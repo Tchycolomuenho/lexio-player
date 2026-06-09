@@ -3,11 +3,6 @@ name: Build & Release Lexio Player
 on:
   push:
     branches: [main]
-    paths:
-      - 'lexio_player.py'
-      - 'build_exe.py'
-      - 'installer.iss'
-      - '.github/workflows/*.yml'
   workflow_dispatch:
 
 jobs:
