@@ -3,16 +3,17 @@
 __pycache__/
 build/
 dist/
-*.spec
 installer/*.exe
 installer/*.iss
 gh_*.py
 check_*.py
 click_*.py
 upload_*.py
+capture_network.py
 file_page.py
 get_*.py
-capture_network.py
 api_*.py
 check_*.py
+api_get_link.py
+api_upload.py
 
