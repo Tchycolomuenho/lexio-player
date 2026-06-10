@@ -57,7 +57,7 @@ if not _VLC_PATH:
 # ── Imports with early error display ──
 try:
     from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QPropertyAnimation, QEasingCurve, QRect, QPoint, QUrl, QEvent, QFileInfo
-    from PyQt5.QtGui import QPixmap, QPainter, QColor, QPen, QFont, QIcon, QCursor, QRadialGradient, QFontMetrics, QFontInfo
+    from PyQt5.QtGui import QPixmap, QPainter, QColor, QPen, QFont, QIcon, QCursor, QRadialGradient, QLinearGradient, QFontMetrics, QFontInfo
     from PyQt5.QtWidgets import (
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
         QLabel, QPushButton, QSlider, QFileDialog, QListWidget, QListWidgetItem,
@@ -784,6 +784,8 @@ class VideoOverlay(QWidget):
         self._hide_subs = False   # active-recall: hide subtitle until mouse peeks at bottom
         self._mouse_y = 0
         self._loop_active = False  # show a LOOP badge while the A-B loop is on
+        self._flash_msg = ""       # transient banner (e.g. "Guardado em Vídeos") for fullscreen
+        self._flash_until = 0.0
 
         # Animation timer: ~60fps for fluid Twitch-style card motion
         self._anim_timer = QTimer()
@@ -811,7 +813,19 @@ class VideoOverlay(QWidget):
                 if cur != new_rect:
                     self.setGeometry(new_rect)
                 self.raise_()
+                # Keep the floating transport (study mode) ABOVE this overlay so
+                # its buttons stay clickable and visible over the subtitles.
+                tov = getattr(w, "_transport_overlay", None)
+                if tov is not None and tov.isVisible():
+                    tov.raise_()
                 break
+
+    def flash(self, msg, secs=2.6):
+        """Show a brief banner centred at the top of the video — the only place
+        feedback is visible in fullscreen (the status-bar toast is hidden there)."""
+        self._flash_msg = msg
+        self._flash_until = time.time() + secs
+        self.update()
 
     def show_subtitle(self, text):
         self._current_sub = text
@@ -942,49 +956,77 @@ class VideoOverlay(QWidget):
             p.drawRoundedRect(16, 16, bw, 26, 13, 13)
             p.setPen(QColor(0, 0, 0)); p.drawText(QRect(16, 16, bw, 26), Qt.AlignCenter, "LOOP")
 
+        # ── Transient flash banner (save confirmation, visible in fullscreen) ──
+        if self._flash_msg and time.time() < self._flash_until:
+            ff = QFont("Inter", 12, QFont.DemiBold); p.setFont(ff)
+            fm2 = QFontMetrics(ff)
+            fbw = fm2.horizontalAdvance(self._flash_msg) + 36
+            fbx = (w - fbw) // 2
+            p.setPen(Qt.NoPen); p.setBrush(QColor(255, 255, 255, 235))
+            p.drawRoundedRect(fbx, 18, fbw, 34, 17, 17)
+            p.setPen(QColor(10, 10, 10))
+            p.drawText(QRect(fbx, 18, fbw, 34), Qt.AlignCenter, self._flash_msg)
+
         # ── 1. Subtitle at bottom center ──
         if self._current_sub:
-            sh = 48
-            sy = self.height() - 90
-            reveal = (not self._hide_subs) or (self._mouse_y > self.height() - 170)
+            H = self.height()
+            reveal = (not self._hide_subs) or (self._mouse_y > H - 170)
             if reveal:
-                sub_font = QFont("Inter", 18, QFont.Bold)
+                # Responsive size: scale the font to the video area so it doesn't
+                # look oversized/clipped in a small (windowed) player, and WRAP to
+                # up to two lines instead of truncating — far more readable.
+                fs = max(13, min(20, H // 28))
+                sub_font = QFont("Inter", fs, QFont.Bold)
                 fm = QFontMetrics(sub_font)
-                sw = min(fm.horizontalAdvance(self._current_sub) + 60, w - 40)
-                sx = (w - sw) // 2
-                p.setPen(Qt.NoPen)
-                p.setBrush(QColor(0, 0, 0, 200))
-                p.drawRoundedRect(sx, sy, sw, sh, 8, 8)
-                p.setFont(sub_font)
-                display = self._current_sub
-                if fm.horizontalAdvance(display) > sw - 40:
-                    while fm.horizontalAdvance(display + "…") > sw - 40 and len(display) > 3:
-                        display = display[:-1]
-                    display += "…"
-                # Word-by-word: tint + underline KEY words/expressions by
-                # category (expression / your-level / advanced); the rest stays
-                # white — readable, not a painted rainbow.
-                x = sx + 20
-                space_w = fm.horizontalAdvance(" ")
-                words = display.split(" ")
-                marks = mark_tokens(words)
                 ul_sub = QFont(sub_font); ul_sub.setUnderline(True)
-                # Store clickable rects for subtitle words
-                sub_rects = []
+                space_w = fm.horizontalAdvance(" ")
+                line_h = fm.height() + 2
+                pad = 16
+                maxw = int(w * 0.86)
+                avail = max(80, maxw - 2 * pad)
+                words = [x for x in self._current_sub.split(" ") if x]
+                marks = mark_tokens(words)
+                # Greedy word-wrap into lines.
+                lines, cur, cur_w = [], [], 0
                 for word, mk in zip(words, marks):
-                    if not word:
-                        x += space_w; continue
-                    if mk and mk["color"]:
-                        p.setPen(QColor(mk["color"]))
-                        p.setFont(ul_sub if mk["underline"] else sub_font)
-                        if mk.get("click") or mk.get("underline"):
-                            ww2 = fm.horizontalAdvance(word)
-                            sub_rects.append((x, sy, ww2 + 4, sh, mk.get("click") or word))
-                    else:
-                        p.setPen(QColor(255, 255, 255)); p.setFont(sub_font)
                     ww = fm.horizontalAdvance(word)
-                    p.drawText(QRect(x, sy, ww + 4, sh), Qt.AlignLeft | Qt.AlignVCenter, word)
-                    x += ww + space_w
+                    add = ww + (space_w if cur else 0)
+                    if cur and cur_w + add > avail:
+                        lines.append(cur); cur, cur_w = [], 0; add = ww
+                    cur.append((word, mk)); cur_w += add
+                if cur:
+                    lines.append(cur)
+                if len(lines) > 2:                  # cap at 2 lines, mark the cut
+                    lines = lines[:2]; lines[1].append(("…", None))
+
+                def line_width(ln):
+                    return (sum(fm.horizontalAdvance(wd) for wd, _ in ln)
+                            + space_w * max(0, len(ln) - 1))
+
+                box_h = len(lines) * line_h + 14
+                sw = min(maxw, max((line_width(ln) for ln in lines), default=0) + 2 * pad)
+                margin_b = max(12, H // 14)         # responsive bottom gap
+                sy = H - box_h - margin_b
+                sx = (w - sw) // 2
+                p.setPen(Qt.NoPen); p.setBrush(QColor(0, 0, 0, 200))
+                p.drawRoundedRect(sx, sy, sw, box_h, 8, 8)
+
+                # Draw each line centred; tint + underline KEY words (clickable).
+                sub_rects = []
+                for li, ln in enumerate(lines):
+                    lx = (w - line_width(ln)) // 2
+                    ly = sy + 7 + li * line_h
+                    for word, mk in ln:
+                        ww = fm.horizontalAdvance(word)
+                        if mk and mk["color"]:
+                            p.setPen(QColor(mk["color"]))
+                            p.setFont(ul_sub if mk["underline"] else sub_font)
+                            if mk.get("click") or mk.get("underline"):
+                                sub_rects.append((lx, ly, ww + 4, line_h, mk.get("click") or word))
+                        else:
+                            p.setPen(QColor(255, 255, 255)); p.setFont(sub_font)
+                        p.drawText(QRect(lx, ly, ww + 4, line_h), Qt.AlignLeft | Qt.AlignVCenter, word)
+                        lx += ww + space_w
                 self._sub_word_rects = sub_rects
                 p.setFont(sub_font)
             else:
@@ -994,11 +1036,12 @@ class VideoOverlay(QWidget):
                 pf = QFont("Inter", 11); pfm = QFontMetrics(pf)
                 pw = pfm.horizontalAdvance(ph) + 40
                 px = (w - pw) // 2
+                py = self.height() - 52
                 p.setPen(Qt.NoPen)
                 p.setBrush(QColor(0, 0, 0, 130))
-                p.drawRoundedRect(px, sy + 12, pw, 26, 13, 13)
+                p.drawRoundedRect(px, py, pw, 26, 13, 13)
                 p.setPen(QColor(200, 200, 200, 180)); p.setFont(pf)
-                p.drawText(QRect(px, sy + 12, pw, 26), Qt.AlignCenter, ph)
+                p.drawText(QRect(px, py, pw, 26), Qt.AlignCenter, ph)
 
         # ── 2. Twitch-style vocab cards — right column, slide from right ──
         if not self._cards:
@@ -1103,6 +1146,121 @@ CHROME_UA = (
     "Chrome/124.0.0.0 Safari/537.36"
 )
 BROWSER_PROFILE_DIR = str(Path.home() / ".lexio-player" / "browser-profile")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# IMAGENS — mesma config da web (src/lib/pollinations.ts + /api/media-search).
+# Cadeia de robustez idêntica (tenta por ordem, há SEMPRE imagem):
+#   1. /api/media-search  → fotos REAIS (Unsplash → Tavily → SerpApi → Pollinations)
+#   2. Pollinations (IA, vários prompts/seeds)
+#   3. LoremFlickr (fotos reais, infra independente)
+#   4. Cartão local desenhado (QPixmap) — nunca falha
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Mesmo hash determinístico da web (hashCode em pollinations.ts) → mesmas seeds,
+# logo as MESMAS imagens geradas que o utilizador vê no site.
+def _img_hashcode(s):
+    h = 0
+    for ch in s:
+        h = ((h << 5) - h + ord(ch)) & 0xFFFFFFFF
+    if h >= 0x80000000:
+        h -= 0x100000000
+    return h
+
+_IMG_CONCRETE = set("""
+people person man woman child children baby family friend friends teacher student
+doctor driver worker player house home room kitchen garden park street road city
+town beach mountain river lake forest tree flower animal dog cat bird horse fish
+food meal breakfast lunch dinner table chair door window book phone computer car
+bus train plane bike boat school office hospital store shop market morning evening
+night sun moon sky cloud rain water fire light hand face eye work job money news
+story game sport team ball party event show film movie photo coffee tea bread
+university class lesson exam airport station hotel restaurant cafe sea ocean island
+""".split())
+
+def _img_extract_context(text, word=""):
+    """Extrai palavras visuais do exemplo, priorizando substantivos concretos —
+    igual ao pollinationsImages/dynamicPrompt da web."""
+    toks = [w for w in re.sub(r"[^\w\s]", " ", text or "").split()
+            if len(w) > 2 and w.lower() != (word or "").lower()]
+    concrete = [w for w in toks if w.lower() in _IMG_CONCRETE]
+    other = [w for w in toks if w.lower() not in _IMG_CONCRETE]
+    return " ".join((concrete + other)[:6])
+
+def pollinations_image_urls(word, context="", count=4):
+    from urllib.parse import quote
+    safe = (word or "").strip() or "vocabulary word"
+    ctx = _img_extract_context(context, word) or (context or "")[:80]
+    style = "photorealistic, sharp focus, natural lighting, detailed, warm tones"
+    photo = "photography, depth of field, high quality, 8K"
+    prompts = [
+        f"{safe} {ctx}, {style}, {photo}",
+        f"{ctx}, {safe}, real life scene, {style}",
+        f"{safe} in a daily life situation, people, {style}",
+        f"{safe} vocabulary illustration, clean educational, {style}",
+    ]
+    urls = []
+    for p in prompts[:max(1, count)]:
+        enc = quote(p[:250]); seed = abs(_img_hashcode(p)) % 100000
+        urls.append(f"https://image.pollinations.ai/prompt/{enc}"
+                    f"?width=512&height=512&nologo=true&seed={seed}&referrer=lexio-player")
+    return urls
+
+def loremflickr_image_urls(word, context="", count=2):
+    from urllib.parse import quote
+    safe = (word or "").strip() or "vocabulary"
+    ctx = ",".join([w for w in re.sub(r"[^\w\s]", " ", context or "").split() if len(w) > 2][:2])
+    kw = quote(",".join([x for x in (safe, ctx) if x]))
+    base = abs(_img_hashcode(safe + context))
+    return [f"https://loremflickr.com/512/512/{kw}?lock={base % 90000 + i}" for i in range(count)]
+
+def media_search_image_urls(word, example="", meaning="", image_prompt=""):
+    """Chama o MESMO endpoint da web: /api/media-search (Unsplash→Tavily→SerpApi→
+    Pollinations). Devolve fotos reais curadas, ou [] se falhar."""
+    try:
+        body = json.dumps({"type": "image", "word": word, "example": example,
+                           "meaning": meaning, "imagePrompt": image_prompt,
+                           "maxImages": 4}).encode()
+        req = Request(f"{LEXIO_API}/api/media-search", data=body,
+                      headers={"Content-Type": "application/json", "User-Agent": CHROME_UA})
+        d = json.loads(urlopen(req, timeout=20).read().decode())
+        return [u for u in (d.get("images") or []) if u]
+    except Exception as e:
+        log(f"media-search: {e}")
+        return []
+
+def build_image_candidates(word, example="", meaning="", image_prompt=""):
+    """Lista ordenada de URLs candidatas (sem o cartão local, que é desenhado se
+    todas falharem). Reais → Pollinations → LoremFlickr."""
+    ctx = example or meaning
+    real = media_search_image_urls(word, example, meaning, image_prompt)
+    out, seen = [], set()
+    for u in real + pollinations_image_urls(word, ctx) + loremflickr_image_urls(word, ctx):
+        if u and u not in seen:
+            seen.add(u); out.append(u)
+    return out
+
+def local_card_pixmap(word, context="", w=400, h=240):
+    """Cartão garantido desenhado localmente (nunca falha) — equivalente ao
+    localCardDataUri (SVG) da web. Gradiente + palavra + LEXIO."""
+    pm = QPixmap(w, h); pm.fill(Qt.transparent)
+    p = QPainter(pm); p.setRenderHint(QPainter.Antialiasing); p.setRenderHint(QPainter.TextAntialiasing)
+    hh = abs(_img_hashcode(word or "x"))
+    g = QLinearGradient(0, 0, w, h)
+    g.setColorAt(0.0, QColor.fromHsl(hh % 360, 115, 56))
+    g.setColorAt(1.0, QColor.fromHsl((hh + 40) % 360, 140, 31))
+    p.setPen(Qt.NoPen); p.setBrush(g); p.drawRoundedRect(0, 0, w, h, 10, 10)
+    p.setBrush(QColor(255, 255, 255, 16)); p.drawEllipse(w // 2 - 70, 28, 140, 140)
+    wd = ((word or "Lexio").strip())[:22]
+    fs = 30 if len(wd) > 14 else (38 if len(wd) > 9 else 46)
+    p.setPen(QColor(255, 255, 255))
+    p.setFont(QFont("Inter", fs, QFont.Bold))
+    p.drawText(QRect(8, 0, w - 16, h - 34), Qt.AlignCenter, wd)
+    p.setPen(QColor(255, 255, 255, 120)); p.setFont(QFont("Inter", 10, QFont.Bold))
+    p.drawText(QRect(0, h - 28, w, 20), Qt.AlignCenter, "L E X I O")
+    p.end()
+    return pm
+
 
 class LoginDialog(QDialog):
     """Embedded browser for Google OAuth login — captures Supabase JWT automatically."""
@@ -1713,6 +1871,38 @@ class ChatPanel(QWidget):
         else:
             self._add_msg(f"Adicionado: “{word[:30]}” ao teu vocabulário principal.", "system")
 
+    # ── Sync a "+"-saved word to the cloud as PENDING (table saved_words) ──
+    def sync_saved_word(self, text, video=""):
+        """Fire-and-forget push so the word also shows on the web as a pending
+        item the user can Add-to-vocabulary or Discard. Silent (no chat spam):
+        if logged out it just stays local in the Vídeos tab."""
+        if not text:
+            return False
+        header = self._get_token_header()
+        if not header:
+            return False
+        threading.Thread(target=self._sync_saved_worker,
+                         args=(text, video, header), daemon=True).start()
+        return True
+
+    def _sync_saved_worker(self, text, video, header):
+        import base64
+        try:
+            tok = header.split(" ", 1)[1]
+            pl = tok.split(".")[1]; pl += "=" * (-len(pl) % 4)
+            uid = json.loads(base64.urlsafe_b64decode(pl).decode()).get("sub")
+            if not uid:
+                return
+            row = {"user_id": uid, "text": text, "word": text.split()[0] if text.split() else text,
+                   "lang": "en", "source": "player", "video": video or ""}
+            ih = {"Content-Type": "application/json", "apikey": SUPABASE_ANON,
+                  "Authorization": header, "Prefer": "resolution=ignore-duplicates,return=minimal"}
+            urlopen(Request(f"{SUPABASE_URL}/rest/v1/saved_words",
+                            data=json.dumps(row).encode(), headers=ih), timeout=20)
+            log(f"saved_words synced: {text[:30]}")
+        except Exception as e:
+            log(f"sync saved word: {e}")
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # STUDY MANAGER
@@ -1759,7 +1949,7 @@ class WordDetailsPanel(QWidget):
     def __init__(self, parent, chat):
         super().__init__(parent)
         self._chat = chat
-        self._word = ""; self._lang = "en"
+        self._word = ""; self._lang = "en"; self._meaning = ""
         self._examples = []; self._ex_idx = 0
         self._tts_player = None
         self.setStyleSheet(f"background:{SRF};border-right:1px solid {BRD};")
@@ -1905,6 +2095,7 @@ class WordDetailsPanel(QWidget):
         self.meta_lbl.setText(" · ".join([x for x in [self._esc(data.get("phonetic", "")),
                                                        self._esc(data.get("type", ""))] if x]))
         self.meaning_lbl.setText(data.get("meaning", ""))
+        self._meaning = data.get("meaning", "")
         self._examples = [e for e in (data.get("examples") or []) if e][:3]
         if self._examples:
             self.ex_box.show(); self._show_example(0)
@@ -1947,30 +2138,43 @@ class WordDetailsPanel(QWidget):
         threading.Thread(target=self._img_worker, args=(idx, ex), daemon=True).start()
 
     def _img_worker(self, idx, example):
-        try:
-            from urllib.parse import quote
-            ctx = " ".join([w for w in re.sub(r"[^\w\s]", " ", example).split() if len(w) > 3][:8])
-            prompt = (f"{ctx}, photorealistic, natural lighting, real life scene").strip() or example[:80]
-            enc = quote(prompt[:220]); seed = abs(hash(example)) % 100000
-            u = f"https://image.pollinations.ai/prompt/{enc}?width=400&height=240&nologo=true&seed={seed}"
-            raw = urlopen(u, timeout=50).read()
-            self._img_ready.emit((idx, raw))
-        except Exception as e:
-            log(f"example image: {e}")
-            self._img_ready.emit((idx, b""))
+        """Same image config as the web: ask /api/media-search for REAL photos
+        (Unsplash→Tavily→SerpApi→Pollinations), then fall through Pollinations and
+        LoremFlickr. Tries each candidate URL until one decodes; if the network is
+        down entirely, _on_img draws the guaranteed local card."""
+        # A short visual prompt built from the example (same as the web's dynamic
+        # prompt) helps the real-image search return a relevant photo.
+        image_prompt = _img_extract_context(example, self._word)
+        candidates = build_image_candidates(self._word, example, self._meaning, image_prompt)
+        for u in candidates:
+            if idx != self._ex_idx:      # user navigated away — stop wasting data
+                return
+            try:
+                req = Request(u, headers={"User-Agent": CHROME_UA, "Accept": "image/*"})
+                raw = urlopen(req, timeout=30).read()
+                if raw and len(raw) > 800 and idx == self._ex_idx:
+                    self._img_ready.emit((idx, raw))
+                    return
+            except Exception as e:
+                log(f"example image: {e}")
+        self._img_ready.emit((idx, b""))   # all sources failed → guaranteed card
 
     def _on_img(self, payload):
         idx, raw = payload
         if idx != self._ex_idx:      # user already navigated away
             return
+        w = max(180, self.ex_img.width() - 2)
         if raw:
             pm = QPixmap()
             if pm.loadFromData(raw):
-                w = max(180, self.ex_img.width() - 2)
                 self.ex_img.setPixmap(pm.scaledToWidth(w, Qt.SmoothTransformation))
                 self.ex_img.setText("")
                 return
-        self.ex_img.setText("(sem imagem)")
+        # Guarantee an image (never just a blank/letter), exactly like the web's
+        # local SVG card fallback.
+        ex = self._examples[idx] if 0 <= idx < len(self._examples) else ""
+        self.ex_img.setPixmap(local_card_pixmap(self._word, ex).scaledToWidth(w, Qt.SmoothTransformation))
+        self.ex_img.setText("")
 
     def _play_tts(self):
         if not self._word:
@@ -2013,6 +2217,8 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self._study_mode = False
+        self._transport_overlay = None     # floating seek+controls window (study mode)
+        self._transport_floating = False
         self._controls_state = {}  # save/restore visibility
         try: self._setup()
         except Exception as e: log(f"FATAL: {e}\n{traceback.format_exc()}"); raise
@@ -2084,6 +2290,7 @@ class MainWindow(QMainWindow):
 
         left = QWidget(); left.setStyleSheet(f"background:{BG};")
         left_lo = QVBoxLayout(left); left_lo.setContentsMargins(0,0,0,0); left_lo.setSpacing(0)
+        self._left_lo = left_lo   # kept so the transport can be floated/docked in study mode
 
         # Video engine
         self.engine = PlayerEngine()
@@ -2206,6 +2413,7 @@ class MainWindow(QMainWindow):
         twl = QVBoxLayout(self.tools_wrap); twl.setContentsMargins(0,0,0,0); twl.setSpacing(0)
 
         tabs = QTabWidget()
+        self.tabs = tabs   # referenced so saving a word can jump to the Vídeos tab
         tabs.setStyleSheet(
             f"QTabWidget::pane{{background:{SRF};border:none;}}"
             f"QTabBar{{background:{SRF};qproperty-drawBase:0;}}"
@@ -2237,7 +2445,7 @@ class MainWindow(QMainWindow):
         self.vv_title.setStyleSheet(f"color:{TXT};font-size:11px;font-weight:bold;background:transparent;")
         vhl.addWidget(self.vv_title); vhl.addStretch()
         vvl.addLayout(vhl)
-        vhint = QLabel("Palavras guardadas com  +  nas legendas. Clica com o botão direito para adicionar ao teu vocabulário ou remover.")
+        vhint = QLabel("Aqui ficam as palavras que guardaste com  +  nas legendas — só neste player, não no teu vocabulário principal. Clica com o botão direito numa palavra para a Adicionar ao meu vocabulário ou Remover.")
         vhint.setWordWrap(True); vhint.setStyleSheet(f"color:{TMT};font-size:10px;background:transparent;")
         vvl.addWidget(vhint)
         self.vv_list = QListWidget()
@@ -2320,6 +2528,7 @@ class MainWindow(QMainWindow):
             g = self.engine.mapToGlobal(QPoint(0, 0))
             self.overlay.setGeometry(g.x(), g.y(), self.engine.width(), self.engine.height())
             self.overlay.raise_()
+            self._reposition_transport()   # keep the floating transport glued to the video
 
     def showEvent(self, e):
         super().showEvent(e)
@@ -2373,19 +2582,23 @@ class MainWindow(QMainWindow):
         transport (seek + controls) auto-hiding after inactivity."""
         self._study_mode = not self._study_mode
         if self._study_mode:
-            # Hide the chrome that has no place in fullscreen, but KEEP the seek
-            # and controls bars \u2014 they just auto-hide after a few seconds so the
-            # user can always scrub/seek (the old behaviour removed them entirely).
+            # Hide the chrome that has no place in fullscreen.
             for name in ["top_bar", "practice_bar"]:
                 w = self.findChild(QWidget, name)
                 if w: w.hide()
             self.tools_wrap.hide()
             self.statusBar().hide()
+            # Float the seek + controls OVER the video instead of below it, so
+            # auto-hide/show no longer resizes the video (the old behaviour made
+            # the picture jump up/down \u2014 uncomfortable). The video keeps its size.
+            self._float_transport(True)
             self.setWindowState(Qt.WindowFullScreen)
             self.fs_btn.setText("\u26F6")
             self.fs_btn.setToolTip("Sair do ecr\u00E3 inteiro [Esc]")
             self.sbl.setText("Modo Estudo \u2014 Esc para sair")
             self._fs_activity()   # show transport, then start the hide countdown
+            # Re-anchor once fullscreen geometry settles (it applies asynchronously).
+            QTimer.singleShot(80, self._reposition_transport)
         else:
             self._exit_study_mode()
 
@@ -2394,8 +2607,8 @@ class MainWindow(QMainWindow):
         self._study_mode = False
         self._fs_hide_timer.stop()
         self.setWindowState(Qt.WindowNoState)
-        # Show all bars again
-        for name in ["top_bar", "seek_bar", "controls_bar", "practice_bar"]:
+        self._float_transport(False)   # dock seek + controls back into the layout
+        for name in ["top_bar", "practice_bar"]:
             w = self.findChild(QWidget, name)
             if w: w.show()
         self.tools_wrap.show()
@@ -2404,33 +2617,79 @@ class MainWindow(QMainWindow):
         self.fs_btn.setToolTip("Ecr\u00E3 inteiro (F)")
         self.sbl.setText("Pronto")
 
-    def _fs_transport(self):
-        """The bars that auto-hide in fullscreen."""
-        return [self.findChild(QWidget, n) for n in ("seek_bar", "controls_bar")]
+    # \u2500\u2500 Floating transport (fullscreen) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    def _ensure_transport_overlay(self):
+        """Lazily build the frameless window that hosts the seek + controls bars
+        over the bottom of the video in study mode."""
+        if getattr(self, "_transport_overlay", None) is None:
+            ov = QWidget(self)
+            ov.setObjectName("transport_overlay")
+            ov.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool)
+            ov.setAttribute(Qt.WA_ShowWithoutActivating)
+            ov.setStyleSheet("#transport_overlay{background:#0c0c0c;}")
+            lo = QVBoxLayout(ov); lo.setContentsMargins(0, 0, 0, 0); lo.setSpacing(0)
+            self._transport_overlay = ov
+            self._transport_lo = lo
+        return self._transport_overlay
+
+    def _float_transport(self, floating):
+        """Move seek_bar + controls_bar between the docked layout and the floating
+        overlay. Reparenting (not hide/show) is what stops the video resizing."""
+        if floating == self._transport_floating:
+            return
+        self._transport_floating = floating
+        sb = self.findChild(QWidget, "seek_bar")
+        cb = self.findChild(QWidget, "controls_bar")
+        if floating:
+            ov = self._ensure_transport_overlay()
+            for w in (sb, cb):
+                if w: self._left_lo.removeWidget(w); self._transport_lo.addWidget(w); w.show()
+            ov.show()
+            self._reposition_transport()
+            ov.raise_()
+        else:
+            ov = getattr(self, "_transport_overlay", None)
+            if ov:
+                for w in (sb, cb):
+                    if w: self._transport_lo.removeWidget(w)
+                ov.hide()
+            # Restore original order under the engine: seek (1), controls (2).
+            if sb: self._left_lo.insertWidget(1, sb); sb.show()
+            if cb: self._left_lo.insertWidget(2, cb); cb.show()
+
+    def _reposition_transport(self):
+        """Anchor the floating transport to the bottom edge of the video."""
+        ov = getattr(self, "_transport_overlay", None)
+        if not ov or not ov.isVisible() or not hasattr(self, "engine"):
+            return
+        h = 90  # seek (34) + controls (56)
+        g = self.engine.mapToGlobal(QPoint(0, 0))
+        ov.setGeometry(g.x(), g.y() + self.engine.height() - h, self.engine.width(), h)
+        ov.raise_()
 
     def _fs_activity(self):
         """Mouse/keyboard activity in fullscreen: reveal the transport and
         restart the inactivity countdown."""
         if not self._study_mode:
             return
-        changed = False
-        for w in self._fs_transport():
-            if w and not w.isVisible():
-                w.show(); changed = True
-        if changed:
-            QTimer.singleShot(0, self._reposition_overlay)
+        ov = getattr(self, "_transport_overlay", None)
+        if ov and not ov.isVisible():
+            ov.show()
+            self._reposition_transport()
+        elif ov:
+            ov.raise_()
         self._fs_hide_timer.start()
 
     def _fs_hide_controls(self):
         if not self._study_mode:
             return
-        # Keep them up while the pointer is over the controls themselves.
-        if any(w and w.underMouse() for w in self._fs_transport()):
+        ov = getattr(self, "_transport_overlay", None)
+        # Keep it up while the pointer is over the controls themselves.
+        if ov and ov.underMouse():
             self._fs_hide_timer.start()
             return
-        for w in self._fs_transport():
-            if w: w.hide()
-        QTimer.singleShot(0, self._reposition_overlay)
+        if ov:
+            ov.hide()
 
     def _toggle_tools(self):
         self._tools_visible = not self._tools_visible
@@ -2438,21 +2697,42 @@ class MainWindow(QMainWindow):
 
     # ── Vocab overlay ──
     def _on_overlay_add(self, text):
-        """+ on a subtitle card → save to the SEPARATE video-vocab list (Vídeos tab),
-        NOT the main study vocabulary. The user promotes it later if they want."""
+        """+ on a subtitle card → save to the SEPARATE video-vocab list (Vídeos tab)
+        AND push to the cloud as PENDING (saved_words) so it shows on the web, where
+        the user opts in (Add to vocabulary) or discards. NOT the main vocabulary."""
         vocab_file = DATA_DIR / 'saved-vocab.json'
         try:
+            video = Path(self.video_path).name if self.video_path else ""
             saved = []
             if vocab_file.exists():
                 saved = json.loads(vocab_file.read_text(encoding='utf-8'))
             if not any(s.get("text") == text for s in saved):
-                saved.append({"text": text, "time": datetime.now().isoformat(),
-                              "video": Path(self.video_path).name if self.video_path else ""})
+                saved.append({"text": text, "time": datetime.now().isoformat(), "video": video})
                 vocab_file.write_text(json.dumps(saved, indent=2, ensure_ascii=False), encoding='utf-8')
             self._load_video_vocab()           # refresh the dedicated Vídeos tab
-            showToast(f"Guardado em Vídeos: {text[:28]}", "accent")
+            # Push to the web as a pending word (silent if logged out → stays local).
+            synced = self.chat.sync_saved_word(text, video) if hasattr(self, "chat") else False
+            # Make it obvious WHERE the word went. The status-bar toast is hidden
+            # in fullscreen, so also flash a banner over the video, and (when the
+            # panel is visible) jump to the Vídeos tab so the user sees it land.
+            where = "Vídeos + web (pendente)" if synced else "Vídeos"
+            self.overlay.flash(f"Guardado · {where}")
+            showToast(f"Guardado em {where} — {text[:24]}", "accent")
+            if not self._study_mode and self.tools_wrap.isVisible():
+                idx = self._vv_tab_index()
+                if idx is not None:
+                    self.tabs.setCurrentIndex(idx)
         except Exception as e:
             log(f"save vocab: {e}")
+
+    def _vv_tab_index(self):
+        """Index of the Vídeos tab in the tools panel (or None)."""
+        if not hasattr(self, "tabs"):
+            return None
+        for i in range(self.tabs.count()):
+            if self.tabs.tabText(i) == "Vídeos":
+                return i
+        return None
 
     def _load_video_vocab(self):
         """Populate the Vídeos tab from the separate saved-vocab.json file."""
@@ -2466,11 +2746,44 @@ class MainWindow(QMainWindow):
         if not hasattr(self, 'vv_list'):
             return
         self.vv_list.clear()
+        if not self._vv_entries:
+            empty = QListWidgetItem("Ainda sem palavras. Carrega no  +  de uma legenda enquanto vês um vídeo.")
+            empty.setFlags(Qt.NoItemFlags)   # not selectable — it's a hint
+            empty.setForeground(QColor(TMT))
+            self.vv_list.addItem(empty)
         for e in reversed(self._vv_entries):   # newest first
             vid = e.get("video", ""); txt = e.get("text", "")
-            self.vv_list.addItem(QListWidgetItem(txt + (f"   ·  {vid}" if vid else "")))
+            it = QListWidgetItem()
+            self.vv_list.addItem(it)
+            lbl = QLabel(self._vocab_html(txt, vid))
+            lbl.setTextFormat(Qt.RichText)
+            lbl.setWordWrap(True)
+            lbl.setAttribute(Qt.WA_TransparentForMouseEvents)  # let the list handle hover/right-click
+            lbl.setStyleSheet("background:transparent;font-size:11px;padding:1px 2px;")
+            self.vv_list.setItemWidget(it, lbl)
+            it.setSizeHint(lbl.sizeHint())
         n = len(self._vv_entries)
         self.vv_title.setText(f"Vocabulário dos vídeos ({n})" if n else "Vocabulário dos vídeos")
+
+    @staticmethod
+    def _vocab_html(text, video=""):
+        """Render a saved phrase with the SAME key-word colours as the subtitles
+        (expressions violet, your-level green, advanced amber); plain words stay
+        near-white. So the sidebar finally has the coloured letters."""
+        def esc(s):
+            return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+        words = text.split()
+        marks = mark_tokens(words)
+        out = []
+        for word, mk in zip(words, marks):
+            if mk and mk.get("color") and mk.get("key"):
+                out.append(f'<span style="color:{mk["color"]}">{esc(word)}</span>')
+            else:
+                out.append(f'<span style="color:{TXT}">{esc(word)}</span>')
+        html = " ".join(out)
+        if video:
+            html += f' <span style="color:{TMT}">·  {esc(video)}</span>'
+        return html
 
     def _vv_menu(self, pos):
         it = self.vv_list.itemAt(pos)
