@@ -56,14 +56,14 @@ if not _VLC_PATH:
 
 # ── Imports with early error display ──
 try:
-    from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QPropertyAnimation, QEasingCurve, QRect, QPoint, QUrl, QEvent
-    from PyQt5.QtGui import QPixmap, QPainter, QColor, QPen, QFont, QIcon, QCursor, QRadialGradient, QFontMetrics
+    from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QPropertyAnimation, QEasingCurve, QRect, QPoint, QUrl, QEvent, QFileInfo
+    from PyQt5.QtGui import QPixmap, QPainter, QColor, QPen, QFont, QIcon, QCursor, QRadialGradient, QFontMetrics, QFontInfo
     from PyQt5.QtWidgets import (
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
         QLabel, QPushButton, QSlider, QFileDialog, QListWidget, QListWidgetItem,
         QMenu, QMessageBox, QTextEdit, QLineEdit,
         QTabWidget, QStatusBar, QScrollArea, QSizePolicy, QDialog,
-        QGraphicsOpacityEffect, QStyle, QStyleOptionSlider
+        QGraphicsOpacityEffect, QStyle, QStyleOptionSlider, QFileIconProvider
     )
     from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEngineProfile, QWebEnginePage
     from PyQt5.QtWebChannel import QWebChannel
@@ -521,6 +521,7 @@ class PlayerEngine(QWidget):
         if self._player:
             self._player.stop(); self._media = None
         self._path = None; self._duration = 0; self._subs = []; self._played_ids = set()
+        self._last_sub = ""
         self._show_ph()
         self._timer.start(self._poll_ms)
 
@@ -779,6 +780,7 @@ class VideoOverlay(QWidget):
         self._cards = []
         self._hover_idx = -1
         self._current_sub = ""
+        self._sub_word_rects = []  # [(x, y, w, h, word)] for bottom subtitle
         self._hide_subs = False   # active-recall: hide subtitle until mouse peeks at bottom
         self._mouse_y = 0
         self._loop_active = False  # show a LOOP badge while the A-B loop is on
@@ -815,20 +817,23 @@ class VideoOverlay(QWidget):
         self._current_sub = text
 
     def show_vocab(self, text):
-        """Called when subtitle triggers a new phrase"""
+        """Called when subtitle triggers a new phrase.
+        Clears old cards (>15s) on each new subtitle to prevent excessive accumulation,
+        while keeping cards visible during pauses (no new triggers while paused).
+        """
         now = time.time()
+        # Remove cards older than 15s so only ~3-5 are visible during normal playback
+        self._cards = [c for c in self._cards if now - c.time < 15]
         color = TWITCH_COLORS[hash(text) % len(TWITCH_COLORS)]
         self._cards.append(VocabCard(text, now, color, now))
-        # Limit card count to prevent memory issues
-        if len(self._cards) > 80:
-            self._cards = self._cards[-60:]
 
     def _tick(self):
         now = time.time()
         changed = False
-        # Remove expired cards
+        # Remove old cards (safety net — show_vocab cleans on each new subtitle,
+        # but this handles edge cases like seeking without new triggers).
         before = len(self._cards)
-        self._cards = [c for c in self._cards if now - c.time < 12]
+        self._cards = [c for c in self._cards if now - c.time < 60]
         if len(self._cards) != before:
             changed = True
         # Reset hover if card was removed
@@ -861,6 +866,12 @@ class VideoOverlay(QWidget):
             # 2) Otherwise the +/AI buttons
             self._handle_vocab_click(mx, card, idx)
             return
+        # Check if click hit an underlined word in the bottom subtitle
+        mx, my = e.pos().x(), e.pos().y()
+        for (wx, wy, ww, wh, word) in self._sub_word_rects:
+            if wx <= mx <= wx + ww and wy <= my <= wy + wh:
+                self.word_clicked.emit(word)
+                return
         self.video_clicked.emit()
 
     def mouseDoubleClickEvent(self, e):
@@ -958,17 +969,23 @@ class VideoOverlay(QWidget):
                 words = display.split(" ")
                 marks = mark_tokens(words)
                 ul_sub = QFont(sub_font); ul_sub.setUnderline(True)
+                # Store clickable rects for subtitle words
+                sub_rects = []
                 for word, mk in zip(words, marks):
                     if not word:
                         x += space_w; continue
                     if mk and mk["color"]:
                         p.setPen(QColor(mk["color"]))
                         p.setFont(ul_sub if mk["underline"] else sub_font)
+                        if mk.get("click") or mk.get("underline"):
+                            ww2 = fm.horizontalAdvance(word)
+                            sub_rects.append((x, sy, ww2 + 4, sh, mk.get("click") or word))
                     else:
                         p.setPen(QColor(255, 255, 255)); p.setFont(sub_font)
                     ww = fm.horizontalAdvance(word)
                     p.drawText(QRect(x, sy, ww + 4, sh), Qt.AlignLeft | Qt.AlignVCenter, word)
                     x += ww + space_w
+                self._sub_word_rects = sub_rects
                 p.setFont(sub_font)
             else:
                 # Active-recall: subtitle hidden — discreet placeholder, peek by
@@ -996,7 +1013,10 @@ class VideoOverlay(QWidget):
 
         for i, card, cw, y, h, _ in self._card_rects():
             age = now - card.time
-            alpha = max(80, int(255 - age * 15))
+            # Full opacity — no fade-out. Cards live 60s then disappear cleanly.
+            # Fading during pause looked like subtitles vanishing, which confused
+            # users studying paused video.
+            alpha = 230
             hovering = (i == self._hover_idx)
 
             # Right-aligned in the overlay
@@ -1774,7 +1794,16 @@ class WordDetailsPanel(QWidget):
             f"QPushButton{{background:transparent;color:{TS2};border:1px solid {BRD};border-radius:13px;"
             f"padding:2px 12px;font-size:11px;font-family:'Inter';}}QPushButton:hover{{border-color:{ACC};color:{TXT};}}")
         self.listen_btn.clicked.connect(self._play_tts)
-        wr.addWidget(self.listen_btn); wr.addStretch()
+        wr.addWidget(self.listen_btn)
+        # YouGlish button — opens the word on YouGlish in the browser
+        self.yg_btn = QPushButton("YG"); self.yg_btn.setCursor(Qt.PointingHandCursor); self.yg_btn.setFixedHeight(26)
+        self.yg_btn.setToolTip("Ouvir pronúncia em contexto no YouGlish")
+        self.yg_btn.setStyleSheet(
+            f"QPushButton{{background:transparent;color:{TS2};border:1px solid {BRD};border-radius:13px;"
+            f"padding:2px 8px;font-size:10px;font-family:'Inter';font-weight:700;}}"
+            f"QPushButton:hover{{border-color:{ACC};color:{TXT};}}")
+        self.yg_btn.clicked.connect(self._open_youglish)
+        wr.addWidget(self.yg_btn); wr.addStretch()
         il.addLayout(wr)
 
         self.meta_lbl = QLabel(""); self.meta_lbl.setWordWrap(True)
@@ -1972,6 +2001,13 @@ class WordDetailsPanel(QWidget):
         if self._chat and self._word:
             self._chat.promote_word(self._word)
 
+    def _open_youglish(self):
+        """Open the word on YouGlish for pronunciation in context."""
+        if self._word:
+            import urllib.parse
+            query = urllib.parse.quote(self._word)
+            webbrowser.open(f"https://youglish.com/pronounce/{query}/english/us")
+
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -1994,8 +2030,8 @@ class MainWindow(QMainWindow):
         self._setup_ui()
         self.engine.position_changed.connect(self._on_pos)
         self.engine.media_ended.connect(self._on_end)
-        self.engine.duration_changed.connect(self._on_dur)
         self.engine.playing_changed.connect(self._on_play)
+        self.engine.duration_changed.connect(self._on_dur)
         # Wire overlay signals
         self.engine.subtitle_changed.connect(self.overlay.show_subtitle)
         self.engine.vocab_triggered.connect(self.overlay.show_vocab)
@@ -2678,11 +2714,22 @@ class MainWindow(QMainWindow):
             if self.mgr.del_an(self.video_path, i): self.aw.takeItem(i)
 
     # ── Playlist ──
-    def _pl_add(self, p):
-        p = Path(p)
+    def _pl_add(self, path):
+        p = Path(path)
         if str(p) not in self._playlist:
             self._playlist.append(str(p))
-            self.plw.addItem(QListWidgetItem(p.name)); self.plcnt.setText(f"{len(self._playlist)}")
+            item = QListWidgetItem()
+            # Shell icon for the file type
+            try:
+                fi = QFileInfo(str(p))
+                icon = QFileIconProvider().icon(fi)
+                item.setIcon(icon)
+            except:
+                pass
+            item.setText(p.name)
+            item.setToolTip(str(p))
+            self.plw.addItem(item)
+            self.plcnt.setText(f"{len(self._playlist)}")
     def _pl_row(self, row):
         if 0 <= row < len(self._playlist): self._pl_idx = row; self._open_file(self._playlist[row])
     def _clr_pl(self):
@@ -2741,7 +2788,10 @@ class MainWindow(QMainWindow):
     def keyPressEvent(self, e):
         k = e.key()
         # Any key reveals the transport while in fullscreen study mode.
-        self._fs_activity()
+        # EXCEPT Space (pause) — showing the bars mid-pause shrinks the video
+        # area, causing a visual "jump" as the engine and overlay resize.
+        if k != Qt.Key_Space:
+            self._fs_activity()
         # Space always pauses/plays - chat input uses Enter to send
         if k == Qt.Key_Space:
             self._toggle()
