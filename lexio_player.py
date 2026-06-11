@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Lexio Study Player v3.1 — VLC embutido + Vocab Overlay + Chat IA
+Lexio Study Player v3.4.0 — VLC embutido + Vocab Overlay + Chat IA
 """
 import os, sys, json, webbrowser, subprocess, threading, re, traceback, time
 from pathlib import Path
@@ -19,7 +19,7 @@ def log(msg):
             f.write(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}\n")
     except: pass
 
-log("=== LEXIO PLAYER v3.1 === (pyinstaller-friendly)")
+log("=== LEXIO PLAYER v3.4.0 === (pyinstaller-friendly)")
 
 # ── VLC path — search more locations ──
 _VLC_PATH = None
@@ -56,7 +56,7 @@ if not _VLC_PATH:
 
 # ── Imports with early error display ──
 try:
-    from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QPropertyAnimation, QEasingCurve, QRect, QPoint, QUrl, QEvent, QFileInfo
+    from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QPropertyAnimation, QEasingCurve, QRect, QRectF, QPoint, QSize, QUrl, QEvent, QFileInfo
     from PyQt5.QtGui import QPixmap, QPainter, QColor, QPen, QFont, QIcon, QCursor, QRadialGradient, QLinearGradient, QFontMetrics, QFontInfo
     from PyQt5.QtWidgets import (
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -100,7 +100,7 @@ ACC_HOVER = "#cfcfcf"  # dimmer white on hover
 ON_ACC = "#000000"   # text/icon ON white accent
 
 APP_NAME = "Lexio Study Player"
-APP_VERSION = "3.1.0"
+APP_VERSION = "3.4.0"
 DATA_DIR = Path.home() / '.lexio-player'; DATA_DIR.mkdir(exist_ok=True)
 RECENT_FILE = DATA_DIR / 'recent.json'
 STUDY_FILE = DATA_DIR / 'study-data.json'
@@ -508,37 +508,41 @@ class PlayerEngine(QWidget):
                 log(f"sub parse fail: {e}")
         try:
             self._media = self._inst.media_new(path)
-            # Add subtitle to VLC via media options (native, most reliable)
-            if sub_path and sub_path.exists():
-                try:
-                    self._media.add_options(f':sub-file={sub_path}')
-                    log(f"VLC native sub via media: {sub_path.name}")
-                except Exception as e:
-                    log(f"VLC media sub fail: {e}")
+            # Subtitles are rendered EXCLUSIVELY by our Qt VideoOverlay (positioned
+            # safely above the controls bar, persists on pause, words clickable).
+            # We deliberately do NOT feed the .srt to VLC's native renderer: VLC
+            # burns subs at the bottom of the video frame, which in a windowed
+            # (non-fullscreen) player lands over the controls groove and double-
+            # draws under our overlay. self._subs (parsed above) drives the overlay.
             self._player.set_media(self._media)
             self._player.play()
             self.ph.hide()
             QTimer.singleShot(300, lambda: self._player and self._player.set_hwnd(int(self.winId())))
+            # Disable any native subtitle track (external or embedded auto-pick) so
+            # the Qt overlay is the single source of truth. The user can still turn
+            # embedded tracks on via the CC cycle button.
+            QTimer.singleShot(500, self._disable_native_subs)
             log(f"Playing: {path}")
         except Exception as e: log(f"open: {e}")
 
+    def _disable_native_subs(self):
+        """Turn off VLC's own subtitle rendering — the Qt overlay handles subs."""
+        if not self._player: return
+        try:
+            self._player.video_set_spu(-1)
+        except Exception as e:
+            log(f"disable native subs: {e}")
+
     def load_srt(self, srt_path):
-        """Load subtitle file manually"""
+        """Load subtitle file manually — rendered by the Qt overlay, not VLC."""
         if not self._player: return False
         try:
             self._subs = parse_srt(Path(srt_path).read_text(encoding='utf-8', errors='replace'))
             self._played_ids = set()
             log(f"Loaded {len(self._subs)} subs from {srt_path}")
-            # Also add to VLC natively for reliable rendering
-            try:
-                self._player.video_set_subtitle_file(str(srt_path))
-                # Enable the subtitle track
-                spu_count = self._player.video_get_spu_count()
-                if spu_count and spu_count > 0:
-                    self._player.video_set_spu(1)
-                log(f"VLC native sub loaded: {srt_path}")
-            except Exception as e:
-                log(f"VLC sub-file load fail: {e}")
+            # Keep VLC's native renderer OFF so the overlay stays the single source
+            # of truth (no double subtitles, no controls-bar overlap).
+            self._disable_native_subs()
             return True
         except Exception as e:
             log(f"load_srt fail: {e}")
@@ -566,6 +570,22 @@ class PlayerEngine(QWidget):
             return next_track
         except:
             return -1
+
+    def video_size(self):
+        """(width, height) of the actual decoded video, or (0,0) if unknown.
+        Used to keep the subtitle/cards INSIDE the real video image (not over the
+        black letterbox bars). Cached — VLC only knows it once decoding starts."""
+        vw = vh = 0
+        if self._player:
+            try:
+                sz = self._player.video_get_size(0)   # (w, h)
+                if sz and len(sz) == 2:
+                    vw, vh = int(sz[0]), int(sz[1])
+            except Exception:
+                vw = vh = 0
+        if vw and vh:
+            self._vid_size = (vw, vh)
+        return getattr(self, "_vid_size", (0, 0))
 
     def sub_count(self):
         """Returns number of loaded .srt subs"""
@@ -852,6 +872,8 @@ class VideoOverlay(QWidget):
         self._loop_active = False  # show a LOOP badge while the A-B loop is on
         self._flash_msg = ""       # transient banner (e.g. "Guardado em Vídeos") for fullscreen
         self._flash_until = 0.0
+        self._is_playing = True    # while paused we FREEZE card aging (the user may be
+                                   # chatting with the AI / reading details — subs stay)
 
         # Animation timer: ~60fps for fluid Twitch-style card motion
         self._anim_timer = QTimer()
@@ -872,6 +894,7 @@ class VideoOverlay(QWidget):
         for w in app.topLevelWidgets():
             if isinstance(w, QMainWindow) and hasattr(w, 'engine') and w.engine.isVisible():
                 eng = w.engine
+                self._engine = eng     # cached for _video_rect() in paint/hit-tests
                 g = eng.mapToGlobal(QPoint(0, 0))
                 # Only move if size/position changed (avoid flicker)
                 cur = self.geometry()
@@ -886,6 +909,25 @@ class VideoOverlay(QWidget):
                     tov.raise_()
                 break
 
+    def _video_rect(self):
+        """Rect (x, y, w, h) of the ACTUAL video image inside the overlay — VLC
+        letterboxes/pillarboxes the picture inside the widget, so we keep subtitles
+        and cards within this rect instead of over the black bars / random spots."""
+        W, H = self.width(), self.height()
+        eng = getattr(self, "_engine", None)
+        vw = vh = 0
+        if eng is not None:
+            try:
+                vw, vh = eng.video_size()
+            except Exception:
+                vw = vh = 0
+        if not vw or not vh or W <= 0 or H <= 0:
+            return 0, 0, W, H
+        scale = min(W / vw, H / vh)
+        dw, dh = int(vw * scale), int(vh * scale)
+        dx, dy = (W - dw) // 2, (H - dh) // 2
+        return dx, dy, dw, dh
+
     def flash(self, msg, secs=2.6):
         """Show a brief banner centred at the top of the video — the only place
         feedback is visible in fullscreen (the status-bar toast is hidden there)."""
@@ -896,30 +938,25 @@ class VideoOverlay(QWidget):
     def show_subtitle(self, text):
         self._current_sub = text
 
+    MAX_CARDS = 6   # how many Twitch-style cards stay on screen at once
+
     def show_vocab(self, text):
-        """Called when subtitle triggers a new phrase.
-        Clears old cards (>15s) on each new subtitle to prevent excessive accumulation,
-        while keeping cards visible during pauses (no new triggers while paused).
-        """
+        """Called when a subtitle triggers a new phrase. Cards are kept by COUNT,
+        not by time: we keep the newest MAX_CARDS and never expire them on a clock.
+        New cards only arrive WHILE PLAYING, so during a pause nothing is removed —
+        the cards (and subtitle) stay put for as long as the user studies."""
         now = time.time()
-        # Remove cards older than 15s so only ~3-5 are visible during normal playback
-        self._cards = [c for c in self._cards if now - c.time < 15]
         color = TWITCH_COLORS[hash(text) % len(TWITCH_COLORS)]
         self._cards.append(VocabCard(text, now, color, now))
+        if len(self._cards) > self.MAX_CARDS:
+            self._cards = self._cards[-self.MAX_CARDS:]
 
     def _tick(self):
-        now = time.time()
-        changed = False
-        # Remove old cards (safety net — show_vocab cleans on each new subtitle,
-        # but this handles edge cases like seeking without new triggers).
-        before = len(self._cards)
-        self._cards = [c for c in self._cards if now - c.time < 60]
-        if len(self._cards) != before:
-            changed = True
-        # Reset hover if card was removed
+        # No time-based expiry: cards persist until pushed out by newer ones (see
+        # show_vocab). This guarantees they never vanish on pause. We just keep the
+        # animation repainting and the hover index sane.
         if self._cards and self._hover_idx >= len(self._cards):
-            self._hover_idx = -1; changed = True
-        # Always repaint if we have cards (animation runs continuously)
+            self._hover_idx = -1
         if self._cards or self._current_sub:
             self.update()
 
@@ -960,37 +997,33 @@ class VideoOverlay(QWidget):
         self.toggle_fullscreen.emit()
 
     def _card_rects(self):
-        """Yield (i, card, col_w, y, h, now) for visible cards, bottom→top."""
-        fm = QFontMetrics(QFont("Inter", 11))
-        w = self.width()
-        col_w = min(350, int(w * 0.4))
-        y = self.height() - 10
+        """Yield (i, card, col_w, y, h, now) for visible cards, bottom→top —
+        anchored to the bottom-right of the VIDEO image (not the widget), so cards
+        never land over the black bars."""
+        vx, vy, vw, vh = self._video_rect()
+        col_w = min(350, int(vw * 0.4))
+        y = vy + vh - 10
         now = time.time()
         for i, card in enumerate(self._cards):
             nlines = max(len(card.text.split('\n')), 1)
             h = nlines * 18 + 20
             y -= h + 4
-            if y < 0:
+            if y < vy:
                 break
             yield (i, card, col_w, y, h, now)
 
     def _hit_test_vocab(self, pos):
+        vx, vy, vw, vh = self._video_rect()
         for i, card, cw, y, h, now in self._card_rects():
-            x = self.width() - cw - 20  # match margin=20 in paintEvent
+            x = vx + vw - cw - 20  # match margin=20 in paintEvent
             if x <= pos.x() <= x + cw and y <= pos.y() <= y + h:
                 return i
         return -1
 
     def _handle_vocab_click(self, mx, card, idx):
-        w = self.width()
-        col_w = min(350, int(w * 0.4))
-        y = self.height() - 10
-        for j in range(idx + 1):
-            c = self._cards[j]
-            cn = max(len(c.text.split('\n')), 1)
-            ch = cn * 18 + 20
-            y -= ch + 4
-        x = w - col_w - 20
+        vx, vy, vw, vh = self._video_rect()
+        col_w = min(350, int(vw * 0.4))
+        x = vx + vw - col_w - 20
         btn_x = x + col_w - 52
         chat_x = btn_x + 24
         if btn_x <= mx <= btn_x + 22:
@@ -1033,22 +1066,23 @@ class VideoOverlay(QWidget):
             p.setPen(QColor(10, 10, 10))
             p.drawText(QRect(fbx, 18, fbw, 34), Qt.AlignCenter, self._flash_msg)
 
-        # ── 1. Subtitle at bottom center ──
+        # ── 1. Subtitle at the bottom of the VIDEO (never over the black bars) ──
         if self._current_sub:
-            H = self.height()
-            reveal = (not self._hide_subs) or (self._mouse_y > H - 170)
+            vx_, vy_, vw_, vh_ = self._video_rect()
+            H = vh_                 # scale & place relative to the video, not widget
+            reveal = (not self._hide_subs) or (self._mouse_y > vy_ + vh_ - 170)
             if reveal:
                 # Responsive size: scale the font to the video area so it doesn't
                 # look oversized/clipped in a small (windowed) player, and WRAP to
                 # up to two lines instead of truncating — far more readable.
-                fs = max(13, min(20, H // 28))
+                fs = max(13, min(20, max(1, H) // 28))
                 sub_font = QFont("Inter", fs, QFont.Bold)
                 fm = QFontMetrics(sub_font)
                 ul_sub = QFont(sub_font); ul_sub.setUnderline(True)
                 space_w = fm.horizontalAdvance(" ")
                 line_h = fm.height() + 2
                 pad = 16
-                maxw = int(w * 0.86)
+                maxw = int(vw_ * 0.86)
                 avail = max(80, maxw - 2 * pad)
                 words = [x for x in self._current_sub.split(" ") if x]
                 marks = mark_tokens(words)
@@ -1071,16 +1105,16 @@ class VideoOverlay(QWidget):
 
                 box_h = len(lines) * line_h + 14
                 sw = min(maxw, max((line_width(ln) for ln in lines), default=0) + 2 * pad)
-                margin_b = max(12, H // 14)         # responsive bottom gap
-                sy = H - box_h - margin_b
-                sx = (w - sw) // 2
+                margin_b = max(12, vh_ // 14)       # responsive bottom gap (of video)
+                sy = vy_ + vh_ - box_h - margin_b   # bottom of the VIDEO image
+                sx = vx_ + (vw_ - sw) // 2          # centred within the VIDEO image
                 p.setPen(Qt.NoPen); p.setBrush(QColor(0, 0, 0, 200))
                 p.drawRoundedRect(sx, sy, sw, box_h, 8, 8)
 
                 # Draw each line centred; tint + underline KEY words (clickable).
                 sub_rects = []
                 for li, ln in enumerate(lines):
-                    lx = (w - line_width(ln)) // 2
+                    lx = vx_ + (vw_ - line_width(ln)) // 2
                     ly = sy + 7 + li * line_h
                     for word, mk in ln:
                         ww = fm.horizontalAdvance(word)
@@ -1101,8 +1135,8 @@ class VideoOverlay(QWidget):
                 ph = "•  •  •   (passa o rato em baixo para ver)"
                 pf = QFont("Inter", 11); pfm = QFontMetrics(pf)
                 pw = pfm.horizontalAdvance(ph) + 40
-                px = (w - pw) // 2
-                py = self.height() - 52
+                px = vx_ + (vw_ - pw) // 2
+                py = vy_ + vh_ - 52
                 p.setPen(Qt.NoPen)
                 p.setBrush(QColor(0, 0, 0, 130))
                 p.drawRoundedRect(px, py, pw, 26, 13, 13)
@@ -1116,21 +1150,20 @@ class VideoOverlay(QWidget):
 
         fm = QFontMetrics(QFont("Inter", 11))
         now = time.time()
-        # Fixed-width right column: max 350px or 40% of overlay
-        col_w = min(350, int(w * 0.4))
-        margin = 20  # right margin from edge
+        vx_c, vy_c, vw_c, vh_c = self._video_rect()
+        # Fixed-width right column: max 350px or 40% of the VIDEO image
+        col_w = min(350, int(vw_c * 0.4))
+        margin = 20  # right margin from the video's right edge
 
         for i, card, cw, y, h, _ in self._card_rects():
-            age = now - card.time
-            # Full opacity — no fade-out. Cards live 60s then disappear cleanly.
-            # Fading during pause looked like subtitles vanishing, which confused
-            # users studying paused video.
+            # Full opacity — no fade-out. Cards persist until newer cards push them
+            # out (count-based), so they never vanish on pause.
             alpha = 230
             hovering = (i == self._hover_idx)
 
-            # Right-aligned in the overlay
-            target_x = w - col_w - margin
-            start_x = w  # off-screen right
+            # Right-aligned within the VIDEO image (not the widget/black bars)
+            target_x = vx_c + vw_c - col_w - margin
+            start_x = vx_c + vw_c  # slides in from the video's right edge
 
             # Slide animation: 400ms ease-out
             slide_t = min(1.0, (now - card.slide_start) / 0.4)
@@ -1305,6 +1338,79 @@ def build_image_candidates(word, example="", meaning="", image_prompt=""):
         if u and u not in seen:
             seen.add(u); out.append(u)
     return out
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# AVALIAÇÃO DE IMAGENS — 👍/👎 em cada imagem. Guardado localmente E sincronizado
+# para o Supabase (tabela image_ratings). As avaliações ENVIESAM a ordem das
+# candidatas na próxima vez (gostadas primeiro, rejeitadas no fim) → a escolha de
+# imagem fica cada vez mais precisa. Mesma ideia replicada na web.
+# ═══════════════════════════════════════════════════════════════════════════
+IMG_RATINGS_FILE = DATA_DIR / 'image-ratings.json'
+
+def _load_img_ratings():
+    try:
+        if IMG_RATINGS_FILE.exists():
+            return json.loads(IMG_RATINGS_FILE.read_text(encoding='utf-8'))
+    except Exception:
+        pass
+    return {}
+
+_IMG_RATINGS = _load_img_ratings()   # { "word\turl": score }  +1 gostei / -1 não
+
+def _img_rating_key(word, url):
+    return f"{(word or '').strip().lower()}\t{url}"
+
+def get_image_rating(word, url):
+    try:
+        return int(_IMG_RATINGS.get(_img_rating_key(word, url), 0))
+    except Exception:
+        return 0
+
+def set_image_rating_local(word, url, score):
+    k = _img_rating_key(word, url)
+    if score == 0:
+        _IMG_RATINGS.pop(k, None)
+    else:
+        _IMG_RATINGS[k] = int(score)
+    try:
+        IMG_RATINGS_FILE.write_text(json.dumps(_IMG_RATINGS, ensure_ascii=False), encoding='utf-8')
+    except Exception as e:
+        log(f"save image ratings: {e}")
+
+def sync_image_rating(word, url, score, auth_header=None):
+    """Fire-and-forget upsert para o Supabase (image_ratings). Só sincroniza com
+    sessão iniciada; offline/deslogado fica só local."""
+    if not auth_header or not url:
+        return
+    def _worker():
+        try:
+            import base64
+            tok = auth_header.split(" ", 1)[1]
+            pl = tok.split(".")[1]; pl += "=" * (-len(pl) % 4)
+            uid = json.loads(base64.urlsafe_b64decode(pl).decode()).get("sub")
+            if not uid:
+                return
+            row = {"user_id": uid, "word": (word or "").strip().lower(),
+                   "image_url": url, "score": int(score)}
+            headers = {"Content-Type": "application/json", "apikey": SUPABASE_ANON,
+                       "Authorization": auth_header,
+                       "Prefer": "resolution=merge-duplicates,return=minimal"}
+            urlopen(Request(f"{SUPABASE_URL}/rest/v1/image_ratings?on_conflict=user_id,word,image_url",
+                            data=json.dumps(row).encode(), headers=headers), timeout=15)
+            log(f"image rating synced: {word} {score:+d}")
+        except Exception as e:
+            log(f"image rating sync: {e}")
+    threading.Thread(target=_worker, daemon=True).start()
+
+def apply_rating_bias(word, candidates):
+    """Reordena candidatas pelas avaliações guardadas: gostadas primeiro,
+    rejeitadas no fim (mas nunca remove todas — há SEMPRE imagem)."""
+    liked, neutral, disliked = [], [], []
+    for u in candidates:
+        s = get_image_rating(word, u)
+        (liked if s > 0 else disliked if s < 0 else neutral).append(u)
+    return liked + neutral + disliked
 
 def local_card_pixmap(word, context="", w=400, h=240):
     """Cartão garantido desenhado localmente (nunca falha) — equivalente ao
@@ -2081,6 +2187,97 @@ class StudyMgr:
         return json.dumps({"video":Path(v).name,"path":str(v),"exported":datetime.now().isoformat(),"bookmarks":self.get_bm(v),"annotations":self.get_an(v)}, indent=2, ensure_ascii=False)
 
 
+def _thumb_icon(up, color, size=16):
+    """Draw a clean, monochrome thumbs-up / thumbs-down ICON (no emoji) — sleeve +
+    fist + raised thumb, rotated 180° for 'down'. Matches the player's flat theme."""
+    pm = QPixmap(size, size); pm.fill(Qt.transparent)
+    p = QPainter(pm); p.setRenderHint(QPainter.Antialiasing)
+    p.translate(size / 2.0, size / 2.0)
+    p.scale(size / 24.0, size / 24.0)
+    if not up:
+        p.rotate(180)
+    p.translate(-12, -12)
+    p.setPen(Qt.NoPen); p.setBrush(QColor(color))
+    p.drawRoundedRect(QRectF(2.0, 13.0, 4.0, 9.0), 1.2, 1.2)    # sleeve / wrist
+    p.drawRoundedRect(QRectF(7.0, 11.0, 13.0, 11.0), 2.5, 2.5)  # fist
+    p.drawRoundedRect(QRectF(8.0, 2.0, 5.0, 11.0), 2.5, 2.5)    # raised thumb
+    p.end()
+    return QIcon(pm)
+
+
+# Cores das avaliações (monocromático + um verde/vermelho discretos no estado ativo)
+_RATE_ON_UP = QColor(64, 196, 128)     # gostei (verde suave)
+_RATE_ON_DOWN = QColor(224, 96, 96)    # não gostei (vermelho suave)
+
+
+class RatedThumb(QWidget):
+    """Small image thumbnail (web AI-sidebar style) with like/dislike ICON buttons.
+    Ratings are stored locally + synced to Supabase and bias future image picks."""
+    TW, TH = 92, 64
+
+    def __init__(self, parent, get_auth=None):
+        super().__init__(parent)
+        self._get_auth = get_auth      # callable → Authorization header (or None)
+        self._word = ""; self._url = ""; self._score = 0
+        self.setFixedWidth(self.TW)
+        v = QVBoxLayout(self); v.setContentsMargins(0, 0, 0, 0); v.setSpacing(3)
+        self.img = QLabel(""); self.img.setFixedSize(self.TW, self.TH)
+        self.img.setAlignment(Qt.AlignCenter)
+        self.img.setStyleSheet(
+            f"background:{ELV};border:1px solid {BRD};border-radius:8px;color:{TMT};font-size:9px;")
+        v.addWidget(self.img)
+        rr = QHBoxLayout(); rr.setContentsMargins(0, 0, 0, 0); rr.setSpacing(4)
+        rr.addStretch()
+        self.up = self._rbtn("Boa imagem")
+        self.up.clicked.connect(lambda: self._rate(1))
+        self.down = self._rbtn("Imagem fraca")
+        self.down.clicked.connect(lambda: self._rate(-1))
+        rr.addWidget(self.up); rr.addWidget(self.down); rr.addStretch()
+        v.addLayout(rr)
+        self.clear()
+
+    def img_size(self):
+        return (self.TW, self.TH)
+
+    def _rbtn(self, tip):
+        b = QPushButton(); b.setFixedSize(26, 20); b.setCursor(Qt.PointingHandCursor)
+        b.setToolTip(tip); b.setIconSize(QSize(15, 15))
+        b.setStyleSheet(
+            "QPushButton{background:transparent;border:none;border-radius:5px;}"
+            f"QPushButton:hover{{background:{HVR};}}")
+        return b
+
+    def _refresh_icons(self):
+        self.up.setIcon(_thumb_icon(True, _RATE_ON_UP if self._score > 0 else TMT))
+        self.down.setIcon(_thumb_icon(False, _RATE_ON_DOWN if self._score < 0 else TMT))
+
+    def clear(self):
+        self._url = ""; self._score = 0
+        self.img.setPixmap(QPixmap()); self.img.setText("")
+        self.up.setEnabled(False); self.down.setEnabled(False)
+        self._refresh_icons()
+        self.hide()
+
+    def set_image(self, pixmap, word, url):
+        self._word = word; self._url = url
+        self.img.setPixmap(pixmap.scaled(self.TW, self.TH, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        self.img.setText("")
+        has_url = bool(url)
+        self.up.setEnabled(has_url); self.down.setEnabled(has_url)
+        self._score = get_image_rating(word, url) if has_url else 0
+        self._refresh_icons()
+        self.show()
+
+    def _rate(self, score):
+        if not self._url:
+            return
+        self._score = 0 if self._score == score else score   # click active again → clear
+        set_image_rating_local(self._word, self._url, self._score)
+        self._refresh_icons()
+        auth = self._get_auth() if self._get_auth else None
+        sync_image_rating(self._word, self._url, self._score, auth)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # MAIN WINDOW
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2173,10 +2370,19 @@ class WordDetailsPanel(QWidget):
         self.ex_text = QLabel(""); self.ex_text.setWordWrap(True)
         self.ex_text.setStyleSheet(f"color:{TXT};font-size:13px;font-style:italic;font-family:'Inter';background:transparent;")
         exl.addWidget(self.ex_text)
-        self.ex_img = QLabel(""); self.ex_img.setMinimumHeight(60)
-        self.ex_img.setAlignment(Qt.AlignCenter)
-        self.ex_img.setStyleSheet(f"background:{ELV};border:1px solid {BRD};border-radius:10px;color:{TMT};font-size:11px;")
-        exl.addWidget(self.ex_img)
+        # Image thumbnails (web AI-sidebar style): a few small, friendly-sized
+        # pictures of THIS example — each with 👍/👎 rating that biases future picks.
+        self.img_status = QLabel("")
+        self.img_status.setStyleSheet(f"color:{TMT};font-size:11px;background:transparent;")
+        exl.addWidget(self.img_status)
+        self.thumb_row = QWidget(); self.thumb_row.setStyleSheet("background:transparent;")
+        trl = QHBoxLayout(self.thumb_row); trl.setContentsMargins(0, 2, 0, 0); trl.setSpacing(8)
+        _auth = (lambda: self._chat._get_token_header()) if self._chat else None
+        self._thumbs = [RatedThumb(self.thumb_row, _auth) for _ in range(3)]
+        for _t in self._thumbs:
+            trl.addWidget(_t)
+        trl.addStretch()
+        exl.addWidget(self.thumb_row)
         self.ex_box.hide()
         il.addWidget(self.ex_box)
 
@@ -2281,47 +2487,52 @@ class WordDetailsPanel(QWidget):
         self.ex_text.setText(f"“{ex}”")
         self.ex_counter.setText(f"{idx + 1} / {len(self._examples)}")
         self.ex_prev.setEnabled(idx > 0); self.ex_next.setEnabled(idx < len(self._examples) - 1)
-        self.ex_img.setPixmap(QPixmap()); self.ex_img.setText(T("gen_image"))
+        for t in self._thumbs:
+            t.clear()
+        self.img_status.setText(T("gen_image"))
         threading.Thread(target=self._img_worker, args=(idx, ex), daemon=True).start()
 
     def _img_worker(self, idx, example):
         """Same image config as the web: ask /api/media-search for REAL photos
         (Unsplash→Tavily→SerpApi→Pollinations), then fall through Pollinations and
-        LoremFlickr. Tries each candidate URL until one decodes; if the network is
-        down entirely, _on_img draws the guaranteed local card."""
-        # A short visual prompt built from the example (same as the web's dynamic
-        # prompt) helps the real-image search return a relevant photo.
+        LoremFlickr. Fetches up to 3 DISTINCT images (a thumbnail strip, like the
+        web AI sidebar). Candidates are biased by past 👍/👎 ratings."""
         image_prompt = _img_extract_context(example, self._word)
         candidates = build_image_candidates(self._word, example, self._meaning, image_prompt)
+        candidates = apply_rating_bias(self._word, candidates)
+        slot = 0
         for u in candidates:
             if idx != self._ex_idx:      # user navigated away — stop wasting data
                 return
+            if slot >= len(self._thumbs):
+                break
             try:
                 req = Request(u, headers={"User-Agent": CHROME_UA, "Accept": "image/*"})
                 raw = urlopen(req, timeout=30).read()
                 if raw and len(raw) > 800 and idx == self._ex_idx:
-                    self._img_ready.emit((idx, raw))
-                    return
+                    self._img_ready.emit((idx, slot, raw, u))
+                    slot += 1
             except Exception as e:
                 log(f"example image: {e}")
-        self._img_ready.emit((idx, b""))   # all sources failed → guaranteed card
+        if slot == 0 and idx == self._ex_idx:   # everything failed → guaranteed card
+            self._img_ready.emit((idx, 0, b"", ""))
 
     def _on_img(self, payload):
-        idx, raw = payload
+        idx, slot, raw, url = payload
         if idx != self._ex_idx:      # user already navigated away
             return
-        w = max(180, self.ex_img.width() - 2)
+        self.img_status.setText("")
+        if not (0 <= slot < len(self._thumbs)):
+            return
+        thumb = self._thumbs[slot]
         if raw:
             pm = QPixmap()
             if pm.loadFromData(raw):
-                self.ex_img.setPixmap(pm.scaledToWidth(w, Qt.SmoothTransformation))
-                self.ex_img.setText("")
+                thumb.set_image(pm, self._word, url)
                 return
-        # Guarantee an image (never just a blank/letter), exactly like the web's
-        # local SVG card fallback.
+        # Guarantee an image (never just a blank), exactly like the web's local card.
         ex = self._examples[idx] if 0 <= idx < len(self._examples) else ""
-        self.ex_img.setPixmap(local_card_pixmap(self._word, ex).scaledToWidth(w, Qt.SmoothTransformation))
-        self.ex_img.setText("")
+        thumb.set_image(local_card_pixmap(self._word, ex), self._word, "")
 
     def _play_tts(self):
         if not self._word:
@@ -2691,6 +2902,7 @@ class MainWindow(QMainWindow):
     # ── Overlay positioning (top-level Tool window tracks the engine area) ──
     def _reposition_overlay(self):
         if hasattr(self, 'engine') and hasattr(self, 'overlay') and self._overlay_shown:
+            self.overlay._engine = self.engine   # keep _video_rect() in sync
             g = self.engine.mapToGlobal(QPoint(0, 0))
             self.overlay.setGeometry(g.x(), g.y(), self.engine.width(), self.engine.height())
             self.overlay.raise_()
@@ -3096,7 +3308,10 @@ class MainWindow(QMainWindow):
         if not self.video_path: self._open(); return
         self.engine.toggle()
 
-    def _on_play(self, p): self.play_btn.setText(chr(0xE769) if p else chr(0xE768))
+    def _on_play(self, p):
+        self.play_btn.setText(chr(0xE769) if p else chr(0xE768))
+        # Tell the overlay so it freezes vocab-card aging while paused (subs stay).
+        self.overlay._is_playing = bool(p)
     def _on_pos(self, p):
         if self._seeking: return
         self.tlbl.setText(FMT(p))
