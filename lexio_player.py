@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Lexio Study Player v3.4.0 — VLC embutido + Vocab Overlay + Chat IA
+Lexio Study Player v3.5.0 — VLC embutido + Vocab Overlay + Chat IA
 """
 import os, sys, json, webbrowser, subprocess, threading, re, traceback, time
 from pathlib import Path
@@ -19,7 +19,7 @@ def log(msg):
             f.write(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}\n")
     except: pass
 
-log("=== LEXIO PLAYER v3.4.0 === (pyinstaller-friendly)")
+log("=== LEXIO PLAYER v3.5.0 === (pyinstaller-friendly)")
 
 # ── VLC path — search more locations ──
 _VLC_PATH = None
@@ -100,7 +100,7 @@ ACC_HOVER = "#cfcfcf"  # dimmer white on hover
 ON_ACC = "#000000"   # text/icon ON white accent
 
 APP_NAME = "Lexio Study Player"
-APP_VERSION = "3.4.0"
+APP_VERSION = "3.5.0"
 DATA_DIR = Path.home() / '.lexio-player'; DATA_DIR.mkdir(exist_ok=True)
 RECENT_FILE = DATA_DIR / 'recent.json'
 STUDY_FILE = DATA_DIR / 'study-data.json'
@@ -390,7 +390,12 @@ class PlayerEngine(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setStyleSheet(f"background:{BG};border:none;")
-        self.setMinimumHeight(360)
+        # Minimum SMALL enough that the layout can genuinely shrink the video in
+        # reduced windows. A 360px minimum made the layout overflow on small
+        # windows: the bars below moved up but the video HWND stayed 360 tall,
+        # so the subtitle overlay (glued to the engine) landed over the controls
+        # bar / screen corner instead of on the visible video.
+        self.setMinimumHeight(120)
         self.setFocusPolicy(Qt.StrongFocus)
 
         self._inst = None; self._player = None; self._media = None
@@ -895,10 +900,13 @@ class VideoOverlay(QWidget):
             if isinstance(w, QMainWindow) and hasattr(w, 'engine') and w.engine.isVisible():
                 eng = w.engine
                 self._engine = eng     # cached for _video_rect() in paint/hit-tests
-                g = eng.mapToGlobal(QPoint(0, 0))
+                # NEVER eng.mapToGlobal() here — the engine is a NATIVE child
+                # (VLC set_hwnd) and Qt double-counts the window position for
+                # native children, sending the overlay to the screen corner.
+                gx, gy, gw, gh = w._engine_global_rect()
                 # Only move if size/position changed (avoid flicker)
                 cur = self.geometry()
-                new_rect = QRect(g.x(), g.y(), eng.width(), eng.height())
+                new_rect = QRect(gx, gy, gw, gh)
                 if cur != new_rect:
                     self.setGeometry(new_rect)
                 self.raise_()
@@ -927,6 +935,33 @@ class VideoOverlay(QWidget):
         dw, dh = int(vw * scale), int(vh * scale)
         dx, dy = (W - dw) // 2, (H - dh) // 2
         return dx, dy, dw, dh
+
+    def _active_rect(self):
+        """(x0, y0, x1, y1) — the part of the video the user can actually SEE:
+        the overlay clipped to the screen's work area (the window may be dragged
+        partly off-screen) and, horizontally, to the video image (no pillarbox
+        side bars). Subtitles and vocab cards are laid out inside this rect, so
+        they always sit on the visible video — never at a screen corner."""
+        W, H = self.width(), self.height()
+        x0, y0, x1, y1 = 0, 0, W, H
+        try:
+            g = self.mapToGlobal(QPoint(0, 0))
+            scr = QApplication.screenAt(QPoint(g.x() + W // 2, g.y() + H // 2)) \
+                or QApplication.primaryScreen()
+            if scr is not None:
+                av = scr.availableGeometry()
+                x0 = max(x0, av.left() - g.x());      y0 = max(y0, av.top() - g.y())
+                x1 = min(x1, av.right() + 1 - g.x()); y1 = min(y1, av.bottom() + 1 - g.y())
+        except Exception:
+            pass
+        # Horizontal clip to the video image. Vertically we keep the full band —
+        # subtitles may sit on the bottom letterbox bar, like every player does.
+        vx, vy, vw, vh = self._video_rect()
+        x0 = max(x0, vx); x1 = min(x1, vx + vw)
+        # Degenerate (window fully off-screen / sizes unknown) → whole overlay.
+        if x1 - x0 < 160 or y1 - y0 < 90:
+            return 0, 0, W, H
+        return x0, y0, x1, y1
 
     def flash(self, msg, secs=2.6):
         """Show a brief banner centred at the top of the video — the only place
@@ -997,33 +1032,34 @@ class VideoOverlay(QWidget):
         self.toggle_fullscreen.emit()
 
     def _card_rects(self):
-        """Yield (i, card, col_w, y, h, now) for visible cards, bottom→top —
-        anchored to the bottom-right of the VIDEO image (not the widget), so cards
-        never land over the black bars."""
-        vx, vy, vw, vh = self._video_rect()
-        col_w = min(350, int(vw * 0.4))
-        y = vy + vh - 10
+        """Yield (i, card, col_w, y, h, now) for visible cards, bottom→top.
+        Cards live inside the VISIBLE part of the video (active rect): anchored
+        to its right edge, stacked ABOVE the subtitle (no overlap), so they never
+        land on black bars, screen corners or off-screen window areas."""
+        ax0, ay0, ax1, ay1 = self._active_rect()
+        col_w = min(350, int((ax1 - ax0) * 0.4))
+        y = min(getattr(self, "_sub_top", ay1), ay1) - 8
         now = time.time()
         for i, card in enumerate(self._cards):
             nlines = max(len(card.text.split('\n')), 1)
             h = nlines * 18 + 20
             y -= h + 4
-            if y < vy:
+            if y < ay0:
                 break
             yield (i, card, col_w, y, h, now)
 
     def _hit_test_vocab(self, pos):
-        vx, vy, vw, vh = self._video_rect()
+        ax0, ay0, ax1, ay1 = self._active_rect()
         for i, card, cw, y, h, now in self._card_rects():
-            x = vx + vw - cw - 20  # match margin=20 in paintEvent
+            x = ax1 - cw - 20  # match margin=20 in paintEvent
             if x <= pos.x() <= x + cw and y <= pos.y() <= y + h:
                 return i
         return -1
 
     def _handle_vocab_click(self, mx, card, idx):
-        vx, vy, vw, vh = self._video_rect()
-        col_w = min(350, int(vw * 0.4))
-        x = vx + vw - col_w - 20
+        ax0, ay0, ax1, ay1 = self._active_rect()
+        col_w = min(350, int((ax1 - ax0) * 0.4))
+        x = ax1 - col_w - 20
         btn_x = x + col_w - 52
         chat_x = btn_x + 24
         if btn_x <= mx <= btn_x + 22:
@@ -1046,43 +1082,52 @@ class VideoOverlay(QWidget):
         p.setRenderHint(p.Antialiasing)
         p.setRenderHint(p.TextAntialiasing)
         w = self.width()
+        # Everything is laid out inside the VISIBLE part of the video (the window
+        # may hang off-screen; the video may be letterboxed). ax/ay = that rect.
+        ax0, ay0, ax1, ay1 = self._active_rect()
+        acx = (ax0 + ax1) // 2          # horizontal centre of the visible video
+        # Top of the subtitle box this frame (updated below). The Twitch cards stack
+        # ABOVE this so the two never overlap. Defaults to the visible bottom.
+        self._sub_top = ay1
 
         # ── LOOP badge (clear feedback that the A-B loop is active) ──
         if self._loop_active:
             bf = QFont("Inter", 11, QFont.Bold); p.setFont(bf)
             bw = QFontMetrics(bf).horizontalAdvance("LOOP") + 24
             p.setPen(Qt.NoPen); p.setBrush(QColor(255, 255, 255, 230))
-            p.drawRoundedRect(16, 16, bw, 26, 13, 13)
-            p.setPen(QColor(0, 0, 0)); p.drawText(QRect(16, 16, bw, 26), Qt.AlignCenter, "LOOP")
+            p.drawRoundedRect(ax0 + 16, ay0 + 16, bw, 26, 13, 13)
+            p.setPen(QColor(0, 0, 0)); p.drawText(QRect(ax0 + 16, ay0 + 16, bw, 26), Qt.AlignCenter, "LOOP")
 
         # ── Transient flash banner (save confirmation, visible in fullscreen) ──
         if self._flash_msg and time.time() < self._flash_until:
             ff = QFont("Inter", 12, QFont.DemiBold); p.setFont(ff)
             fm2 = QFontMetrics(ff)
             fbw = fm2.horizontalAdvance(self._flash_msg) + 36
-            fbx = (w - fbw) // 2
+            fbx = acx - fbw // 2
             p.setPen(Qt.NoPen); p.setBrush(QColor(255, 255, 255, 235))
-            p.drawRoundedRect(fbx, 18, fbw, 34, 17, 17)
+            p.drawRoundedRect(fbx, ay0 + 18, fbw, 34, 17, 17)
             p.setPen(QColor(10, 10, 10))
-            p.drawText(QRect(fbx, 18, fbw, 34), Qt.AlignCenter, self._flash_msg)
+            p.drawText(QRect(fbx, ay0 + 18, fbw, 34), Qt.AlignCenter, self._flash_msg)
 
-        # ── 1. Subtitle at the bottom of the VIDEO (never over the black bars) ──
+        # ── 1. Subtitle at the bottom of the VISIBLE video. The active rect already
+        # accounts for the window hanging partly off-screen and for pillarbox bars,
+        # so the subtitle always sits on video the user can actually see. VLC's own
+        # subtitle renderer is disabled (single source, nothing over the controls). ──
         if self._current_sub:
-            vx_, vy_, vw_, vh_ = self._video_rect()
-            H = vh_                 # scale & place relative to the video, not widget
-            reveal = (not self._hide_subs) or (self._mouse_y > vy_ + vh_ - 170)
+            aw = ax1 - ax0; ah = ay1 - ay0
+            reveal = (not self._hide_subs) or (self._mouse_y > ay1 - 170)
             if reveal:
-                # Responsive size: scale the font to the video area so it doesn't
-                # look oversized/clipped in a small (windowed) player, and WRAP to
-                # up to two lines instead of truncating — far more readable.
-                fs = max(13, min(20, max(1, H) // 28))
+                # Responsive size: the font scales with the VISIBLE video height, so
+                # a small (windowed) player gets smaller subtitles that fit, and a
+                # big/full one gets larger. WRAPs to two lines instead of truncating.
+                fs = max(9, min(24, ah // 26))
                 sub_font = QFont("Inter", fs, QFont.Bold)
                 fm = QFontMetrics(sub_font)
                 ul_sub = QFont(sub_font); ul_sub.setUnderline(True)
                 space_w = fm.horizontalAdvance(" ")
                 line_h = fm.height() + 2
                 pad = 16
-                maxw = int(vw_ * 0.86)
+                maxw = int(aw * 0.86)
                 avail = max(80, maxw - 2 * pad)
                 words = [x for x in self._current_sub.split(" ") if x]
                 marks = mark_tokens(words)
@@ -1105,16 +1150,17 @@ class VideoOverlay(QWidget):
 
                 box_h = len(lines) * line_h + 14
                 sw = min(maxw, max((line_width(ln) for ln in lines), default=0) + 2 * pad)
-                margin_b = max(12, vh_ // 14)       # responsive bottom gap (of video)
-                sy = vy_ + vh_ - box_h - margin_b   # bottom of the VIDEO image
-                sx = vx_ + (vw_ - sw) // 2          # centred within the VIDEO image
+                margin_b = max(12, ah // 14)        # responsive bottom gap
+                sy = ay1 - box_h - margin_b         # bottom of the VISIBLE video
+                sx = acx - sw // 2                  # centred on the visible video
+                self._sub_top = sy                  # cards stack above this (no overlap)
                 p.setPen(Qt.NoPen); p.setBrush(QColor(0, 0, 0, 200))
                 p.drawRoundedRect(sx, sy, sw, box_h, 8, 8)
 
                 # Draw each line centred; tint + underline KEY words (clickable).
                 sub_rects = []
                 for li, ln in enumerate(lines):
-                    lx = vx_ + (vw_ - line_width(ln)) // 2
+                    lx = acx - line_width(ln) // 2
                     ly = sy + 7 + li * line_h
                     for word, mk in ln:
                         ww = fm.horizontalAdvance(word)
@@ -1135,8 +1181,8 @@ class VideoOverlay(QWidget):
                 ph = "•  •  •   (passa o rato em baixo para ver)"
                 pf = QFont("Inter", 11); pfm = QFontMetrics(pf)
                 pw = pfm.horizontalAdvance(ph) + 40
-                px = vx_ + (vw_ - pw) // 2
-                py = vy_ + vh_ - 52
+                px = acx - pw // 2
+                py = ay1 - 52
                 p.setPen(Qt.NoPen)
                 p.setBrush(QColor(0, 0, 0, 130))
                 p.drawRoundedRect(px, py, pw, 26, 13, 13)
@@ -1150,10 +1196,9 @@ class VideoOverlay(QWidget):
 
         fm = QFontMetrics(QFont("Inter", 11))
         now = time.time()
-        vx_c, vy_c, vw_c, vh_c = self._video_rect()
-        # Fixed-width right column: max 350px or 40% of the VIDEO image
-        col_w = min(350, int(vw_c * 0.4))
-        margin = 20  # right margin from the video's right edge
+        # Fixed-width right column: max 350px or 40% of the visible video
+        col_w = min(350, int((ax1 - ax0) * 0.4))
+        margin = 20  # right margin from the visible video's right edge
 
         for i, card, cw, y, h, _ in self._card_rects():
             # Full opacity — no fade-out. Cards persist until newer cards push them
@@ -1161,9 +1206,9 @@ class VideoOverlay(QWidget):
             alpha = 230
             hovering = (i == self._hover_idx)
 
-            # Right-aligned within the VIDEO image (not the widget/black bars)
-            target_x = vx_c + vw_c - col_w - margin
-            start_x = vx_c + vw_c  # slides in from the video's right edge
+            # Right-aligned within the VISIBLE video (never black bars / off-screen)
+            target_x = ax1 - col_w - margin
+            start_x = ax1  # slides in from the visible right edge
 
             # Slide animation: 400ms ease-out
             slide_t = min(1.0, (now - card.slide_start) / 0.4)
@@ -2616,7 +2661,20 @@ class MainWindow(QMainWindow):
 
     def _setup_ui(self):
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
-        self.setMinimumSize(900, 600); self.resize(1200, 780)
+        # Fit the window to the user's screen. A fixed 1200x780 default does NOT
+        # fit a 1366x768 display (taller than the screen!), so the window opened
+        # hanging off-screen and subtitles landed at the screen corner. Clamp the
+        # default to the available work area and open centred; keep the minimum
+        # small enough that "reduced" window sizes are actually possible.
+        self.setMinimumSize(720, 480)
+        try:
+            av = QApplication.primaryScreen().availableGeometry()
+            w0 = min(1200, av.width() - 24); h0 = min(780, av.height() - 24)
+            self.resize(w0, h0)
+            self.move(av.left() + (av.width() - w0) // 2,
+                      av.top() + (av.height() - h0) // 2)
+        except Exception:
+            self.resize(1200, 780)
         self.setStyleSheet(f"QMainWindow{{background:{BG};color:{TXT};}}")
 
         c = QWidget(); self.setCentralWidget(c)
@@ -2670,6 +2728,7 @@ class MainWindow(QMainWindow):
 
         # Seek bar
         sb = QWidget(); sb.setObjectName("seek_bar"); sb.setFixedHeight(34)
+        self._seek_bar_w = sb   # used by _engine_global_rect to find the video's true bottom
         sb.setStyleSheet(f"#seek_bar{{background:{SRF};}}")
         sl = QHBoxLayout(sb); sl.setContentsMargins(12,0,12,0); sl.setSpacing(8)
         self.tlbl = QLabel("0:00"); self.tlbl.setStyleSheet(f"color:{TMT};font-size:11px;min-width:38px;background:transparent;")
@@ -2772,6 +2831,11 @@ class MainWindow(QMainWindow):
         # ── Collapsible tools section ──
         self.tools_wrap = QWidget()
         self.tools_wrap.setStyleSheet(f"background:{SRF};border-top:1px solid {BRD};")
+        # Cap the tools panel so the VIDEO always dominates the window. Without a
+        # cap, the tab lists' implicit minimums hogged ~340px and squeezed the
+        # video to a sliver in reduced windows (the lists scroll anyway).
+        self.tools_wrap.setMinimumHeight(110)
+        self.tools_wrap.setMaximumHeight(210)
         twl = QVBoxLayout(self.tools_wrap); twl.setContentsMargins(0,0,0,0); twl.setSpacing(0)
 
         tabs = QTabWidget()
@@ -2900,11 +2964,67 @@ class MainWindow(QMainWindow):
         self._load_recent()
 
     # ── Overlay positioning (top-level Tool window tracks the engine area) ──
+    def _tree_global_rect(self, widget):
+        """Global rect of a widget by WALKING THE WIDGET TREE (pure parent-
+        relative arithmetic). NEVER use mapToGlobal() on the engine or anything
+        near it: VLC's set_hwnd() makes the engine a NATIVE child widget, and
+        Qt's native-child mapToGlobal DOUBLE-COUNTS the window position — that
+        glued the subtitle overlay to the screen's bottom-right corner whenever
+        the window wasn't at (0,0) (i.e. any mode other than fullscreen)."""
+        off_x = off_y = 0
+        wdg = widget
+        while wdg is not None and wdg is not self:
+            off_x += wdg.x(); off_y += wdg.y()
+            wdg = wdg.parentWidget()
+        g = self.geometry()   # top-level client geometry — global coords, reliable
+        return (g.x() + off_x, g.y() + off_y, widget.width(), widget.height())
+
+    def _engine_global_rect(self):
+        """TRUE global rect of the video area. The engine widget itself can keep
+        a STALE size after window resizes (Qt sometimes fails to re-apply layout
+        geometry to the VLC-owned native HWND), overlapping the bars below it.
+        The seek bar is a normal (alien) widget with reliable geometry and sits
+        immediately under the video — so its top edge is the video's true bottom.
+        When they disagree we also FORCE the engine back into its real slot, so
+        VLC renders the picture at the right size too."""
+        ex, ey, ew, eh = self._tree_global_rect(self.engine)
+        sb = getattr(self, "_seek_bar_w", None)
+        if sb is not None and sb.isVisible() and sb.window() is self:
+            sx, sy, sw, sh = self._tree_global_rect(sb)
+            true_h = sy - ey
+            true_w = sw                       # same column as the video
+            if true_h >= 60:
+                # Heal the stale native HWND if the OS-level rect disagrees with
+                # the layout slot. Qt's resize() does not reach the VLC-owned
+                # window (its cached geometry stays stale too), so compare with
+                # GetWindowRect and apply via MoveWindow in the native parent's
+                # client coordinates.
+                try:
+                    import ctypes
+                    from ctypes import wintypes
+                    hwnd = int(self.engine.winId())
+                    cur = wintypes.RECT()
+                    ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(cur))
+                    cw_, ch_ = cur.right - cur.left, cur.bottom - cur.top
+                    if (abs(cur.left - ex) > 2 or abs(cur.top - ey) > 2
+                            or abs(cw_ - true_w) > 2 or abs(ch_ - true_h) > 2):
+                        parent = ctypes.windll.user32.GetParent(hwnd)
+                        pt = wintypes.POINT(ex, ey)
+                        if parent:
+                            ctypes.windll.user32.ScreenToClient(parent, ctypes.byref(pt))
+                        ctypes.windll.user32.MoveWindow(hwnd, pt.x, pt.y,
+                                                        true_w, true_h, True)
+                        log(f"ENGINE HEAL: ({cur.left},{cur.top}) {cw_}x{ch_} -> ({ex},{ey}) {true_w}x{true_h}")
+                except Exception as e:
+                    log(f"engine heal: {e}")
+                eh, ew = true_h, true_w
+        return (ex, ey, ew, eh)
+
     def _reposition_overlay(self):
         if hasattr(self, 'engine') and hasattr(self, 'overlay') and self._overlay_shown:
             self.overlay._engine = self.engine   # keep _video_rect() in sync
-            g = self.engine.mapToGlobal(QPoint(0, 0))
-            self.overlay.setGeometry(g.x(), g.y(), self.engine.width(), self.engine.height())
+            new = self._engine_global_rect()
+            self.overlay.setGeometry(*new)
             self.overlay.raise_()
             self._reposition_transport()   # keep the floating transport glued to the video
 
@@ -3041,8 +3161,8 @@ class MainWindow(QMainWindow):
         if not ov or not ov.isVisible() or not hasattr(self, "engine"):
             return
         h = 90  # seek (34) + controls (56)
-        g = self.engine.mapToGlobal(QPoint(0, 0))
-        ov.setGeometry(g.x(), g.y() + self.engine.height() - h, self.engine.width(), h)
+        gx, gy, gw, gh = self._engine_global_rect()   # never engine.mapToGlobal (native child)
+        ov.setGeometry(gx, gy + gh - h, gw, h)
         ov.raise_()
 
     def _fs_activity(self):
@@ -3626,6 +3746,12 @@ class MainWindow(QMainWindow):
 def main():
     log("main()")
     try:
+        # High-DPI awareness — MUST be set before QApplication. Without it, on a
+        # scaled display (125%/150%) the top-level subtitle overlay (Qt logical
+        # coords) drifts off the VLC video (HWND in physical px) by the engine's
+        # offset, so subtitles land in a corner when the window is not fullscreen.
+        QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+        QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
         app = QApplication(sys.argv)
         app.setApplicationName(APP_NAME); app.setStyle("Fusion")
         # App / taskbar icon. On Windows the taskbar groups by AppUserModelID, so
