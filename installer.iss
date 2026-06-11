@@ -3,7 +3,9 @@
 ; uninstaller, and optional file associations
 
 #define MyAppName "Lexio Study Player"
-#define MyAppVersion "3.3.0"
+; Single source of truth: read the version from version.txt (kept in sync with the
+; app title / APP_VERSION). Avoids the installer being named with a stale version.
+#define MyAppVersion Trim(FileRead(FileOpen("version.txt")))
 #define MyAppPublisher "Lexio"
 #define MyAppURL "https://github.com/amandioestevao/lexio-player"
 #define MyAppExeName "LexioStudyPlayer.exe"
