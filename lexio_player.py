@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Lexio Study Player v3.5.0 — VLC embutido + Vocab Overlay + Chat IA
+Lexio Study Player v3.6.0 — VLC embutido (standalone) + Vocab Overlay + Chat IA
 """
 import os, sys, json, webbrowser, subprocess, threading, re, traceback, time
 from pathlib import Path
@@ -19,40 +19,56 @@ def log(msg):
             f.write(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}\n")
     except: pass
 
-log("=== LEXIO PLAYER v3.5.0 === (pyinstaller-friendly)")
+log("=== LEXIO PLAYER v3.6.0 === (pyinstaller-friendly)")
 
-# ── VLC path — search more locations ──
+# ── VLC path ──
+# A self-contained build ships libvlc.dll + libvlccore.dll + the plugins folder
+# RIGHT NEXT TO the app (PyInstaller one-dir / _MEIPASS), so the user needs NOTHING
+# else installed. We look there FIRST; only if it isn't bundled do we fall back to a
+# system-wide VLC install (handy when running from source during development).
 _VLC_PATH = None
-for _p in [
+
+def _bundled_vlc_dir():
+    """Where VLC sits inside a frozen build (next to the exe, or _MEIPASS)."""
+    if getattr(sys, "frozen", False):
+        for base in (getattr(sys, "_MEIPASS", None), os.path.dirname(sys.executable)):
+            if base and os.path.exists(os.path.join(base, "libvlc.dll")):
+                return base
+    return None
+
+_search = []
+_b = _bundled_vlc_dir()
+if _b:
+    _search.append(_b)
+_search += [
     r"C:\Program Files\VideoLAN\VLC",
     r"C:\Program Files (x86)\VideoLAN\VLC",
     str(Path.home() / "AppData" / "Local" / "Programs" / "VLC"),
-]:
+    str(Path.home() / "AppData" / "Local" / "Microsoft" / "WinGet" / "Links"),
+]
+for _p in _search:
     dll = os.path.join(_p, "libvlc.dll")
     if os.path.exists(dll):
         _VLC_PATH = _p
         os.environ["PATH"] = _p + os.pathsep + os.environ.get("PATH", "")
-        os.environ["VLC_PLUGIN_PATH"] = os.path.join(_p, "plugins")
-        # Try multiple methods to register DLL path
+        # Point python-vlc straight at our DLL + plugins so it never picks up some
+        # other VLC on PATH (avoids version/bitness mismatches).
+        os.environ["PYTHON_VLC_LIB_PATH"] = dll
+        _plug = os.path.join(_p, "plugins")
+        if os.path.isdir(_plug):
+            os.environ["VLC_PLUGIN_PATH"] = _plug
+        # Register the DLL directory by every available method.
         try: os.add_dll_directory(_p)
-        except: pass
+        except Exception: pass
         try:
             import ctypes
             ctypes.windll.kernel32.SetDllDirectoryW(_p)
-        except: pass
-        log(f"VLC found: {_p}")
+        except Exception: pass
+        log(f"VLC found{' (bundled)' if _p == _b else ''}: {_p}")
         break
 if not _VLC_PATH:
     log("VLC NOT FOUND")
     log(f"PATH={os.environ.get('PATH','')[:200]}")
-    # Try winget paths too
-    for _p in [str(Path.home() / "AppData" / "Local" / "Microsoft" / "WinGet" / "Links")]:
-        dll = os.path.join(_p, "libvlc.dll")
-        if os.path.exists(dll):
-            _VLC_PATH = _p
-            os.environ["PATH"] = _p + os.pathsep + os.environ.get("PATH", "")
-            log(f"VLC found (winget): {_p}")
-            break
 
 # ── Imports with early error display ──
 try:
@@ -100,7 +116,7 @@ ACC_HOVER = "#cfcfcf"  # dimmer white on hover
 ON_ACC = "#000000"   # text/icon ON white accent
 
 APP_NAME = "Lexio Study Player"
-APP_VERSION = "3.5.0"
+APP_VERSION = "3.6.0"
 DATA_DIR = Path.home() / '.lexio-player'; DATA_DIR.mkdir(exist_ok=True)
 RECENT_FILE = DATA_DIR / 'recent.json'
 STUDY_FILE = DATA_DIR / 'study-data.json'
@@ -422,7 +438,7 @@ class PlayerEngine(QWidget):
         self._init_vlc()
 
     def _show_ph(self):
-        self.ph.setText("Lexio Study Player\n\nCtrl+O  abrir\nEspaco  play/pause")
+        self.ph.setText(T("ph_hint"))
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
@@ -856,6 +872,7 @@ class VideoOverlay(QWidget):
     toggle_fullscreen = pyqtSignal()
     word_clicked = pyqtSignal(str)     # underlined key word clicked → details panel
     mouse_moved = pyqtSignal()         # any movement over the video (wakes fs controls)
+    load_sub_requested = pyqtSignal()  # user clicked the "no subtitle — load one" banner
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -873,6 +890,8 @@ class VideoOverlay(QWidget):
         self._current_sub = ""
         self._sub_word_rects = []  # [(x, y, w, h, word)] for bottom subtitle
         self._hide_subs = False   # active-recall: hide subtitle until mouse peeks at bottom
+        self._no_sub_hint = False # show a clickable "load a subtitle" banner over the video
+        self._no_sub_rect = None  # QRect of that banner (for click hit-testing)
         self._mouse_y = 0
         self._loop_active = False  # show a LOOP badge while the A-B loop is on
         self._flash_msg = ""       # transient banner (e.g. "Guardado em Vídeos") for fullscreen
@@ -963,6 +982,19 @@ class VideoOverlay(QWidget):
             return 0, 0, W, H
         return x0, y0, x1, y1
 
+    def _sub_zone_top(self, ay0, ay1):
+        """Y of the TOP of a one-line subtitle box for this active rect. The Twitch
+        cards stack above this line, and it's used as the default even when no main
+        subtitle is on screen — so the cards keep a FIXED lowest point and don't
+        jump up/down each time the subtitle appears and disappears."""
+        ah = ay1 - ay0
+        fs = max(9, min(24, ah // 26))
+        fm = QFontMetrics(QFont("Inter", fs, QFont.Bold))
+        line_h = fm.height() + 2
+        box_h = line_h + 14                 # one line, same formula as the drawn box
+        margin_b = max(12, ah // 14)
+        return ay1 - box_h - margin_b
+
     def flash(self, msg, secs=2.6):
         """Show a brief banner centred at the top of the video — the only place
         feedback is visible in fullscreen (the status-bar toast is hidden there)."""
@@ -972,6 +1004,13 @@ class VideoOverlay(QWidget):
 
     def show_subtitle(self, text):
         self._current_sub = text
+
+    def set_no_sub_hint(self, on):
+        """Show/hide the clickable 'this video has no subtitle — load one' banner."""
+        on = bool(on)
+        if on != self._no_sub_hint:
+            self._no_sub_hint = on
+            self.update()
 
     MAX_CARDS = 6   # how many Twitch-style cards stay on screen at once
 
@@ -1006,6 +1045,10 @@ class VideoOverlay(QWidget):
             self.update()   # so the subtitle reveals/hides as the mouse nears the bottom
 
     def mousePressEvent(self, e):
+        # "Load a subtitle" banner takes priority — it sits at the top, clear of cards.
+        if self._no_sub_rect is not None and self._no_sub_rect.contains(e.pos()):
+            self.load_sub_requested.emit()
+            return
         idx = self._hit_test_vocab(e.pos())
         if idx >= 0 and idx < len(self._cards):
             card = self._cards[idx]
@@ -1087,8 +1130,10 @@ class VideoOverlay(QWidget):
         ax0, ay0, ax1, ay1 = self._active_rect()
         acx = (ax0 + ax1) // 2          # horizontal centre of the visible video
         # Top of the subtitle box this frame (updated below). The Twitch cards stack
-        # ABOVE this so the two never overlap. Defaults to the visible bottom.
-        self._sub_top = ay1
+        # ABOVE this so the two never overlap. Defaults to the FIXED one-line subtitle
+        # line (not the visible bottom) so the cards keep the same lowest point whether
+        # or not a main subtitle is currently showing — no more up/down jump.
+        self._sub_top = self._sub_zone_top(ay0, ay1)
 
         # ── LOOP badge (clear feedback that the A-B loop is active) ──
         if self._loop_active:
@@ -1108,6 +1153,23 @@ class VideoOverlay(QWidget):
             p.drawRoundedRect(fbx, ay0 + 18, fbw, 34, 17, 17)
             p.setPen(QColor(10, 10, 10))
             p.drawText(QRect(fbx, ay0 + 18, fbw, 34), Qt.AlignCenter, self._flash_msg)
+
+        # ── "No subtitle — click to load" banner (top-centre, clickable) ──
+        # Only when the flash isn't busy, so the two never fight for the spot.
+        self._no_sub_rect = None
+        if self._no_sub_hint and not (self._flash_msg and time.time() < self._flash_until):
+            nf = QFont("Inter", 12, QFont.DemiBold); p.setFont(nf)
+            nfm = QFontMetrics(nf)
+            label = "  " + T("no_sub_banner")
+            nbw = nfm.horizontalAdvance(label) + 44
+            nbx = acx - nbw // 2
+            nby = ay0 + 16
+            rect = QRect(nbx, nby, nbw, 36)
+            self._no_sub_rect = rect
+            p.setPen(Qt.NoPen); p.setBrush(QColor(0, 0, 0, 205))
+            p.drawRoundedRect(rect, 18, 18)
+            p.setPen(QColor(255, 255, 255))
+            p.drawText(rect, Qt.AlignCenter, label)
 
         # ── 1. Subtitle at the bottom of the VISIBLE video. The active rect already
         # accounts for the window hanging partly off-screen and for pillarbox bars,
@@ -2653,6 +2715,8 @@ class MainWindow(QMainWindow):
         self.overlay.video_clicked.connect(self._toggle)
         self.overlay.toggle_fullscreen.connect(self._toggle_fs)
         self.overlay.mouse_moved.connect(self._fs_activity)
+        self.overlay.load_sub_requested.connect(self._load_sub_file)
+        self.setAcceptDrops(True)   # drag a .srt (or video) straight onto the window
         self._load_recent()
         # Route shortcut keys app-wide (so they work even when the VLC video has
         # focus) — but never when typing in the chat / notes.
@@ -2691,11 +2755,13 @@ class MainWindow(QMainWindow):
         self.tit = QLabel(""); self.tit.setStyleSheet(f"color:{TS2};font-size:12px;background:transparent;")
         tl.addWidget(self.tit, 1)
 
-        # Chat toggle
-        self.chat_toggle = QPushButton("Chat")
-        self.chat_toggle.setFixedSize(50,28)
+        # Chat toggle — clearly labelled ("Chat IA") so it's easy to find; the old
+        # bare "Chat" pill was too discreet. Accent-filled when active.
+        self.chat_toggle = QPushButton("\U0001F4AC  Chat IA")
+        self.chat_toggle.setFixedHeight(28); self.chat_toggle.setMinimumWidth(92)
+        self.chat_toggle.setCursor(Qt.PointingHandCursor)
         self.chat_toggle.setToolTip(T("chat_toggle_tip"))
-        self.chat_toggle.setStyleSheet(f"QPushButton{{background:transparent;border:1px solid {BRD};border-radius:14px;color:{TS2};font-size:11px;}}QPushButton:hover{{background:{HVR};color:{TXT};border-color:{ACC};}}QPushButton:checked{{background:rgba(255,255,255,0.14);border-color:{ACC};color:{ACC};}}")
+        self.chat_toggle.setStyleSheet(f"QPushButton{{background:transparent;border:1px solid {ACC};border-radius:14px;color:{TS2};font-size:11px;font-weight:600;padding:0 12px;}}QPushButton:hover{{background:{HVR};color:{TXT};border-color:{ACC};}}QPushButton:checked{{background:{ACC};border-color:{ACC};color:{ON_ACC};}}")
         self.chat_toggle.setCheckable(True); self.chat_toggle.setChecked(True)
         self.chat_toggle.clicked.connect(self._toggle_chat)
         tl.addWidget(self.chat_toggle)
@@ -2815,14 +2881,25 @@ class MainWindow(QMainWindow):
         ppl = QHBoxLayout(pbar); ppl.setContentsMargins(16,3,16,5); ppl.setSpacing(6)
         plab = QLabel(T("practice")); plab.setStyleSheet(f"color:{TMT};font-size:10px;font-weight:600;background:transparent;")
         ppl.addWidget(plab)
-        b_rep = prac_btn(T("repeat"), "Repetir a frase atual (Z)"); b_rep.clicked.connect(self.engine.replay_sub)
-        b_prev = prac_btn(T("previous"), "Frase anterior (,)"); b_prev.clicked.connect(self.engine.prev_sub)
-        b_next = prac_btn(T("next"), "Frase seguinte (.)"); b_next.clicked.connect(self.engine.next_sub)
-        b_a = prac_btn("A", "Marcar início do loop (manual)"); b_a.clicked.connect(self._set_loop_a)
-        b_b = prac_btn("B", "Marcar fim do loop e ativar (manual)"); b_b.clicked.connect(self._set_loop_b)
-        self.btn_loop = prac_btn(T("loop"), "Loop da frase atual / desligar (L)", True); self.btn_loop.clicked.connect(self._toggle_loop)
-        self.btn_ap = prac_btn(T("autopause"), "Pausa no fim de cada frase — shadowing (X)", True); self.btn_ap.clicked.connect(self._toggle_autopause)
-        self.btn_hide = prac_btn(T("hide_sub"), "Esconder legenda — recall ativo (H)", True); self.btn_hide.clicked.connect(self._toggle_hide_subs)
+        # Prominent, clearly-labelled subtitle button — the tiny CC icon up in the
+        # controls bar was too easy to miss. Turns green with a ✓ once a sub loads.
+        self.btn_sub = prac_btn(T("sub_add"), T("sub_add_tip"), True)
+        self.btn_sub.setStyleSheet(
+            f"QPushButton{{background:transparent;color:{TS2};border:1px solid {ACC};"
+            f"border-radius:13px;font-size:11px;padding:4px 13px;font-family:'Inter';font-weight:600;}}"
+            f"QPushButton:hover{{background:{HVR};color:{TXT};border-color:{ACC};}}"
+            f"QPushButton:checked{{background:rgba(60,180,90,0.18);color:#9EE6A0;border-color:#3CB45A;}}")
+        self.btn_sub.clicked.connect(self._load_sub_file)
+        ppl.addWidget(self.btn_sub)
+        ppl.addSpacing(4)
+        b_rep = prac_btn(T("repeat"), T("prac_repeat_tip")); b_rep.clicked.connect(self.engine.replay_sub)
+        b_prev = prac_btn(T("previous"), T("prac_prev_tip")); b_prev.clicked.connect(self.engine.prev_sub)
+        b_next = prac_btn(T("next"), T("prac_next_tip")); b_next.clicked.connect(self.engine.next_sub)
+        b_a = prac_btn("A", T("prac_loop_a_tip")); b_a.clicked.connect(self._set_loop_a)
+        b_b = prac_btn("B", T("prac_loop_b_tip")); b_b.clicked.connect(self._set_loop_b)
+        self.btn_loop = prac_btn(T("loop"), T("prac_loop_tip"), True); self.btn_loop.clicked.connect(self._toggle_loop)
+        self.btn_ap = prac_btn(T("autopause"), T("prac_autopause_tip"), True); self.btn_ap.clicked.connect(self._toggle_autopause)
+        self.btn_hide = prac_btn(T("hide_sub"), T("prac_hide_tip"), True); self.btn_hide.clicked.connect(self._toggle_hide_subs)
         for b in (b_rep, b_prev, b_next, b_a, b_b): ppl.addWidget(b)
         ppl.addStretch()
         for b in (self.btn_loop, self.btn_ap, self.btn_hide): ppl.addWidget(b)
@@ -3372,7 +3449,7 @@ class MainWindow(QMainWindow):
         """Called when user clicks the chat icon on a vocab overlay"""
         # Send text to Chat IA
         if hasattr(self, 'chat'):
-            self.chat.input.setText(f"Explica-me esta frase: \"{text}\"")
+            self.chat.input.setText(T("chat_explain_prefix", text=text))
             self.chat.input.setFocus()
             # Make sure chat is visible
             self.chat_toggle.setChecked(True)
@@ -3386,20 +3463,20 @@ class MainWindow(QMainWindow):
         if not on: self.seek.clear_marks()
         if hasattr(self, 'btn_loop'): self.btn_loop.setChecked(on)
         if on:
-            showToast(T("loop_on"), "accent")
+            self._notify(T("loop_on"))
         elif was_on:
-            showToast(T("loop_off"), "accent")
+            self._notify(T("loop_off"))
         elif not self.engine.subs_loaded():
-            showToast(T("loop_need_sub"), "accent")
+            self._notify(T("need_sub_for_tool"))
         else:
-            showToast(T("loop_no_line"), "accent")
+            self._notify(T("loop_no_line"))
 
     def _set_loop_a(self):
         if not self.video_path:
             showToast(T("open_first"), "accent"); return
         a = self.engine.set_loop_a()
         self.seek.set_mark('A', a); self.seek.set_mark('B', None)
-        showToast(f"Ponto A marcado em {FMT(a)} — agora marca B", "accent")
+        showToast(T("loop_a_marked", t=FMT(a)), "accent")
 
     def _set_loop_b(self):
         lp = self.engine.set_loop_b()
@@ -3407,21 +3484,37 @@ class MainWindow(QMainWindow):
             self.overlay._loop_active = True; self.overlay.update()
             self.seek.set_mark('A', lp[0]); self.seek.set_mark('B', lp[1])
             if hasattr(self, 'btn_loop'): self.btn_loop.setChecked(True)
-            showToast(f"Loop A-B ativo: {FMT(lp[0])}–{FMT(lp[1])}", "accent")
+            showToast(T("loop_ab_active", a=FMT(lp[0]), b=FMT(lp[1])), "accent")
         else:
             showToast(T("loop_mark_a"), "accent")
 
     def _toggle_autopause(self):
+        # These tools only do something with a subtitle loaded — otherwise the button
+        # looks dead. Guide the user to load one instead of silently doing nothing.
+        if not self.engine.subs_loaded():
+            if hasattr(self, 'btn_ap'): self.btn_ap.setChecked(False)
+            self._notify(T("need_sub_for_tool")); return
         self._autopause_on = not getattr(self, '_autopause_on', False)
         self.engine.set_autopause(self._autopause_on)
         if hasattr(self, 'btn_ap'): self.btn_ap.setChecked(self._autopause_on)
-        showToast("Auto-pausa por frase: ligada" if self._autopause_on else "Auto-pausa: desligada", "accent")
+        self._notify(T("autopause_on") if self._autopause_on else T("autopause_off"))
 
     def _toggle_hide_subs(self):
+        if not self.engine.subs_loaded():
+            if hasattr(self, 'btn_hide'): self.btn_hide.setChecked(False)
+            self._notify(T("need_sub_for_tool")); return
         self.overlay._hide_subs = not self.overlay._hide_subs
         self.overlay.update()
         if hasattr(self, 'btn_hide'): self.btn_hide.setChecked(self.overlay._hide_subs)
-        showToast("Legenda escondida (rato em baixo para ver)" if self.overlay._hide_subs else "Legenda visível", "accent")
+        self._notify(T("subs_hidden") if self.overlay._hide_subs else T("subs_visible"))
+
+    def _notify(self, msg):
+        """Feedback the user can actually SEE: a flash on the video (works in
+        fullscreen) plus the status-bar message. The status bar alone was too easy
+        to miss, which made the practice buttons feel like they did nothing."""
+        showToast(msg, "accent")
+        if getattr(self, 'overlay', None) and self.video_path:
+            self.overlay.flash(msg)
 
     # ── Playback ──
     def _toggle(self):
@@ -3471,22 +3564,58 @@ class MainWindow(QMainWindow):
             srt = self._recall_sub(path)
             if srt and self.engine.load_srt(srt):
                 self._update_sub_icon()
-                self.sbl.setText(f"CC {Path(srt).name} (memória)")
+                self.sbl.setText(T("sub_from_memory", name=Path(srt).name))
                 return
         self.sbl.setText(Path(path).name)
+
+    # ── Drag & drop: a .srt onto the video loads it; a video opens it ──
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+
+    def dragMoveEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+
+    def dropEvent(self, e):
+        paths = [u.toLocalFile() for u in e.mimeData().urls() if u.toLocalFile()]
+        if not paths:
+            return
+        subs  = [p for p in paths if Path(p).suffix.lower() in ('.srt', '.vtt')]
+        media = [p for p in paths if Path(p).suffix.lower() in (SUPPORTED_VID | SUPPORTED_AUD)]
+        if media:
+            for p in media:
+                self._pl_add(p)
+            self._open_file(media[0])
+        if subs:
+            if not self.engine.path():
+                showToast(T("sub_need_first"), "accent")
+            elif self.engine.load_srt(subs[0]):
+                self._remember_sub(self.engine.path(), subs[0])
+                self._update_sub_icon()
+                name = Path(subs[0]).name
+                self.sbl.setText(f"CC {name}")
+                self.overlay.flash(T("sub_dropped", name=name))
+            else:
+                showToast(T("sub_load_fail"), "accent")
+        e.acceptProposedAction()
 
     def _load_sub_file(self):
         """Open file dialog to load .srt subtitle manually"""
         if not self.engine.path():
-            self.sbl.setText("Abre um vídeo primeiro"); return
+            showToast(T("sub_need_first"), "accent")
+            self.sbl.setText(T("sub_need_first")); return
         path, _ = QFileDialog.getOpenFileName(self, "Carregar legenda", "",
             "Legendas (*.srt *.SRT *.vtt *.VTT);;Todos (*)")
         if path and self.engine.load_srt(path):
             self._remember_sub(self.engine.path(), path)   # remember for next time
             self._update_sub_icon()
-            self.sbl.setText(f"CC {Path(path).name}")
+            name = Path(path).name
+            self.sbl.setText(f"CC {name}")
+            self.overlay.flash(T("sub_dropped", name=name))
         elif path:
             self.sbl.setText(T("sub_load_fail"))
+            self.overlay.flash(T("sub_load_fail"))
 
     # ── Subtitle memory: remember which .srt was used for each video ──
     def _sub_memory(self):
@@ -3517,23 +3646,32 @@ class MainWindow(QMainWindow):
         tr = self.engine.cycle_sub_track()
         self._update_sub_icon()
         if tr >= 0:
-            self.sbl.setText("Legenda ativa")
+            self.sbl.setText(T("sub_track_on"))
         else:
-            self.sbl.setText("Legendas desligadas")
+            self.sbl.setText(T("sub_track_off"))
 
     def _update_sub_icon(self):
-        """Update the subtitle indicator based on loaded subs"""
+        """Update the subtitle indicator based on loaded subs, and the big subtitle
+        button / on-video 'load a subtitle' banner so the state is obvious."""
         srt = self.engine.sub_count()
         vlc_tracks = self.engine.sub_track_count()
+        has_subs = srt > 0 or vlc_tracks > 0
         if srt > 0:
             self.sub_icon.setText(f"CC {srt}")
-            self.sub_icon.setToolTip(f"{srt} legendas carregadas")
+            self.sub_icon.setToolTip(T("subs_loaded_count", n=srt))
         elif vlc_tracks > 0:
             self.sub_icon.setText(f"VLC {vlc_tracks}")
             self.sub_icon.setToolTip(f"{vlc_tracks} faixas VLC")
         else:
             self.sub_icon.setText("")
-            self.sub_icon.setToolTip("Sem legendas")
+            self.sub_icon.setToolTip(T("subs_none"))
+        # Big practice-bar button: green check when a subtitle is loaded.
+        if hasattr(self, 'btn_sub'):
+            self.btn_sub.setText(T("sub_loaded") if has_subs else T("sub_add"))
+            self.btn_sub.setChecked(has_subs)
+        # On-video banner: only when a video is open and there's still no subtitle.
+        if hasattr(self, 'overlay'):
+            self.overlay.set_no_sub_hint(bool(self.video_path) and not has_subs)
 
     def _cycle_spd(self):
         spds = [0.5,0.75,1.0,1.25,1.5,2.0]
@@ -3545,7 +3683,7 @@ class MainWindow(QMainWindow):
         if not self.video_path: return
         bm = {"pos":self.engine.get_pos(),"label":f"Marco {len(self.mgr.get_bm(self.video_path))+1}","note":"","created":datetime.now().isoformat()}
         self.mgr.d["bookmarks"].setdefault(str(self.video_path),[]).append(bm); self.mgr.save()
-        self._add_bm_item(bm); self.sbl.setText(f"Marcador {FMT(bm['pos'])}")
+        self._add_bm_item(bm); self.sbl.setText(T("bookmark_saved", t=FMT(bm['pos'])))
     def _add_bm_item(self, bm):
         self.bw.addItem(QListWidgetItem(f"{FMT(bm.get('pos',0))}  {bm.get('label','')}")); self.bw.item(self.bw.count()-1).setData(Qt.UserRole,bm)
     def _bm_menu(self, pos):
@@ -3567,7 +3705,7 @@ class MainWindow(QMainWindow):
         if not self.video_path or not t: return
         an = {"pos":self.engine.get_pos(),"text":t,"created":datetime.now().isoformat()}
         self.mgr.d["annotations"].setdefault(str(self.video_path),[]).append(an); self.mgr.save()
-        self._add_an_item(an); self.te.clear(); self.sbl.setText("Nota")
+        self._add_an_item(an); self.te.clear(); self.sbl.setText(T("note_saved"))
     def _add_an_item(self, an):
         t = an.get('text',''); self.aw.addItem(QListWidgetItem(f"{FMT(an.get('pos',0))} {t[:50]}")); self.aw.item(self.aw.count()-1).setData(Qt.UserRole,an)
     def _an_menu(self, pos):

@@ -41,7 +41,8 @@ Name: "desktopicon"; Description: "Criar atalho no Ambiente de Trabalho"; GroupD
 Name: "startup"; Description: "Iniciar com o Windows"; GroupDescription: "Inicialização:"; Flags: unchecked
 
 [Files]
-Source: "dist\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+; One-dir PyInstaller build: ship the whole folder (exe + _internal + bundled VLC).
+Source: "dist\LexioStudyPlayer\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 
 [Icons]
