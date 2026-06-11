@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Lexio Study Player v3.6.0 — VLC embutido (standalone) + Vocab Overlay + Chat IA
+Lexio Study Player v3.7.0 — VLC embutido (standalone) + Legendas online + Vocab Overlay + Chat IA
 """
 import os, sys, json, webbrowser, subprocess, threading, re, traceback, time
 from pathlib import Path
@@ -19,7 +19,7 @@ def log(msg):
             f.write(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}\n")
     except: pass
 
-log("=== LEXIO PLAYER v3.6.0 === (pyinstaller-friendly)")
+log("=== LEXIO PLAYER v3.7.0 === (pyinstaller-friendly)")
 
 # ── VLC path ──
 # A self-contained build ships libvlc.dll + libvlccore.dll + the plugins folder
@@ -116,7 +116,7 @@ ACC_HOVER = "#cfcfcf"  # dimmer white on hover
 ON_ACC = "#000000"   # text/icon ON white accent
 
 APP_NAME = "Lexio Study Player"
-APP_VERSION = "3.6.0"
+APP_VERSION = "3.7.0"
 DATA_DIR = Path.home() / '.lexio-player'; DATA_DIR.mkdir(exist_ok=True)
 RECENT_FILE = DATA_DIR / 'recent.json'
 STUDY_FILE = DATA_DIR / 'study-data.json'
@@ -1541,6 +1541,185 @@ def local_card_pixmap(word, context="", w=400, h=240):
     return pm
 
 
+# ── Online subtitle search (OpenSubtitles legacy REST — keyless) ──────────────
+# ISO 639-1 (UI codes) → ISO 639-2/B (what OpenSubtitles' sublanguageid expects).
+_OS_LANG3 = {
+    "en": "eng", "pt": "por", "es": "spa", "fr": "fre", "de": "ger", "it": "ita",
+    "nl": "dut", "ru": "rus", "ar": "ara", "zh": "chi", "ja": "jpn", "ko": "kor",
+    "hi": "hin", "tr": "tur", "pl": "pol", "sv": "swe", "vi": "vie", "th": "tha",
+    "id": "ind", "uk": "ukr", "ro": "rum", "el": "ell", "cs": "cze", "da": "dan",
+    "fi": "fin", "no": "nor", "hu": "hun", "he": "heb", "fa": "per", "bg": "bul",
+    "hr": "hrv", "sr": "srp", "sk": "slo", "sl": "slv", "et": "est", "lt": "lit",
+    "lv": "lav", "ca": "cat", "gl": "glg", "eu": "eus", "is": "ice", "sq": "alb",
+}
+# A sensible default order for the language picker (covers most learners).
+_OS_LANG_ORDER = ["en", "es", "pt", "fr", "de", "it", "nl", "ru", "ar", "zh",
+                  "ja", "ko", "hi", "tr", "pl", "sv", "vi", "th", "id", "uk",
+                  "ro", "el", "cs", "da", "fi", "no", "hu", "he", "fa"]
+_OS_UA = "TemporaryUserAgent"   # OpenSubtitles' documented keyless test UA
+
+def _clean_sub_query(stem):
+    """Turn a video filename into a clean search query: drop release tags
+    (1080p, x264, BluRay…), years and separators, keep the title words."""
+    s = re.sub(r"[._]+", " ", stem or "")
+    s = re.sub(r"\[[^\]]*\]|\([^)]*\)", " ", s)        # bracketed groups
+    s = re.split(r"\b(19|20)\d{2}\b", s)[0] or s        # cut at a year
+    s = re.sub(r"\b(1080p|720p|480p|2160p|4k|x264|x265|h264|h265|hevc|bluray|"
+               r"blu-ray|brrip|bdrip|webrip|web-dl|webdl|hdrip|dvdrip|xvid|aac|"
+               r"ac3|dts|hdtv|proper|repack|remux|yify|yts|rarbg)\b.*$", "",
+               s, flags=re.I)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s or (stem or "")
+
+
+class SubSearchDialog(QDialog):
+    """Search OpenSubtitles (keyless legacy API) for a subtitle and load it.
+    All network work runs off the UI thread; results come back via signals.
+    On accept, ``self.result_path`` holds the saved .srt path."""
+    _search_done = pyqtSignal(object, object)   # (results | None, error | None)
+    _dl_done = pyqtSignal(object, object)        # (saved_path | None, error | None)
+
+    def __init__(self, parent, query, video_path, default_lang):
+        super().__init__(parent)
+        self.setWindowTitle(T("subsearch_title"))
+        self.setMinimumSize(560, 460)
+        self.setStyleSheet(f"background:{BG};color:{TXT};")
+        self.result_path = None
+        self._video_path = video_path
+        self._busy = False
+
+        lo = QVBoxLayout(self); lo.setContentsMargins(16, 14, 16, 14); lo.setSpacing(10)
+        title = QLabel(T("subsearch_title"))
+        title.setStyleSheet(f"color:{TXT};font-size:15px;font-weight:bold;background:transparent;")
+        lo.addWidget(title)
+
+        # Query + language + search button
+        row = QHBoxLayout(); row.setSpacing(8)
+        self.q = QLineEdit(query)
+        self.q.setPlaceholderText(T("subsearch_query"))
+        self.q.setStyleSheet(f"QLineEdit{{background:{ELV};color:{TXT};border:1px solid {BRD};"
+                             f"border-radius:6px;padding:7px 10px;font-size:12px;}}QLineEdit:focus{{border-color:{ACC};}}")
+        row.addWidget(self.q, 1)
+        self.lang = QComboBox()
+        self.lang.setStyleSheet(
+            f"QComboBox{{background:{ELV};color:{TXT};border:1px solid {BRD};border-radius:6px;padding:6px 8px;font-size:12px;}}"
+            f"QComboBox QAbstractItemView{{background:{ELV};color:{TXT};selection-background-color:{HVR};}}")
+        for code in _OS_LANG_ORDER:
+            self.lang.addItem(i18n.language_display_name(code), code)
+        di = self.lang.findData(default_lang)
+        if di >= 0:
+            self.lang.setCurrentIndex(di)
+        row.addWidget(self.lang)
+        self.btn = QPushButton(T("subsearch_btn"))
+        self.btn.setStyleSheet(f"QPushButton{{background:{ACC};color:{ON_ACC};border:none;border-radius:6px;"
+                               f"padding:7px 16px;font-size:12px;font-weight:600;}}QPushButton:hover{{background:{ACC_HOVER};}}")
+        self.btn.clicked.connect(self._do_search)
+        row.addWidget(self.btn)
+        lo.addLayout(row)
+
+        self.results = QListWidget()
+        self.results.setStyleSheet(
+            f"QListWidget{{background:{SRF};color:{TXT};border:1px solid {BRD};border-radius:6px;font-size:12px;}}"
+            f"QListWidget::item{{padding:7px 9px;border-bottom:1px solid {BRD};}}"
+            f"QListWidget::item:selected{{background:{HVR};color:{TXT};}}")
+        self.results.itemDoubleClicked.connect(self._download_selected)
+        lo.addWidget(self.results, 1)
+
+        self.status = QLabel(T("subsearch_hint"))
+        self.status.setStyleSheet(f"color:{TMT};font-size:11px;background:transparent;")
+        lo.addWidget(self.status)
+
+        self._search_done.connect(self._on_search_done)
+        self._dl_done.connect(self._on_dl_done)
+        self.q.returnPressed.connect(self._do_search)
+        QTimer.singleShot(250, self._do_search)   # auto-search with the prefilled title
+
+    # — search —
+    def _do_search(self):
+        if self._busy:
+            return
+        q = self.q.text().strip()
+        if not q:
+            return
+        lang3 = _OS_LANG3.get(self.lang.currentData(), "eng")
+        self._busy = True; self.btn.setEnabled(False)
+        self.results.clear(); self.status.setText(T("subsearch_searching"))
+        threading.Thread(target=self._search_worker, args=(q, lang3), daemon=True).start()
+
+    def _search_worker(self, q, lang3):
+        try:
+            from urllib.parse import quote
+            url = (f"https://rest.opensubtitles.org/search/"
+                   f"query-{quote(q)}/sublanguageid-{lang3}")
+            req = Request(url, headers={"X-User-Agent": _OS_UA, "User-Agent": _OS_UA})
+            raw = urlopen(req, timeout=25).read().decode("utf-8", "replace")
+            data = json.loads(raw)
+            if not isinstance(data, list):
+                data = []
+            # Keep the most-downloaded first, cap the list.
+            data.sort(key=lambda d: int(d.get("SubDownloadsCnt") or 0), reverse=True)
+            self._search_done.emit(data[:40], None)
+        except Exception as e:
+            log(f"subsearch: {e}")
+            self._search_done.emit(None, str(e))
+
+    def _on_search_done(self, data, err):
+        self._busy = False; self.btn.setEnabled(True)
+        if err is not None:
+            self.status.setText(T("subsearch_fail")); return
+        if not data:
+            self.status.setText(T("subsearch_none")); return
+        for d in data:
+            name = d.get("MovieReleaseName") or d.get("SubFileName") or "—"
+            dls = d.get("SubDownloadsCnt") or "0"
+            lang = d.get("LanguageName") or ""
+            it = QListWidgetItem(f"{name}\n   {lang} · ⬇ {dls}")
+            it.setData(Qt.UserRole, d.get("SubDownloadLink") or "")
+            self.results.addItem(it)
+        self.status.setText(T("subsearch_hint"))
+
+    # — download —
+    def _download_selected(self, item):
+        if self._busy or item is None:
+            return
+        link = item.data(Qt.UserRole)
+        if not link:
+            return
+        self._busy = True; self.status.setText(T("subsearch_downloading"))
+        threading.Thread(target=self._dl_worker, args=(link,), daemon=True).start()
+
+    def _dl_worker(self, link):
+        try:
+            import gzip
+            req = Request(link, headers={"X-User-Agent": _OS_UA, "User-Agent": _OS_UA})
+            blob = urlopen(req, timeout=30).read()
+            try:
+                srt_bytes = gzip.decompress(blob)
+            except Exception:
+                srt_bytes = blob   # some mirrors return the raw .srt
+            # utf-8-sig strips a leading BOM (OpenSubtitles files often carry one),
+            # which would otherwise corrupt the first cue index for the parser.
+            text = srt_bytes.decode("utf-8-sig", "replace")
+            # Save next to the video (so it's auto-found next time); fall back to the data dir.
+            try:
+                dest = Path(self._video_path).with_suffix(".srt")
+                dest.write_text(text, encoding="utf-8")
+            except Exception:
+                dest = DATA_DIR / (Path(self._video_path).stem + ".srt")
+                dest.write_text(text, encoding="utf-8")
+            self._dl_done.emit(str(dest), None)
+        except Exception as e:
+            log(f"subdl: {e}")
+            self._dl_done.emit(None, str(e))
+
+    def _on_dl_done(self, path, err):
+        self._busy = False
+        if err is not None or not path:
+            self.status.setText(T("subsearch_dl_fail")); return
+        self.result_path = path
+        self.accept()
+
+
 class LoginDialog(QDialog):
     """Embedded browser for Google OAuth login — captures Supabase JWT automatically."""
     def __init__(self, parent=None):
@@ -2891,6 +3070,9 @@ class MainWindow(QMainWindow):
             f"QPushButton:checked{{background:rgba(60,180,90,0.18);color:#9EE6A0;border-color:#3CB45A;}}")
         self.btn_sub.clicked.connect(self._load_sub_file)
         ppl.addWidget(self.btn_sub)
+        self.btn_sub_online = prac_btn(T("sub_online"), T("sub_online_tip"))
+        self.btn_sub_online.clicked.connect(self._search_subs_online)
+        ppl.addWidget(self.btn_sub_online)
         ppl.addSpacing(4)
         b_rep = prac_btn(T("repeat"), T("prac_repeat_tip")); b_rep.clicked.connect(self.engine.replay_sub)
         b_prev = prac_btn(T("previous"), T("prac_prev_tip")); b_prev.clicked.connect(self.engine.prev_sub)
@@ -3616,6 +3798,22 @@ class MainWindow(QMainWindow):
         elif path:
             self.sbl.setText(T("sub_load_fail"))
             self.overlay.flash(T("sub_load_fail"))
+
+    def _search_subs_online(self):
+        """Open the OpenSubtitles search dialog, prefilled from the video name."""
+        if not self.engine.path():
+            showToast(T("sub_need_first"), "accent"); return
+        query = _clean_sub_query(Path(self.video_path).stem)
+        dlg = SubSearchDialog(self, query, self.video_path, i18n.current_lang())
+        if dlg.exec_() == QDialog.Accepted and dlg.result_path:
+            if self.engine.load_srt(dlg.result_path):
+                self._remember_sub(self.engine.path(), dlg.result_path)
+                self._update_sub_icon()
+                name = Path(dlg.result_path).name
+                self.sbl.setText(f"CC {name}")
+                self.overlay.flash(T("sub_dropped", name=name))
+            else:
+                self._notify(T("sub_load_fail"))
 
     # ── Subtitle memory: remember which .srt was used for each video ──
     def _sub_memory(self):
