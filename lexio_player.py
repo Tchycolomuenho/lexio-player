@@ -1541,16 +1541,24 @@ class ChatPanel(QWidget):
     login_result = pyqtSignal(object, object)          # (auth_data | None, error | None)
     chat_result = pyqtSignal(object, object, object, bool)  # (resp, err, loader, relogin)
     promote_result = pyqtSignal(object, object)        # (word, error | None) — add-to-main-vocab
+    user_ctx_ready = pyqtSignal(object)                # (dict) — perfil + atividade lidos da conta
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._messages = []
         self._token = self._load_token()
+        self._user_name = ""           # nome do utilizador (perfil da web)
+        self._user_target = ""         # língua-alvo da conta
+        self._activity_summary = ""    # resumo da atividade (player+web) p/ a IA "conhecer" o user
         self._setup_ui()
         self._ai_thread = None
         self.login_result.connect(self._on_login_done)
         self.chat_result.connect(self._on_chat_result)
         self.promote_result.connect(self._on_promote_result)
+        self.user_ctx_ready.connect(self._on_user_ctx)
+        # Se já há sessão guardada, conhece o utilizador logo ao arrancar.
+        if self._token and self._token.get("access_token"):
+            QTimer.singleShot(800, self._fetch_user_context)
 
     def _load_token(self):
         """Load full auth data from token file."""
@@ -1742,13 +1750,66 @@ class ChatPanel(QWidget):
         self.login_btn.setEnabled(True)
         if auth and auth.get("access_token"):
             self._save_token_data(auth)
-            self.login_btn.setText("Conta")
+            self.login_btn.setText(T("account"))
             self._add_msg(T("login_connected"), "system")
             log("Login: success, token saved")
+            self._fetch_user_context()   # conhece o utilizador (perfil + atividade)
         elif err:
             self._add_msg(T("login_failed", err=err), "system")
         else:
             self._add_msg(T("login_cancelled"), "system")
+
+    # ── Conhecer o utilizador: lê perfil + atividade da conta web ──
+    def _fetch_user_context(self):
+        header = self._get_token_header()
+        if not header:
+            return
+        threading.Thread(target=self._user_ctx_worker, args=(header,), daemon=True).start()
+
+    def _user_ctx_worker(self, header):
+        import base64
+        try:
+            tok = header.split(" ", 1)[1]; pl = tok.split(".")[1]; pl += "=" * (-len(pl) % 4)
+            uid = json.loads(base64.urlsafe_b64decode(pl).decode()).get("sub")
+            if not uid:
+                return
+            ih = {"apikey": SUPABASE_ANON, "Authorization": header}
+            info = {"name": "", "target": "", "videos": []}
+            try:
+                u = f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{uid}&select=display_name,target_lang"
+                d = json.loads(urlopen(Request(u, headers=ih), timeout=15).read().decode())
+                if d:
+                    info["name"] = d[0].get("display_name") or ""
+                    info["target"] = d[0].get("target_lang") or ""
+            except Exception as e:
+                log(f"profile fetch: {e}")
+            try:
+                u = (f"{SUPABASE_URL}/rest/v1/player_sessions?user_id=eq.{uid}"
+                     "&select=video_title&order=started_at.desc&limit=15")
+                d = json.loads(urlopen(Request(u, headers=ih), timeout=15).read().decode())
+                seen = set()
+                for r in d:
+                    v = (r.get("video_title") or "").strip()
+                    if v and v not in seen:
+                        seen.add(v); info["videos"].append(v)
+            except Exception as e:
+                log(f"sessions fetch: {e}")
+            self.user_ctx_ready.emit(info)
+        except Exception as e:
+            log(f"user ctx: {e}")
+
+    def _on_user_ctx(self, info):
+        self._user_name = info.get("name", "") or ""
+        self._user_target = info.get("target", "") or ""
+        vids = (info.get("videos") or [])[:6]
+        parts = []
+        if self._user_target:
+            parts.append(f"Their learning language is {self._user_target}.")
+        if vids:
+            parts.append("Recently watched on the Lexio player: " + "; ".join(vids) + ".")
+        self._activity_summary = " ".join(parts)
+        if self._user_name:
+            self._add_msg(T("greet_user", name=self._user_name), "system")
 
     def _send(self):
         t = self.input.text().strip()
@@ -1813,6 +1874,11 @@ class ChatPanel(QWidget):
                 # player: língua nativa, vídeo atual, e as palavras que ele guardou.
                 parts = ["You are Lexio's in-player AI tutor for a language learner watching a video.",
                          f"Always reply in the user's native language ({native_language_name()}), warm and concise."]
+                if self._user_name:
+                    parts.append(f"The user's name is {self._user_name}.")
+                if self._activity_summary:
+                    parts.append("What you already know about this user (across the Lexio web app "
+                                 "and desktop player): " + self._activity_summary)
                 video_name = None
                 if self.parent() and hasattr(self.parent(), 'engine') and self.parent().engine.path():
                     video_name = Path(self.parent().engine.path()).name
@@ -2301,6 +2367,10 @@ class MainWindow(QMainWindow):
         self._transport_overlay = None     # floating seek+controls window (study mode)
         self._transport_floating = False
         self._controls_state = {}  # save/restore visibility
+        # Sessão do player → enviada p/ player_sessions (a IA da web fica a saber).
+        self._session_start = None
+        self._session_video = ""
+        self._session_words = []
         try: self._setup()
         except Exception as e: log(f"FATAL: {e}\n{traceback.format_exc()}"); raise
 
@@ -2859,6 +2929,8 @@ class MainWindow(QMainWindow):
                 saved.append({"text": text, "time": datetime.now().isoformat(), "video": video})
                 vocab_file.write_text(json.dumps(saved, indent=2, ensure_ascii=False), encoding='utf-8')
             self._load_video_vocab()           # refresh the dedicated Vídeos tab
+            if text not in self._session_words:
+                self._session_words.append(text)   # entra na atividade da sessão
             # Push to the web as a pending word (silent if logged out → stays local).
             synced = self.chat.sync_saved_word(text, video) if hasattr(self, "chat") else False
             # Make it obvious WHERE the word went. The status-bar toast is hidden
@@ -3048,6 +3120,7 @@ class MainWindow(QMainWindow):
     def _open_file(self, path):
         if not path or not Path(path).exists(): return
         self.engine.stop(); self.video_path = path
+        self._roll_session(Path(path).name)   # envia a sessão anterior, começa nova
         self.seek.clear_marks()
         self._add_recent(path)
         self.setWindowTitle(f"{Path(path).name} — {APP_NAME}")
@@ -3283,7 +3356,52 @@ class MainWindow(QMainWindow):
             elif self.isFullScreen(): self.setWindowState(Qt.WindowNoState)
         else: super().keyPressEvent(e)
 
-    def closeEvent(self, e): self.engine.cleanup(); super().closeEvent(e)
+    def closeEvent(self, e):
+        try: self._push_player_session()   # grava a sessão final p/ a IA da web saber
+        except Exception: pass
+        self.engine.cleanup(); super().closeEvent(e)
+
+    # ── Sessões do player → player_sessions (atividade que a IA da web lê) ──
+    def _roll_session(self, new_video):
+        self._push_player_session()
+        self._session_start = datetime.now()
+        self._session_video = new_video or ""
+        self._session_words = []
+
+    def _push_player_session(self):
+        if not self._session_start or not self._session_video:
+            self._session_start = None
+            return
+        header = self.chat._get_token_header() if hasattr(self, "chat") else None
+        start, video, words = self._session_start, self._session_video, list(self._session_words)
+        self._session_start = None
+        if not header:
+            return
+        threading.Thread(target=self._session_worker,
+                         args=(header, start, video, words), daemon=True).start()
+
+    def _session_worker(self, header, start, video, words):
+        import base64
+        try:
+            tok = header.split(" ", 1)[1]; pl = tok.split(".")[1]; pl += "=" * (-len(pl) % 4)
+            uid = json.loads(base64.urlsafe_b64decode(pl).decode()).get("sub")
+            if not uid:
+                return
+            end = datetime.now()
+            dur = max(0, int((end - start).total_seconds()))
+            if dur < 5:                       # ignora aberturas triviais
+                return
+            row = {"user_id": uid, "started_at": start.isoformat(), "ended_at": end.isoformat(),
+                   "duration_seconds": dur, "video_title": video, "words_encountered": words,
+                   "chat_messages_count": 0,
+                   "target_lang": (getattr(self.chat, "_user_target", "") or "en")[:5]}
+            ih = {"Content-Type": "application/json", "apikey": SUPABASE_ANON,
+                  "Authorization": header, "Prefer": "return=minimal"}
+            urlopen(Request(f"{SUPABASE_URL}/rest/v1/player_sessions",
+                            data=json.dumps(row).encode(), headers=ih), timeout=20)
+            log(f"player_session pushed: {video} ({dur}s, {len(words)} words)")
+        except Exception as e:
+            log(f"push session: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -700,3 +700,18 @@ STRINGS.update({
                          "ja": "Lexio サーバーに接続中...", "ko": "Lexio 서버에 연결 중...",
                          "ru": "Подключение к серверу Lexio...", "ar": "جارٍ الاتصال بخادم Lexio..."},
 })
+
+STRINGS.update({
+    "greet_user": {"en": "Hi {name}! I know your videos and saved words — ask me anything.",
+                   "pt": "Olá {name}! Conheço os teus vídeos e palavras guardadas — pergunta o que quiseres.",
+                   "es": "¡Hola {name}! Conozco tus vídeos y palabras guardadas — pregúntame lo que quieras.",
+                   "fr": "Salut {name} ! Je connais tes vidéos et tes mots enregistrés — demande-moi ce que tu veux.",
+                   "de": "Hallo {name}! Ich kenne deine Videos und gespeicherten Wörter — frag mich alles.",
+                   "it": "Ciao {name}! Conosco i tuoi video e le parole salvate — chiedimi pure.",
+                   "nl": "Hoi {name}! Ik ken je video's en opgeslagen woorden — vraag me alles.",
+                   "zh": "你好 {name}！我了解你的视频和已保存的词语 — 有问题尽管问。",
+                   "ja": "こんにちは {name} さん！あなたの動画と保存した単語を把握しています — 何でも聞いてください。",
+                   "ko": "안녕하세요 {name}님! 당신의 영상과 저장한 단어를 알고 있어요 — 무엇이든 물어보세요.",
+                   "ru": "Привет, {name}! Я знаю твои видео и сохранённые слова — спрашивай что угодно.",
+                   "ar": "مرحبًا {name}! أعرف مقاطعك وكلماتك المحفوظة — اسألني أي شيء."},
+})
