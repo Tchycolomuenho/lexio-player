@@ -3,7 +3,7 @@
 ; uninstaller, and optional file associations
 
 #define MyAppName "Lexio Study Player"
-#define MyAppVersion "3.1.1"
+#define MyAppVersion "3.2.0"
 #define MyAppPublisher "Lexio"
 #define MyAppURL "https://github.com/amandioestevao/lexio-player"
 #define MyAppExeName "LexioStudyPlayer.exe"

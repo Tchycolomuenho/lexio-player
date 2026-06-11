@@ -9,7 +9,7 @@ a = Analysis(
         ('icon.png', '.'),
         ('fonts/Inter.ttf', 'fonts'),
     ],
-    hiddenimports=['vlc'],
+    hiddenimports=['vlc', 'i18n'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

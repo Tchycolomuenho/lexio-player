@@ -63,7 +63,7 @@ try:
         QLabel, QPushButton, QSlider, QFileDialog, QListWidget, QListWidgetItem,
         QMenu, QMessageBox, QTextEdit, QLineEdit,
         QTabWidget, QStatusBar, QScrollArea, QSizePolicy, QDialog,
-        QGraphicsOpacityEffect, QStyle, QStyleOptionSlider, QFileIconProvider
+        QGraphicsOpacityEffect, QStyle, QStyleOptionSlider, QFileIconProvider, QComboBox
     )
     from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEngineProfile, QWebEnginePage
     from PyQt5.QtWebChannel import QWebChannel
@@ -113,6 +113,72 @@ SUPPORTED = SUPPORTED_VID | SUPPORTED_AUD
 LEXIO_API = "https://lexio-app-five.vercel.app"
 SUPABASE_URL = "https://lobwdstwpcbuljferyyo.supabase.co"
 SUPABASE_ANON = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImxvYndkc3R3cGNidWxqZmVyeXlvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzk3NDI5MTIsImV4cCI6MjA5NTMxODkxMn0.GvJRLDE6yLhgDQUq-ckjgRZWbpvS4eKsUZglNyBsjSA"
+
+# ── i18n: UI traduzida; a língua é ESCOLHIDA pelo utilizador no player e fica
+# guardada localmente. Conteúdo (dicionário/chat) herda a língua nativa da conta.
+import i18n
+from i18n import T, set_lang, set_native, native_language_name
+
+i18n.set_cache_dir(str(DATA_DIR / 'i18n-cache'))   # traduções IA on-demand ficam aqui
+_UI_LANG_FILE = DATA_DIR / 'ui-lang.txt'
+
+def load_ui_lang():
+    """Língua da UI: a escolhida pelo utilizador (ficheiro), senão a do SO, senão EN."""
+    try:
+        if _UI_LANG_FILE.exists():
+            code = _UI_LANG_FILE.read_text(encoding='utf-8').strip()
+            if code:
+                return code
+    except Exception:
+        pass
+    try:
+        import locale
+        loc = (locale.getdefaultlocale()[0] or "").split("_")[0].lower()
+        if loc:
+            return loc
+    except Exception:
+        pass
+    return "en"
+
+def save_ui_lang(code):
+    try:
+        _UI_LANG_FILE.write_text(str(code), encoding='utf-8')
+    except Exception as e:
+        log(f"save ui lang: {e}")
+
+def translate_ui_via_ai(code):
+    """Traduz TODAS as strings da UI para `code` via IA (deepseek) e guarda em
+    cache, para o player suportar qualquer língua. Devolve True se conseguiu."""
+    try:
+        lang_en = i18n.language_en_name(code)
+        base = i18n.base_strings()
+        sys_p = (
+            "You are a professional software UI translator. You receive a JSON object "
+            f"of UI strings. Translate every VALUE into {lang_en}. Keep every KEY exactly "
+            "as-is. Preserve placeholders such as {where}, {text}, {err} verbatim. Keep "
+            "translations short (these are buttons, labels, tooltips). Reply with ONLY the "
+            "translated JSON object — no markdown, no prose.")
+        body = json.dumps({"model": "deepseek-chat", "max_tokens": 4000, "temperature": 0.1,
+            "messages": [{"role": "system", "content": sys_p},
+                         {"role": "user", "content": json.dumps(base, ensure_ascii=False)}]}).encode()
+        r = urlopen(Request(f"{LEXIO_API}/api/deepseek-chat", data=body,
+                            headers={"Content-Type": "application/json"}), timeout=90)
+        d = json.loads(r.read().decode())
+        raw = (d.get("text") or "").strip()
+        if not raw and d.get("choices"):
+            raw = d["choices"][0].get("message", {}).get("content", "")
+        raw = raw.strip().strip("`")
+        mapping = json.loads(raw[raw.find("{"): raw.rfind("}") + 1])
+        mapping = {k: str(v) for k, v in mapping.items() if k in base and v}
+        if len(mapping) >= len(base) // 2:   # tradução suficientemente completa
+            i18n.register_translations(code, mapping)
+            return True
+    except Exception as e:
+        log(f"ui translate {code}: {e}")
+    return False
+
+set_lang(load_ui_lang())   # aplica antes de construir a UI
+set_native(load_ui_lang())  # conteúdo (dicionário/chat) na língua escolhida; conta pode sobrepor no login
 
 def FMT(sec):
     s = max(0, int(sec)); h,s = divmod(s,3600); m,s = divmod(s,60)
@@ -1266,7 +1332,7 @@ class LoginDialog(QDialog):
     """Embedded browser for Google OAuth login — captures Supabase JWT automatically."""
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Lexio — Iniciar Sessão")
+        self.setWindowTitle(T("login_title"))
         self.setMinimumSize(500, 720)
         self.setStyleSheet(f"background:{BG};")
         self._auth_data = None
@@ -1277,7 +1343,7 @@ class LoginDialog(QDialog):
         hdr = QWidget(); hdr.setFixedHeight(40)
         hdr.setStyleSheet(f"background:{ELV};border-bottom:1px solid {BRD};")
         hl = QHBoxLayout(hdr); hl.setContentsMargins(12,0,12,0)
-        title = QLabel("Iniciar sessão com Google")
+        title = QLabel(T("login_google"))
         title.setStyleSheet(f"color:{TXT};font-size:13px;font-weight:bold;background:transparent;")
         hl.addWidget(title)
         hl.addStretch()
@@ -1306,7 +1372,7 @@ class LoginDialog(QDialog):
         lo.addWidget(self.browser, 1)
 
         # ── Status bar ──
-        self.status = QLabel("A carregar...")
+        self.status = QLabel(T("login_loading"))
         self.status.setFixedHeight(28)
         self.status.setStyleSheet(f"color:{TMT};font-size:11px;padding:4px 12px;background:{SRF};border-top:1px solid {BRD};")
         lo.addWidget(self.status)
@@ -1317,7 +1383,7 @@ class LoginDialog(QDialog):
     def _start_flow(self):
         """Step 1: get Google OAuth URL from the Lexio API, then navigate."""
         try:
-            self.status.setText("A contactar servidor Lexio...")
+            self.status.setText(T("login_contacting"))
             r = urlopen(Request(f"{LEXIO_API}/api/auth", headers={"User-Agent": APP_NAME}), timeout=10)
             data = json.loads(r.read().decode())
             url = data.get("url")
@@ -1579,11 +1645,11 @@ class ChatPanel(QWidget):
         hdr = QWidget(); hdr.setFixedHeight(40)
         hdr.setStyleSheet(f"background:{ELV};border-bottom:1px solid {BRD};")
         hl = QHBoxLayout(hdr); hl.setContentsMargins(12,0,8,0)
-        title = QLabel("Chat IA")
+        title = QLabel(T("chat_ai"))
         title.setStyleSheet(f"color:{TXT};font-size:14px;font-weight:600;font-family:'Inter';background:transparent;")
         hl.addWidget(title)
         hl.addStretch()
-        self.login_btn = QPushButton("Login" if not self._token else "Conta")
+        self.login_btn = QPushButton(T("login") if not self._token else T("account"))
         self.login_btn.setFixedSize(46,22)
         self.login_btn.setStyleSheet(f"QPushButton{{background:transparent;border:1px solid {BRD};border-radius:11px;color:{TS2};font-size:11px;}}QPushButton:hover{{background:{HVR};color:{TXT};}}")
         self.login_btn.clicked.connect(self._handle_login)
@@ -1599,7 +1665,7 @@ class ChatPanel(QWidget):
         scroll.setWidget(self.mw)
         lo.addWidget(scroll, 1)
 
-        self.welcome = QLabel("Pergunta sobre o vídeo\n\nEx: \"Explica este conceito\"\n\"Traduz esta parte\"")
+        self.welcome = QLabel(T("chat_welcome"))
         self.welcome.setStyleSheet(f"color:{TMT};font-size:12.5px;font-family:'Inter';line-height:1.6;background:transparent;padding:24px;")
         self.welcome.setWordWrap(True); self.welcome.setAlignment(Qt.AlignCenter)
         self.ml.insertWidget(0, self.welcome)
@@ -1607,7 +1673,7 @@ class ChatPanel(QWidget):
         inp = QWidget(); inp.setStyleSheet(f"background:{ELV};border-top:1px solid {BRD};")
         il = QHBoxLayout(inp); il.setContentsMargins(6,6,6,6)
         self.input = QLineEdit()
-        self.input.setPlaceholderText("Pergunta...")
+        self.input.setPlaceholderText(T("chat_placeholder"))
         self.input.setStyleSheet(f"QLineEdit{{background:{ELV};color:{TXT};border:1px solid {BRD};border-radius:19px;padding:9px 15px;font-size:12.5px;font-family:'Inter';}}QLineEdit:focus{{border-color:{ACC};background:{HVR};}}")
         self.input.returnPressed.connect(self._send)
         il.addWidget(self.input, 1)
@@ -1632,14 +1698,14 @@ class ChatPanel(QWidget):
             if reply == QMessageBox.Yes:
                 self._clear_token()
                 self.login_btn.setText("Login")
-                self._add_msg("Sessão terminada.", "system")
+                self._add_msg(T("session_ended"), "system")
             return
 
         # System-browser OAuth: Google blocks login inside embedded webviews, so we
         # open the user's real browser and capture the redirect on a loopback server.
         self.login_btn.setEnabled(False)
         self.welcome.hide()
-        self._add_msg("A abrir o browser para iniciares sessão com o Google...", "system")
+        self._add_msg(T("login_open_browser"), "system")
         threading.Thread(target=self._login_flow, daemon=True).start()
 
     def _login_flow(self):
@@ -1677,12 +1743,12 @@ class ChatPanel(QWidget):
         if auth and auth.get("access_token"):
             self._save_token_data(auth)
             self.login_btn.setText("Conta")
-            self._add_msg("Conta conectada com sucesso!", "system")
+            self._add_msg(T("login_connected"), "system")
             log("Login: success, token saved")
         elif err:
-            self._add_msg(f"Login falhou: {err}", "system")
+            self._add_msg(T("login_failed", err=err), "system")
         else:
-            self._add_msg("Login cancelado ou expirado. Tenta novamente.", "system")
+            self._add_msg(T("login_cancelled"), "system")
 
     def _send(self):
         t = self.input.text().strip()
@@ -1730,7 +1796,7 @@ class ChatPanel(QWidget):
         self.ml.insertWidget(self.ml.count() - 1, c)
 
     def _call_ai(self, text):
-        load = QLabel("A pensar..."); load.setStyleSheet(f"color:{ACC};font-size:11px;padding:4px;background:transparent;font-weight:bold;")
+        load = QLabel(T("thinking")); load.setStyleSheet(f"color:{ACC};font-size:11px;padding:4px;background:transparent;font-weight:bold;")
         lc = QWidget(); lc.setStyleSheet("background:transparent;")
         lcl = QVBoxLayout(lc); lcl.setContentsMargins(0,0,0,0)
         lcl.addWidget(load, 0, Qt.AlignLeft)
@@ -1743,11 +1809,25 @@ class ChatPanel(QWidget):
 
         def work():
             try:
-                ctx = "Ajudas um estudante de línguas com um vídeo."
+                # Contexto que faz a IA CONHECER o utilizador a partir do uso do
+                # player: língua nativa, vídeo atual, e as palavras que ele guardou.
+                parts = ["You are Lexio's in-player AI tutor for a language learner watching a video.",
+                         f"Always reply in the user's native language ({native_language_name()}), warm and concise."]
                 video_name = None
                 if self.parent() and hasattr(self.parent(), 'engine') and self.parent().engine.path():
                     video_name = Path(self.parent().engine.path()).name
-                    ctx = f"O user vê: {video_name}"
+                    parts.append(f"They are currently watching: {video_name}")
+                try:
+                    _vf = DATA_DIR / 'saved-vocab.json'
+                    if _vf.exists():
+                        _saved = json.loads(_vf.read_text(encoding='utf-8'))
+                        _words = [s.get('text', '') for s in _saved[-30:] if s.get('text')]
+                        if _words:
+                            parts.append("Words/phrases this user saved from videos (use them to "
+                                         "personalise help, examples and quick reviews): " + "; ".join(_words))
+                except Exception:
+                    pass
+                ctx = "\n".join(parts)
                 hdrs = {"Content-Type":"application/json"}
                 # Send real JWT if authenticated
                 auth_header = self._get_token_header()
@@ -1817,7 +1897,7 @@ class ChatPanel(QWidget):
             return
         header = self._get_token_header()
         if not header:
-            self._add_msg("Faz login para adicionares ao teu vocabulário principal.", "system")
+            self._add_msg(T("need_login_vocab"), "system")
             return
         self._add_msg(f"A adicionar “{text[:40]}” ao teu vocabulário…", "system")
         threading.Thread(target=self._promote_worker, args=(text, header), daemon=True).start()
@@ -1958,7 +2038,7 @@ class WordDetailsPanel(QWidget):
 
         hdr = QWidget(); hdr.setStyleSheet(f"background:{ELV};border-bottom:1px solid {BRD};")
         hl = QHBoxLayout(hdr); hl.setContentsMargins(16, 10, 10, 10)
-        ht = QLabel("Detalhes"); ht.setStyleSheet(
+        ht = QLabel(T("details")); ht.setStyleSheet(
             f"color:{TXT};font-size:13px;font-weight:600;font-family:'Inter';background:transparent;")
         hl.addWidget(ht); hl.addStretch()
         close = QPushButton("×"); close.setFixedSize(24, 24); close.setCursor(Qt.PointingHandCursor)
@@ -1979,7 +2059,7 @@ class WordDetailsPanel(QWidget):
         self.word_lbl.setStyleSheet(
             f"color:{TXT};font-size:22px;font-weight:800;font-family:'Inter';background:transparent;")
         wr.addWidget(self.word_lbl)
-        self.listen_btn = QPushButton("Ouvir"); self.listen_btn.setCursor(Qt.PointingHandCursor); self.listen_btn.setFixedHeight(26)
+        self.listen_btn = QPushButton(T("listen")); self.listen_btn.setCursor(Qt.PointingHandCursor); self.listen_btn.setFixedHeight(26)
         self.listen_btn.setStyleSheet(
             f"QPushButton{{background:transparent;color:{TS2};border:1px solid {BRD};border-radius:13px;"
             f"padding:2px 12px;font-size:11px;font-family:'Inter';}}QPushButton:hover{{border-color:{ACC};color:{TXT};}}")
@@ -1987,7 +2067,7 @@ class WordDetailsPanel(QWidget):
         wr.addWidget(self.listen_btn)
         # YouGlish button — opens the word on YouGlish in the browser
         self.yg_btn = QPushButton("YG"); self.yg_btn.setCursor(Qt.PointingHandCursor); self.yg_btn.setFixedHeight(26)
-        self.yg_btn.setToolTip("Ouvir pronúncia em contexto no YouGlish")
+        self.yg_btn.setToolTip(T("yg_tip"))
         self.yg_btn.setStyleSheet(
             f"QPushButton{{background:transparent;color:{TS2};border:1px solid {BRD};border-radius:13px;"
             f"padding:2px 8px;font-size:10px;font-family:'Inter';font-weight:700;}}"
@@ -2008,7 +2088,7 @@ class WordDetailsPanel(QWidget):
         self.ex_box = QWidget(); self.ex_box.setStyleSheet("background:transparent;")
         exl = QVBoxLayout(self.ex_box); exl.setContentsMargins(0, 6, 0, 0); exl.setSpacing(6)
         exhead = QHBoxLayout(); exhead.setSpacing(6)
-        exlab = QLabel("EXEMPLO"); exlab.setStyleSheet(
+        exlab = QLabel(T("example")); exlab.setStyleSheet(
             f"color:{TMT};font-size:11px;font-weight:700;letter-spacing:.04em;background:transparent;")
         exhead.addWidget(exlab)
         self.ex_counter = QLabel(""); self.ex_counter.setStyleSheet(
@@ -2042,7 +2122,7 @@ class WordDetailsPanel(QWidget):
 
         ftr = QWidget(); ftr.setStyleSheet(f"background:{ELV};border-top:1px solid {BRD};")
         fl = QVBoxLayout(ftr); fl.setContentsMargins(12, 10, 12, 10)
-        self.add_btn = QPushButton("Adicionar ao meu vocabulário"); self.add_btn.setCursor(Qt.PointingHandCursor)
+        self.add_btn = QPushButton(T("add_vocab")); self.add_btn.setCursor(Qt.PointingHandCursor)
         self.add_btn.setStyleSheet(
             f"QPushButton{{background:{ACC};color:{ON_ACC};border:none;border-radius:14px;padding:9px;"
             f"font-size:12px;font-weight:600;font-family:'Inter';}}QPushButton:hover{{background:{ACC_HOVER};}}")
@@ -2056,21 +2136,22 @@ class WordDetailsPanel(QWidget):
     def show_for(self, word):
         self._word = word; self._lang = "en"; self._examples = []; self._ex_idx = 0
         self.word_lbl.setText(word); self.meta_lbl.setText(""); self.meaning_lbl.setText("")
-        self.extra_lbl.setText("A carregar detalhes…"); self.ex_box.hide()
+        self.extra_lbl.setText(T("loading_details")); self.ex_box.hide()
         self.show(); fade_in(self, 200)
         threading.Thread(target=self._worker, args=(word,), daemon=True).start()
 
     def _worker(self, word):
         try:
+            nat = native_language_name()   # língua nativa do utilizador (herda da conta)
             sys_p = (
-                "You are a bilingual dictionary for a learner whose native language is European Portuguese. "
+                f"You are a bilingual dictionary for a learner whose native language is {nat}. "
                 "Detect the language of the given word/phrase. Reply ONLY with compact JSON, no prose:\n"
                 '{"word":"<lemma>","lang":"<ISO 639-1>","phonetic":"<IPA>","type":"<noun/verb/adj/adv/phrase>",'
                 '"meaning":"<clear definition in the word OWN language>",'
                 '"examples":["<ex1 in the word language>","<ex2>","<ex3>"],'
-                '"synonyms":[{"word":"<syn>","translation":"<European Portuguese>"}],'
-                '"collocations":[{"phrase":"<colloc>","translation":"<European Portuguese>"}],'
-                '"note":"<short usage note in European Portuguese>"}')
+                f'"synonyms":[{{"word":"<syn>","translation":"<{nat}>"}}],'
+                f'"collocations":[{{"phrase":"<colloc>","translation":"<{nat}>"}}],'
+                f'"note":"<short usage note in {nat}>"}}')
             body = json.dumps({"model": "deepseek-chat", "max_tokens": 900, "temperature": 0.2,
                 "messages": [{"role": "system", "content": sys_p},
                              {"role": "user", "content": f'Word/phrase: "{word}"'}]}).encode()
@@ -2089,7 +2170,7 @@ class WordDetailsPanel(QWidget):
 
     def _on_ready(self, data, err):
         if err or not data:
-            self.extra_lbl.setText("Não consegui carregar os detalhes."); return
+            self.extra_lbl.setText(T("details_failed")); return
         self._lang = (data.get("lang") or "en")[:5]
         self.word_lbl.setText(self._esc(data.get("word") or self._word))
         self.meta_lbl.setText(" · ".join([x for x in [self._esc(data.get("phonetic", "")),
@@ -2105,7 +2186,7 @@ class WordDetailsPanel(QWidget):
         parts = []
         syns = data.get("synonyms") or []
         if syns:
-            parts.append(lbl("SINÓNIMOS") + "<p style='margin:0 0 6px 0;line-height:1.7'>")
+            parts.append(lbl(T("synonyms")) + "<p style='margin:0 0 6px 0;line-height:1.7'>")
             for sy in syns[:6]:
                 w = sy.get("word", "") if isinstance(sy, dict) else sy
                 tr = sy.get("translation", "") if isinstance(sy, dict) else ""
@@ -2114,7 +2195,7 @@ class WordDetailsPanel(QWidget):
             parts.append("</p>")
         colls = data.get("collocations") or []
         if colls:
-            parts.append(lbl("COLOCAÇÕES") + "<p style='margin:0 0 6px 0;line-height:1.7'>")
+            parts.append(lbl(T("collocations")) + "<p style='margin:0 0 6px 0;line-height:1.7'>")
             for c in colls[:6]:
                 ph = c.get("phrase", "") if isinstance(c, dict) else c
                 tr = c.get("translation", "") if isinstance(c, dict) else ""
@@ -2122,7 +2203,7 @@ class WordDetailsPanel(QWidget):
                              + (f" <span style='color:{TMT}'>— {self._esc(tr)}</span>" if tr else "") + "<br>")
             parts.append("</p>")
         if data.get("note"):
-            parts.append(lbl("NOTA") + f"<p style='margin:0;color:{TXT}'>{self._esc(data['note'])}</p>")
+            parts.append(lbl(T("note")) + f"<p style='margin:0;color:{TXT}'>{self._esc(data['note'])}</p>")
         self.extra_lbl.setText("".join(parts))
 
     def _show_example(self, idx):
@@ -2134,7 +2215,7 @@ class WordDetailsPanel(QWidget):
         self.ex_text.setText(f"“{ex}”")
         self.ex_counter.setText(f"{idx + 1} / {len(self._examples)}")
         self.ex_prev.setEnabled(idx > 0); self.ex_next.setEnabled(idx < len(self._examples) - 1)
-        self.ex_img.setPixmap(QPixmap()); self.ex_img.setText("A gerar imagem do exemplo…")
+        self.ex_img.setPixmap(QPixmap()); self.ex_img.setText(T("gen_image"))
         threading.Thread(target=self._img_worker, args=(idx, ex), daemon=True).start()
 
     def _img_worker(self, idx, example):
@@ -2266,7 +2347,7 @@ class MainWindow(QMainWindow):
         tl = QHBoxLayout(top); tl.setContentsMargins(16,0,12,0)
         logo = QLabel("▐█ Lexio"); logo.setStyleSheet(f"color:{ACC};font-size:15px;font-weight:bold;background:transparent;")
         tl.addWidget(logo)
-        sub = QLabel("Player"); sub.setStyleSheet(f"color:{TMT};font-size:12px;background:transparent;")
+        sub = QLabel(T("player")); sub.setStyleSheet(f"color:{TMT};font-size:12px;background:transparent;")
         tl.addWidget(sub); tl.addSpacing(12)
         self.tit = QLabel(""); self.tit.setStyleSheet(f"color:{TS2};font-size:12px;background:transparent;")
         tl.addWidget(self.tit, 1)
@@ -2274,13 +2355,13 @@ class MainWindow(QMainWindow):
         # Chat toggle
         self.chat_toggle = QPushButton("Chat")
         self.chat_toggle.setFixedSize(50,28)
-        self.chat_toggle.setToolTip("Mostrar/esconder Chat IA")
+        self.chat_toggle.setToolTip(T("chat_toggle_tip"))
         self.chat_toggle.setStyleSheet(f"QPushButton{{background:transparent;border:1px solid {BRD};border-radius:14px;color:{TS2};font-size:11px;}}QPushButton:hover{{background:{HVR};color:{TXT};border-color:{ACC};}}QPushButton:checked{{background:rgba(255,255,255,0.14);border-color:{ACC};color:{ACC};}}")
         self.chat_toggle.setCheckable(True); self.chat_toggle.setChecked(True)
         self.chat_toggle.clicked.connect(self._toggle_chat)
         tl.addWidget(self.chat_toggle)
 
-        ab = yt_btn("Abrir", accent=True, tip="Abrir vídeo (Ctrl+O)"); ab.clicked.connect(self._open)
+        ab = yt_btn(T("open_video"), accent=True, tip=T("open_video_tip")); ab.clicked.connect(self._open)
         tl.addWidget(ab)
         outer.addWidget(top)
 
@@ -2336,17 +2417,17 @@ class MainWindow(QMainWindow):
         cb.setStyleSheet("#controls_bar{background:#1c1c1c;}")
         cl = QHBoxLayout(cb); cl.setContentsMargins(18,6,18,9); cl.setSpacing(6)
 
-        self.pb = _icn(chr(0xE892), 38, 14, "Anterior (P)"); self.pb.clicked.connect(self._prev)
+        self.pb = _icn(chr(0xE892), 38, 14, T("prev_p")); self.pb.clicked.connect(self._prev)
         self.play_btn = QPushButton(chr(0xE768)); self.play_btn.setFixedSize(46,46)
         self.play_btn.setStyleSheet(f"QPushButton{{background:{ACC};border:none;border-radius:23px;color:{ON_ACC};font-family:{ICON_F};font-size:18px;}}QPushButton:hover{{background:{ACC_HOVER};}}")
         self.play_btn.clicked.connect(self._toggle)
-        self.nb = _icn(chr(0xE893), 38, 14, "Seguinte (N)"); self.nb.clicked.connect(self._next)
+        self.nb = _icn(chr(0xE893), 38, 14, T("next_n")); self.nb.clicked.connect(self._next)
 
-        self.sub_btn = _icn(chr(0xE7F0), 36, 16, "Carregar legenda (.srt)")
+        self.sub_btn = _icn(chr(0xE7F0), 36, 16, T("load_sub_tip"))
         self.sub_btn.clicked.connect(self._load_sub_file)
         self.sub_icon = QPushButton(""); self.sub_icon.setFixedSize(30,24)
         self.sub_icon.setStyleSheet(f"QPushButton{{background:transparent;border:none;color:{TMT};font-size:10px;}}QPushButton:hover{{color:{ACC};}}")
-        self.sub_icon.setToolTip("Clicar para alternar")
+        self.sub_icon.setToolTip(T("sub_toggle_tip"))
         self.sub_icon.clicked.connect(self._cycle_subs)
 
         self.vol_icon = QLabel(chr(0xE767)); self.vol_icon.setStyleSheet(f"color:{TS2};font-family:{ICON_F};font-size:15px;background:transparent;")
@@ -2362,14 +2443,14 @@ class MainWindow(QMainWindow):
         # (the top-bar Chat button is hidden there). Checkable, kept in sync.
         self.chat_btn = QPushButton(chr(0xE8BD)); self.chat_btn.setFixedSize(38, 38)
         self.chat_btn.setCheckable(True); self.chat_btn.setChecked(True)
-        self.chat_btn.setToolTip("Mostrar/esconder Chat IA (C)")
+        self.chat_btn.setToolTip(T("chat_toggle_tip_c"))
         self.chat_btn.setStyleSheet(
             f"QPushButton{{background:transparent;border:none;color:{TS2};font-family:{ICON_F};font-size:15px;border-radius:19px;}}"
             f"QPushButton:hover{{background:{HVR};color:{TXT};}}"
             f"QPushButton:checked{{color:{ACC};}}")
         self.chat_btn.clicked.connect(self._toggle_chat_btn)
 
-        self.fs_btn = _icn(chr(0xE740), 38, 15, "Ecrã inteiro (F)"); self.fs_btn.clicked.connect(self._toggle_study_mode)
+        self.fs_btn = _icn(chr(0xE740), 38, 15, T("fullscreen_f")); self.fs_btn.clicked.connect(self._toggle_study_mode)
 
         # [speed] -- [prev . play . next] -- [CC . vol . chat . fullscreen]
         cl.addWidget(self.spd)
@@ -2392,16 +2473,16 @@ class MainWindow(QMainWindow):
         pbar = QWidget(); pbar.setObjectName("practice_bar"); pbar.setFixedHeight(38)
         pbar.setStyleSheet("#practice_bar{background:#141414;}")
         ppl = QHBoxLayout(pbar); ppl.setContentsMargins(16,3,16,5); ppl.setSpacing(6)
-        plab = QLabel("Prática"); plab.setStyleSheet(f"color:{TMT};font-size:10px;font-weight:600;background:transparent;")
+        plab = QLabel(T("practice")); plab.setStyleSheet(f"color:{TMT};font-size:10px;font-weight:600;background:transparent;")
         ppl.addWidget(plab)
-        b_rep = prac_btn("Repetir", "Repetir a frase atual (Z)"); b_rep.clicked.connect(self.engine.replay_sub)
-        b_prev = prac_btn("Anterior", "Frase anterior (,)"); b_prev.clicked.connect(self.engine.prev_sub)
-        b_next = prac_btn("Seguinte", "Frase seguinte (.)"); b_next.clicked.connect(self.engine.next_sub)
+        b_rep = prac_btn(T("repeat"), "Repetir a frase atual (Z)"); b_rep.clicked.connect(self.engine.replay_sub)
+        b_prev = prac_btn(T("previous"), "Frase anterior (,)"); b_prev.clicked.connect(self.engine.prev_sub)
+        b_next = prac_btn(T("next"), "Frase seguinte (.)"); b_next.clicked.connect(self.engine.next_sub)
         b_a = prac_btn("A", "Marcar início do loop (manual)"); b_a.clicked.connect(self._set_loop_a)
         b_b = prac_btn("B", "Marcar fim do loop e ativar (manual)"); b_b.clicked.connect(self._set_loop_b)
-        self.btn_loop = prac_btn("Loop", "Loop da frase atual / desligar (L)", True); self.btn_loop.clicked.connect(self._toggle_loop)
-        self.btn_ap = prac_btn("Auto-pausa", "Pausa no fim de cada frase — shadowing (X)", True); self.btn_ap.clicked.connect(self._toggle_autopause)
-        self.btn_hide = prac_btn("Esconder legenda", "Esconder legenda — recall ativo (H)", True); self.btn_hide.clicked.connect(self._toggle_hide_subs)
+        self.btn_loop = prac_btn(T("loop"), "Loop da frase atual / desligar (L)", True); self.btn_loop.clicked.connect(self._toggle_loop)
+        self.btn_ap = prac_btn(T("autopause"), "Pausa no fim de cada frase — shadowing (X)", True); self.btn_ap.clicked.connect(self._toggle_autopause)
+        self.btn_hide = prac_btn(T("hide_sub"), "Esconder legenda — recall ativo (H)", True); self.btn_hide.clicked.connect(self._toggle_hide_subs)
         for b in (b_rep, b_prev, b_next, b_a, b_b): ppl.addWidget(b)
         ppl.addStretch()
         for b in (self.btn_loop, self.btn_ap, self.btn_hide): ppl.addWidget(b)
@@ -2434,18 +2515,18 @@ class MainWindow(QMainWindow):
         self.bw.setContextMenuPolicy(Qt.CustomContextMenu)
         self.bw.customContextMenuRequested.connect(self._bm_menu)
         bwl.addWidget(self.bw)
-        tabs.addTab(bwt, "Marcos")
+        tabs.addTab(bwt, T("tab_bookmarks"))
 
         # ── Vídeos: vocabulary captured from subtitles, SEPARATE from the main
         # study vocabulary. The user opts in (right-click → add) to promote a word
         # to their real account vocabulary. ──
         vvt = QWidget(); vvl = QVBoxLayout(vvt); vvl.setContentsMargins(6,6,6,6); vvl.setSpacing(4)
         vhl = QHBoxLayout()
-        self.vv_title = QLabel("Vocabulário dos vídeos")
+        self.vv_title = QLabel(T("videos_vocab_title"))
         self.vv_title.setStyleSheet(f"color:{TXT};font-size:11px;font-weight:bold;background:transparent;")
         vhl.addWidget(self.vv_title); vhl.addStretch()
         vvl.addLayout(vhl)
-        vhint = QLabel("Aqui ficam as palavras que guardaste com  +  nas legendas — só neste player, não no teu vocabulário principal. Clica com o botão direito numa palavra para a Adicionar ao meu vocabulário ou Remover.")
+        vhint = QLabel(T("videos_hint"))
         vhint.setWordWrap(True); vhint.setStyleSheet(f"color:{TMT};font-size:10px;background:transparent;")
         vvl.addWidget(vhint)
         self.vv_list = QListWidget()
@@ -2453,7 +2534,7 @@ class MainWindow(QMainWindow):
         self.vv_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.vv_list.customContextMenuRequested.connect(self._vv_menu)
         vvl.addWidget(self.vv_list)
-        tabs.addTab(vvt, "Vídeos")
+        tabs.addTab(vvt, T("tab_videos"))
         QTimer.singleShot(0, self._load_video_vocab)   # populate once UI is ready
 
         # Notes
@@ -2463,7 +2544,7 @@ class MainWindow(QMainWindow):
         ahl.addStretch()
         ab = yt_btn("+", small=True, accent=True); ab.clicked.connect(self._add_an); ahl.addWidget(ab)
         awl.addLayout(ahl)
-        self.te = QTextEdit(); self.te.setPlaceholderText("Anotacao..."); self.te.setFixedHeight(32)
+        self.te = QTextEdit(); self.te.setPlaceholderText(T("note_placeholder")); self.te.setFixedHeight(32)
         self.te.setStyleSheet(f"QTextEdit{{background:{ELV};color:{TXT};border:1px solid {BRD};border-radius:4px;padding:4px;font-size:11px;}}")
         awl.addWidget(self.te)
         self.aw = QListWidget()
@@ -2471,7 +2552,7 @@ class MainWindow(QMainWindow):
         self.aw.setContextMenuPolicy(Qt.CustomContextMenu)
         self.aw.customContextMenuRequested.connect(self._an_menu)
         awl.addWidget(self.aw)
-        tabs.addTab(awt, "Notas")
+        tabs.addTab(awt, T("tab_notes"))
 
         # Playlist
         pwt = QWidget(); pwl = QVBoxLayout(pwt); pwl.setContentsMargins(6,6,6,6)
@@ -2485,15 +2566,30 @@ class MainWindow(QMainWindow):
         self.plw.setStyleSheet(f"QListWidget{{background:transparent;border:none;color:{TXT};font-size:11px;}}QListWidget::item{{padding:4px 6px;border-radius:3px;border-bottom:1px solid {BRD};}}QListWidget::item:hover{{background:{HVR};}}QListWidget::item:selected{{background:rgba(139,92,246,0.3);}}")
         self.plw.currentRowChanged.connect(self._pl_row)
         pwl.addWidget(self.plw)
-        tabs.addTab(pwt, "Playlist")
+        tabs.addTab(pwt, T("tab_playlist"))
 
         # Tools
         tw = QWidget(); tl = QVBoxLayout(tw); tl.setContentsMargins(6,6,6,6)
-        tl.addWidget(QLabel("Ferramentas")); tl.itemAt(0).widget().setStyleSheet(f"color:{TXT};font-size:11px;font-weight:bold;background:transparent;")
-        for txt, cb in [("Exportar estudo", self._export), ("Atualizacoes", self._check_upd), ("Pasta de dados", lambda: subprocess.Popen(f'explorer "{DATA_DIR}"')), ("Sobre", self._about)]:
+        tl.addWidget(QLabel(T("tab_tools"))); tl.itemAt(0).widget().setStyleSheet(f"color:{TXT};font-size:11px;font-weight:bold;background:transparent;")
+        # ── Seletor de idioma da interface (o utilizador escolhe; suporta qualquer
+        # língua — as não embutidas são traduzidas pela IA e ficam em cache) ──
+        lang_lbl = QLabel(T("ui_language")); lang_lbl.setStyleSheet(f"color:{TMT};font-size:10px;font-weight:600;background:transparent;margin-top:4px;")
+        tl.addWidget(lang_lbl)
+        self.lang_combo = QComboBox()
+        self.lang_combo.setStyleSheet(
+            f"QComboBox{{background:{ELV};color:{TXT};border:1px solid {BRD};border-radius:6px;padding:4px 8px;font-size:11px;}}"
+            f"QComboBox:hover{{border-color:{ACC};}}QComboBox QAbstractItemView{{background:{ELV};color:{TXT};selection-background-color:{HVR};}}")
+        cur = i18n.current_lang()
+        for code, name in i18n.LANGUAGE_CHOICES:
+            self.lang_combo.addItem(name, code)
+            if code == cur:
+                self.lang_combo.setCurrentIndex(self.lang_combo.count() - 1)
+        self.lang_combo.activated.connect(lambda _i: self._change_ui_language(self.lang_combo.currentData()))
+        tl.addWidget(self.lang_combo)
+        for txt, cb in [(T("tools_export"), self._export), (T("tools_updates"), self._check_upd), (T("tools_data_folder"), lambda: subprocess.Popen(f'explorer "{DATA_DIR}"')), (T("tools_about"), self._about)]:
             b = yt_btn(txt, small=True); b.clicked.connect(cb); tl.addWidget(b)
         tl.addStretch()
-        tabs.addTab(tw, "Ferramentas")
+        tabs.addTab(tw, T("tab_tools"))
 
         twl.addWidget(tabs)
         left_lo.addWidget(self.tools_wrap)
@@ -2594,8 +2690,8 @@ class MainWindow(QMainWindow):
             self._float_transport(True)
             self.setWindowState(Qt.WindowFullScreen)
             self.fs_btn.setText("\u26F6")
-            self.fs_btn.setToolTip("Sair do ecr\u00E3 inteiro [Esc]")
-            self.sbl.setText("Modo Estudo \u2014 Esc para sair")
+            self.fs_btn.setToolTip(T("exit_fullscreen"))
+            self.sbl.setText(T("study_mode_esc"))
             self._fs_activity()   # show transport, then start the hide countdown
             # Re-anchor once fullscreen geometry settles (it applies asynchronously).
             QTimer.singleShot(80, self._reposition_transport)
@@ -2614,8 +2710,8 @@ class MainWindow(QMainWindow):
         self.tools_wrap.show()
         self.statusBar().show()
         self.fs_btn.setText("\u26F6")
-        self.fs_btn.setToolTip("Ecr\u00E3 inteiro (F)")
-        self.sbl.setText("Pronto")
+        self.fs_btn.setToolTip(T("fullscreen_f"))
+        self.sbl.setText(T("ready"))
 
     # \u2500\u2500 Floating transport (fullscreen) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
     def _ensure_transport_overlay(self):
@@ -2695,6 +2791,59 @@ class MainWindow(QMainWindow):
         self._tools_visible = not self._tools_visible
         self.tools_wrap.setVisible(self._tools_visible)
 
+    # ── Idioma da UI (escolhido pelo utilizador; qualquer língua via IA) ──
+    def _change_ui_language(self, code):
+        if not code or code == i18n.current_lang():
+            return
+        if i18n.has_language(code):
+            self._apply_ui_language(code)
+            return
+        # Língua não embutida → traduzir com a IA (background) e depois aplicar.
+        name = i18n.language_display_name(code)
+        showToast(T("lang_translating", lang=name), "accent")
+        def work():
+            ok = translate_ui_via_ai(code)
+            QTimer.singleShot(0, lambda: self._on_lang_translated(code, ok))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_lang_translated(self, code, ok):
+        if ok:
+            self._apply_ui_language(code)
+        else:
+            showToast(T("lang_failed"), "accent")
+            self._sync_lang_combo()
+
+    def _apply_ui_language(self, code):
+        save_ui_lang(code)
+        set_lang(code)
+        name = i18n.language_display_name(code)
+        box = QMessageBox(self)
+        box.setStyleSheet(f"QMessageBox{{background:{ELV};}}QLabel{{color:{TXT};}}")
+        box.setWindowTitle(T("lang_restart_title"))
+        box.setText(T("lang_restart_body", lang=name))
+        yes = box.addButton(T("restart_now"), QMessageBox.AcceptRole)
+        box.addButton(T("later"), QMessageBox.RejectRole)
+        box.exec_()
+        if box.clickedButton() is yes:
+            self._restart_app()
+
+    def _restart_app(self):
+        try:
+            args = sys.argv[1:] if getattr(sys, "frozen", False) else sys.argv
+            subprocess.Popen([sys.executable] + list(args))
+            QApplication.quit()
+        except Exception as e:
+            log(f"restart: {e}")
+
+    def _sync_lang_combo(self):
+        if not hasattr(self, "lang_combo"):
+            return
+        cur = i18n.current_lang()
+        for i in range(self.lang_combo.count()):
+            if self.lang_combo.itemData(i) == cur:
+                self.lang_combo.setCurrentIndex(i)
+                break
+
     # ── Vocab overlay ──
     def _on_overlay_add(self, text):
         """+ on a subtitle card → save to the SEPARATE video-vocab list (Vídeos tab)
@@ -2715,9 +2864,9 @@ class MainWindow(QMainWindow):
             # Make it obvious WHERE the word went. The status-bar toast is hidden
             # in fullscreen, so also flash a banner over the video, and (when the
             # panel is visible) jump to the Vídeos tab so the user sees it land.
-            where = "Vídeos + web (pendente)" if synced else "Vídeos"
-            self.overlay.flash(f"Guardado · {where}")
-            showToast(f"Guardado em {where} — {text[:24]}", "accent")
+            where = T("saved_videos_web") if synced else T("saved_videos")
+            self.overlay.flash(T("saved_flash", where=where))
+            showToast(T("saved_toast", where=where, text=text[:24]), "accent")
             if not self._study_mode and self.tools_wrap.isVisible():
                 idx = self._vv_tab_index()
                 if idx is not None:
@@ -2730,7 +2879,7 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "tabs"):
             return None
         for i in range(self.tabs.count()):
-            if self.tabs.tabText(i) == "Vídeos":
+            if self.tabs.tabText(i) == T("tab_videos"):
                 return i
         return None
 
@@ -2747,7 +2896,7 @@ class MainWindow(QMainWindow):
             return
         self.vv_list.clear()
         if not self._vv_entries:
-            empty = QListWidgetItem("Ainda sem palavras. Carrega no  +  de uma legenda enquanto vês um vídeo.")
+            empty = QListWidgetItem(T("videos_empty"))
             empty.setFlags(Qt.NoItemFlags)   # not selectable — it's a hint
             empty.setForeground(QColor(TMT))
             self.vv_list.addItem(empty)
@@ -2763,7 +2912,7 @@ class MainWindow(QMainWindow):
             self.vv_list.setItemWidget(it, lbl)
             it.setSizeHint(lbl.sizeHint())
         n = len(self._vv_entries)
-        self.vv_title.setText(f"Vocabulário dos vídeos ({n})" if n else "Vocabulário dos vídeos")
+        self.vv_title.setText(f"{T('videos_vocab_title')} ({n})" if n else T("videos_vocab_title"))
 
     @staticmethod
     def _vocab_html(text, video=""):
@@ -2796,10 +2945,10 @@ class MainWindow(QMainWindow):
         m = QMenu(self)
         m.setStyleSheet(f"QMenu{{background:{ELV};color:{TXT};border:1px solid {BRD};padding:4px;}}"
                         f"QMenu::item{{padding:6px 14px;border-radius:4px;}}QMenu::item:selected{{background:{HVR};}}")
-        a_add = m.addAction("Adicionar ao meu vocabulário")
-        a_ask = m.addAction("Perguntar à IA")
+        a_add = m.addAction(T("menu_add_vocab"))
+        a_ask = m.addAction(T("ask_ai"))
         m.addSeparator()
-        a_del = m.addAction("Remover")
+        a_del = m.addAction(T("menu_remove"))
         chosen = m.exec_(self.vv_list.mapToGlobal(pos))
         if chosen == a_del:
             try:
@@ -2833,17 +2982,17 @@ class MainWindow(QMainWindow):
         if not on: self.seek.clear_marks()
         if hasattr(self, 'btn_loop'): self.btn_loop.setChecked(on)
         if on:
-            showToast("Loop da frase ligado", "accent")
+            showToast(T("loop_on"), "accent")
         elif was_on:
-            showToast("Loop desligado", "accent")
+            showToast(T("loop_off"), "accent")
         elif not self.engine.subs_loaded():
-            showToast("Carrega uma legenda (.srt) para usar o loop", "accent")
+            showToast(T("loop_need_sub"), "accent")
         else:
-            showToast("Sem frase no ecrã — liga o Loop durante uma legenda", "accent")
+            showToast(T("loop_no_line"), "accent")
 
     def _set_loop_a(self):
         if not self.video_path:
-            showToast("Abre um vídeo primeiro", "accent"); return
+            showToast(T("open_first"), "accent"); return
         a = self.engine.set_loop_a()
         self.seek.set_mark('A', a); self.seek.set_mark('B', None)
         showToast(f"Ponto A marcado em {FMT(a)} — agora marca B", "accent")
@@ -2856,7 +3005,7 @@ class MainWindow(QMainWindow):
             if hasattr(self, 'btn_loop'): self.btn_loop.setChecked(True)
             showToast(f"Loop A-B ativo: {FMT(lp[0])}–{FMT(lp[1])}", "accent")
         else:
-            showToast("Marca primeiro A (e B tem de ser depois de A)", "accent")
+            showToast(T("loop_mark_a"), "accent")
 
     def _toggle_autopause(self):
         self._autopause_on = not getattr(self, '_autopause_on', False)
@@ -2929,7 +3078,7 @@ class MainWindow(QMainWindow):
             self._update_sub_icon()
             self.sbl.setText(f"CC {Path(path).name}")
         elif path:
-            self.sbl.setText("Falha ao carregar legenda")
+            self.sbl.setText(T("sub_load_fail"))
 
     # ── Subtitle memory: remember which .srt was used for each video ──
     def _sub_memory(self):
