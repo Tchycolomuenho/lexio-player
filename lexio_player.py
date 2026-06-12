@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Lexio Study Player v3.7.0 — VLC embutido (standalone) + Legendas online + Vocab Overlay + Chat IA
+Lexio Study Player v3.8.0 — VLC embutido (standalone) + Voz neural natural (edge-tts) + Aba Pronúncia + Imagens em grande
 """
 import os, sys, json, webbrowser, subprocess, threading, re, traceback, time
 from pathlib import Path
@@ -19,7 +19,7 @@ def log(msg):
             f.write(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}\n")
     except: pass
 
-log("=== LEXIO PLAYER v3.7.0 === (pyinstaller-friendly)")
+log("=== LEXIO PLAYER v3.8.0 === (pyinstaller-friendly)")
 
 # ── VLC path ──
 # A self-contained build ships libvlc.dll + libvlccore.dll + the plugins folder
@@ -116,7 +116,7 @@ ACC_HOVER = "#cfcfcf"  # dimmer white on hover
 ON_ACC = "#000000"   # text/icon ON white accent
 
 APP_NAME = "Lexio Study Player"
-APP_VERSION = "3.7.0"
+APP_VERSION = "3.8.0"
 DATA_DIR = Path.home() / '.lexio-player'; DATA_DIR.mkdir(exist_ok=True)
 RECENT_FILE = DATA_DIR / 'recent.json'
 STUDY_FILE = DATA_DIR / 'study-data.json'
@@ -128,6 +128,42 @@ SUPPORTED = SUPPORTED_VID | SUPPORTED_AUD
 
 LEXIO_API = "https://lexio-app-five.vercel.app"
 SUPABASE_URL = "https://lobwdstwpcbuljferyyo.supabase.co"
+
+# Vozes neurais Microsoft (as MESMAS da web, api/tts.js) — naturais, multilíngue.
+# Geradas localmente via `edge-tts` (Python), que calcula o token Sec-MS-GEC que o
+# servidor (npm edge-tts) já não envia → daí o 403. Aqui sai natural e fiável.
+EDGE_VOICES = {
+    "pt": "pt-PT-RaquelNeural", "en": "en-US-AriaNeural", "es": "es-ES-ElviraNeural",
+    "fr": "fr-FR-DeniseNeural", "de": "de-DE-KatjaNeural", "it": "it-IT-ElsaNeural",
+    "ja": "ja-JP-NanamiNeural", "zh": "zh-CN-XiaoxiaoNeural", "ko": "ko-KR-SunHiNeural",
+    "ru": "ru-RU-SvetlanaNeural", "ar": "ar-SA-ZariyahNeural", "nl": "nl-NL-FennaNeural",
+}
+
+
+def speak_edge_tts(text, lang="en", rate=0):
+    """Gera um mp3 com voz NEURAL Microsoft (edge-tts, Python) e devolve o caminho.
+    rate: percentagem de velocidade -50..+50 (negativo = mais devagar) p/ a aba
+    de pronúncia. 0/None = velocidade normal. Devolve None se falhar (offline)."""
+    if not text or not text.strip():
+        return None
+    try:
+        import edge_tts, asyncio, tempfile
+        voice = EDGE_VOICES.get(lang, "en-US-AriaNeural")
+        out = os.path.join(tempfile.gettempdir(), f"lexio_tts_{int(time.time() * 1000)}.mp3")
+        kwargs = {}
+        if rate:
+            rr = max(-50, min(50, int(rate)))
+            kwargs["rate"] = f"+{rr}%" if rr >= 0 else f"{rr}%"
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(edge_tts.Communicate(text.strip(), voice, **kwargs).save(out))
+        finally:
+            loop.close()
+        if os.path.exists(out) and os.path.getsize(out) > 0:
+            return out
+    except Exception as e:
+        log(f"edge-tts: {e}")
+    return None
 SUPABASE_ANON = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImxvYndkc3R3cGNidWxqZmVyeXlvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzk3NDI5MTIsImV4cCI6MjA5NTMxODkxMn0.GvJRLDE6yLhgDQUq-ckjgRZWbpvS4eKsUZglNyBsjSA"
 
 # ── i18n: UI traduzida; a língua é ESCOLHIDA pelo utilizador no player e fica
@@ -1296,6 +1332,9 @@ class VideoOverlay(QWidget):
             sp_w = fmc.horizontalAdvance(" ")
             card.word_rects = []
             lines = card.text.split('\n')
+            # Reserva uma faixa à direita para os botões (+ / AI / ✓) — sem isto o
+            # texto comprido passava POR BAIXO dos botões ("botões em cima das letras").
+            text_right = cur_x + col_w - 58
             for li, line in enumerate(lines[:2]):
                 wx = cur_x + 14
                 wy = y + 4 + li * 18
@@ -1305,6 +1344,11 @@ class VideoOverlay(QWidget):
                     if not word:
                         wx += sp_w; continue
                     ww = fmc.horizontalAdvance(word)
+                    if wx + ww > text_right:
+                        # Não há espaço sem invadir os botões → reticências e corta.
+                        p.setPen(QColor(255, 255, 255, alpha)); p.setFont(base_font)
+                        p.drawText(QRect(wx, wy, 16, 18), Qt.AlignLeft | Qt.AlignVCenter, "…")
+                        break
                     if mk and mk["color"]:
                         c2 = QColor(mk["color"]); c2.setAlpha(alpha)
                         p.setPen(c2); p.setFont(ul_font if mk["underline"] else base_font)
@@ -1322,17 +1366,17 @@ class VideoOverlay(QWidget):
                 p.setFont(QFont("Inter", 11, QFont.Bold))
                 p.drawText(QRect(cur_x + col_w - 30, y, 22, h), Qt.AlignCenter, "✓")
 
-            # Buttons on hover
+            # Buttons on hover — fundos opacos para não deixarem ver o texto por trás
             if hovering:
-                add_bg = QColor(255, 255, 255, min(alpha, 50)) if card.saved else QColor(255, 255, 255, min(alpha, 38))
+                add_bg = QColor(34, 120, 60, 245) if card.saved else QColor(45, 45, 45, 245)
                 p.setBrush(add_bg)
                 bx = cur_x + col_w - 52
                 p.drawRoundedRect(bx, y + (h - 22) // 2, 20, 18, 4, 4)
-                p.setPen(QColor(255, 255, 255, alpha) if card.saved else QColor(255, 255, 255, alpha))
+                p.setPen(QColor(255, 255, 255, alpha))
                 p.setFont(QFont("Inter", 9, QFont.Bold))
                 p.drawText(QRect(bx, y + (h - 22) // 2, 20, 18), Qt.AlignCenter, "✓" if card.saved else "+")
 
-                chat_bg = QColor(30, 30, 30, min(alpha + 30, 255))
+                chat_bg = QColor(45, 45, 45, 245)
                 p.setBrush(chat_bg)
                 c_bx = bx + 24
                 p.drawRoundedRect(c_bx, y + (h - 22) // 2, 20, 18, 4, 4)
@@ -2496,21 +2540,67 @@ _RATE_ON_UP = QColor(64, 196, 128)     # gostei (verde suave)
 _RATE_ON_DOWN = QColor(224, 96, 96)    # não gostei (vermelho suave)
 
 
+class ImageLightbox(QWidget):
+    """Mostra uma imagem em GRANDE sobre a janela (como o lightbox da web).
+    Clique em qualquer sítio — ou Esc — fecha."""
+
+    def __init__(self, parent, pixmap):
+        super().__init__(parent)
+        self._pix = pixmap
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool)
+        self.setAttribute(Qt.WA_DeleteOnClose)
+        self.setStyleSheet("background:rgba(0,0,0,0.9);")
+        self.lbl = QLabel(self); self.lbl.setAlignment(Qt.AlignCenter)
+        self.lbl.setStyleSheet("background:transparent;")
+        hint = QLabel(self); hint.setText("×")
+        hint.setStyleSheet("background:transparent;color:rgba(255,255,255,0.7);font-size:26px;")
+        self._hint = hint
+        win = parent.window() if parent else None
+        if win:
+            g = win.geometry()
+            self.setGeometry(g.x(), g.y(), g.width(), g.height())
+        self._relayout()
+        self.show(); self.raise_(); self.activateWindow()
+
+    def _relayout(self):
+        self.lbl.setGeometry(0, 0, self.width(), self.height())
+        self._hint.setGeometry(self.width() - 44, 12, 32, 32)
+        if self._pix and not self._pix.isNull():
+            m = 48
+            self.lbl.setPixmap(self._pix.scaled(
+                max(1, self.width() - m), max(1, self.height() - m),
+                Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+    def resizeEvent(self, e):
+        self._relayout()
+
+    def mousePressEvent(self, e):
+        self.close()
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key_Escape:
+            self.close()
+
+
 class RatedThumb(QWidget):
     """Small image thumbnail (web AI-sidebar style) with like/dislike ICON buttons.
-    Ratings are stored locally + synced to Supabase and bias future image picks."""
+    Ratings are stored locally + synced to Supabase and bias future image picks.
+    Clicar na miniatura abre a imagem em grande (ImageLightbox)."""
     TW, TH = 92, 64
 
     def __init__(self, parent, get_auth=None):
         super().__init__(parent)
         self._get_auth = get_auth      # callable → Authorization header (or None)
-        self._word = ""; self._url = ""; self._score = 0
+        self._word = ""; self._url = ""; self._score = 0; self._full_pix = None
+        self._lightbox = None
         self.setFixedWidth(self.TW)
         v = QVBoxLayout(self); v.setContentsMargins(0, 0, 0, 0); v.setSpacing(3)
         self.img = QLabel(""); self.img.setFixedSize(self.TW, self.TH)
         self.img.setAlignment(Qt.AlignCenter)
         self.img.setStyleSheet(
             f"background:{ELV};border:1px solid {BRD};border-radius:8px;color:{TMT};font-size:9px;")
+        self.img.setToolTip(T("img_zoom_tip"))
+        self.img.mousePressEvent = self._open_zoom   # clicar → ver em grande
         v.addWidget(self.img)
         rr = QHBoxLayout(); rr.setContentsMargins(0, 0, 0, 0); rr.setSpacing(4)
         rr.addStretch()
@@ -2538,16 +2628,22 @@ class RatedThumb(QWidget):
         self.down.setIcon(_thumb_icon(False, _RATE_ON_DOWN if self._score < 0 else TMT))
 
     def clear(self):
-        self._url = ""; self._score = 0
+        self._url = ""; self._score = 0; self._full_pix = None
         self.img.setPixmap(QPixmap()); self.img.setText("")
+        self.img.setCursor(Qt.ArrowCursor)
         self.up.setEnabled(False); self.down.setEnabled(False)
         self._refresh_icons()
         self.hide()
 
+    def _open_zoom(self, _e=None):
+        if self._full_pix and not self._full_pix.isNull():
+            self._lightbox = ImageLightbox(self.window(), self._full_pix)
+
     def set_image(self, pixmap, word, url):
-        self._word = word; self._url = url
+        self._word = word; self._url = url; self._full_pix = pixmap
         self.img.setPixmap(pixmap.scaled(self.TW, self.TH, Qt.KeepAspectRatio, Qt.SmoothTransformation))
         self.img.setText("")
+        self.img.setCursor(Qt.PointingHandCursor)
         has_url = bool(url)
         self.up.setEnabled(has_url); self.down.setEnabled(has_url)
         self._score = get_image_rating(word, url) if has_url else 0
@@ -2580,7 +2676,7 @@ class WordDetailsPanel(QWidget):
         self._chat = chat
         self._word = ""; self._lang = "en"; self._meaning = ""
         self._examples = []; self._ex_idx = 0
-        self._tts_player = None
+        self._tts_player = None; self._tts_inst = None
         self.setStyleSheet(f"background:{SRF};border-right:1px solid {BRD};")
         self.setMinimumWidth(330); self.setMaximumWidth(440)
         lo = QVBoxLayout(self); lo.setContentsMargins(0, 0, 0, 0); lo.setSpacing(0)
@@ -2608,18 +2704,20 @@ class WordDetailsPanel(QWidget):
         self.word_lbl.setStyleSheet(
             f"color:{TXT};font-size:22px;font-weight:800;font-family:'Inter';background:transparent;")
         wr.addWidget(self.word_lbl)
-        self.listen_btn = QPushButton(T("listen")); self.listen_btn.setCursor(Qt.PointingHandCursor); self.listen_btn.setFixedHeight(26)
+        # Pronunciation button — fone/headphone icon (ouvir a pronúncia da palavra)
+        self.listen_btn = QPushButton("\U0001F3A7"); self.listen_btn.setCursor(Qt.PointingHandCursor); self.listen_btn.setFixedSize(28, 28)
+        self.listen_btn.setToolTip(T("listen"))
         self.listen_btn.setStyleSheet(
-            f"QPushButton{{background:transparent;color:{TS2};border:1px solid {BRD};border-radius:13px;"
-            f"padding:2px 12px;font-size:11px;font-family:'Inter';}}QPushButton:hover{{border-color:{ACC};color:{TXT};}}")
+            f"QPushButton{{background:transparent;color:{TS2};border:1px solid {BRD};border-radius:14px;"
+            f"font-size:14px;font-family:'Inter';}}QPushButton:hover{{border-color:{ACC};color:{TXT};}}")
         self.listen_btn.clicked.connect(self._play_tts)
         wr.addWidget(self.listen_btn)
-        # YouGlish button — opens the word on YouGlish in the browser
-        self.yg_btn = QPushButton("YG"); self.yg_btn.setCursor(Qt.PointingHandCursor); self.yg_btn.setFixedHeight(26)
+        # YouGlish button — camera icon (ver a pronúncia em vídeo no YouGlish)
+        self.yg_btn = QPushButton("\U0001F4F9"); self.yg_btn.setCursor(Qt.PointingHandCursor); self.yg_btn.setFixedSize(28, 28)
         self.yg_btn.setToolTip(T("yg_tip"))
         self.yg_btn.setStyleSheet(
-            f"QPushButton{{background:transparent;color:{TS2};border:1px solid {BRD};border-radius:13px;"
-            f"padding:2px 8px;font-size:10px;font-family:'Inter';font-weight:700;}}"
+            f"QPushButton{{background:transparent;color:{TS2};border:1px solid {BRD};border-radius:14px;"
+            f"font-size:14px;font-family:'Inter';}}"
             f"QPushButton:hover{{border-color:{ACC};color:{TXT};}}")
         self.yg_btn.clicked.connect(self._open_youglish)
         wr.addWidget(self.yg_btn); wr.addStretch()
@@ -2820,30 +2918,68 @@ class WordDetailsPanel(QWidget):
         ex = self._examples[idx] if 0 <= idx < len(self._examples) else ""
         thumb.set_image(local_card_pixmap(self._word, ex), self._word, "")
 
-    def _play_tts(self):
+    def _play_tts(self, rate=0):
         if not self._word:
             return
-        threading.Thread(target=self._tts_worker, args=(self._word, self._lang or "en"), daemon=True).start()
+        threading.Thread(target=self._tts_worker,
+                         args=(self._word, self._lang or "en", rate), daemon=True).start()
 
-    def _tts_worker(self, word, lang):
+    def _tts_worker(self, word, lang, rate=0):
+        """Pronúncia com voz NATURAL (Microsoft Neural via edge-tts), igual à web.
+        `rate` é uma percentagem de velocidade (-50..+50) p/ ouvir devagar/rápido."""
         try:
-            import base64, tempfile
-            body = json.dumps({"text": word, "languageCode": lang}).encode()
-            r = urlopen(Request(f"{LEXIO_API}/api/tts", data=body,
-                                headers={"Content-Type": "application/json"}), timeout=30)
-            d = json.loads(r.read().decode())
-            b64 = d.get("audioBase64")
-            if not b64:
+            tmp = speak_edge_tts(word, lang, rate)
+            if not tmp:
+                # Sem internet / edge falhou → último recurso: voz local do Windows
+                # (não tão boa, mas melhor que silêncio quando offline).
+                self._speak_local(word, lang)
                 return
-            tmp = os.path.join(tempfile.gettempdir(), "lexio_tts.mp3")
-            with open(tmp, "wb") as f:
-                f.write(base64.b64decode(b64))
             import vlc
+            # Instância VLC dedicada + media_new + set_media (padrão fiável do motor).
             if self._tts_player is None:
-                self._tts_player = vlc.MediaPlayer()
-            self._tts_player.set_mrl(tmp); self._tts_player.play()
+                self._tts_inst = vlc.Instance("--quiet", "--no-video")
+                self._tts_player = self._tts_inst.media_player_new()
+            self._tts_player.stop()
+            self._tts_player.set_media(self._tts_inst.media_new(tmp))
+            self._tts_player.audio_set_volume(100)
+            self._tts_player.play()
         except Exception as e:
             log(f"tts: {e}")
+            try:
+                self._speak_local(word, lang)
+            except Exception:
+                pass
+
+    def _speak_local(self, text, lang):
+        """Fallback offline: voz nativa do Windows (SAPI via System.Speech).
+        Usado quando a API TTS falha (Edge devolve 403). Sem dependências extra."""
+        if sys.platform != "win32" or not text:
+            return False
+        culture = {
+            "en": "en-US", "pt": "pt-PT", "es": "es-ES", "fr": "fr-FR",
+            "de": "de-DE", "it": "it-IT", "ja": "ja-JP", "zh": "zh-CN",
+            "ko": "ko-KR", "ru": "ru-RU", "ar": "ar-SA", "nl": "nl-NL",
+        }.get(lang, "en-US")
+        safe = text.replace("'", "''")
+        ps = (
+            "Add-Type -AssemblyName System.Speech;"
+            "$s=New-Object System.Speech.Synthesis.SpeechSynthesizer;"
+            "try{$s.SelectVoiceByHints([System.Speech.Synthesis.VoiceGender]::NotSet,"
+            "[System.Speech.Synthesis.VoiceAge]::NotSet,0,"
+            f"[System.Globalization.CultureInfo]'{culture}')}}catch{{}};"
+            f"$s.Speak('{safe}')"
+        )
+        try:
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            subprocess.Popen(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                startupinfo=si, creationflags=0x08000000,  # CREATE_NO_WINDOW
+            )
+            return True
+        except Exception as e:
+            log(f"tts local: {e}")
+            return False
 
     def _add(self):
         if self._chat and self._word:
@@ -2855,6 +2991,83 @@ class WordDetailsPanel(QWidget):
             import urllib.parse
             query = urllib.parse.quote(self._word)
             webbrowser.open(f"https://youglish.com/pronounce/{query}/english/us")
+
+
+class PronunciationPanel(QWidget):
+    """Aba Pronúncia: ouvir a legenda ATUAL em várias velocidades, com a MESMA
+    voz neural natural da web (edge-tts). Painel lateral, como o de detalhes."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self._line = ""; self._lang = "en"
+        self._tts_player = None; self._tts_inst = None
+        self.setStyleSheet(f"background:{SRF};border-right:1px solid {BRD};")
+        self.setMinimumWidth(300); self.setMaximumWidth(420)
+        lo = QVBoxLayout(self); lo.setContentsMargins(0, 0, 0, 0); lo.setSpacing(0)
+
+        hdr = QWidget(); hdr.setStyleSheet(f"background:{ELV};border-bottom:1px solid {BRD};")
+        hl = QHBoxLayout(hdr); hl.setContentsMargins(16, 10, 10, 10)
+        ht = QLabel("\U0001F5E3  " + T("pron_title")); ht.setStyleSheet(
+            f"color:{TXT};font-size:13px;font-weight:600;font-family:'Inter';background:transparent;")
+        hl.addWidget(ht); hl.addStretch()
+        close = QPushButton("×"); close.setFixedSize(24, 24); close.setCursor(Qt.PointingHandCursor)
+        close.setStyleSheet(f"QPushButton{{background:transparent;border:none;color:{TMT};font-size:17px;}}"
+                            f"QPushButton:hover{{color:{TXT};}}")
+        close.clicked.connect(self.hide); hl.addWidget(close)
+        lo.addWidget(hdr)
+
+        inner = QWidget(); inner.setStyleSheet(f"background:{SRF};")
+        il = QVBoxLayout(inner); il.setContentsMargins(16, 16, 16, 16); il.setSpacing(14)
+        self.line_lbl = QLabel(T("pron_empty")); self.line_lbl.setWordWrap(True)
+        self.line_lbl.setStyleSheet(
+            f"color:{TXT};font-size:17px;font-weight:600;font-family:'Inter';background:transparent;")
+        il.addWidget(self.line_lbl)
+        hint = QLabel(T("pron_hint")); hint.setWordWrap(True)
+        hint.setStyleSheet(f"color:{TMT};font-size:11px;background:transparent;")
+        il.addWidget(hint)
+
+        # Botões de velocidade — cada um (re)toca a linha a essa velocidade.
+        for label, rate in ((T("pron_normal"), 0), (T("pron_slow"), -25), (T("pron_slower"), -45)):
+            b = QPushButton("\U0001F50A  " + label); b.setCursor(Qt.PointingHandCursor); b.setFixedHeight(42)
+            b.setStyleSheet(
+                f"QPushButton{{background:{ELV};color:{TXT};border:1px solid {BRD};border-radius:10px;"
+                f"font-size:13px;font-weight:600;font-family:'Inter';text-align:left;padding:0 16px;}}"
+                f"QPushButton:hover{{border-color:{ACC};background:{HVR};}}")
+            b.clicked.connect(lambda _checked=False, r=rate: self._play(r))
+            il.addWidget(b)
+        il.addStretch()
+        lo.addWidget(inner, 1)
+        self.hide()
+
+    def show_for(self, line, lang="en"):
+        line = (line or "").strip()
+        if not line:
+            self.line_lbl.setText(T("pron_empty"))
+        else:
+            self._line = line; self._lang = (lang or "en")[:2]
+            self.line_lbl.setText(line)
+        self.show()
+
+    def _play(self, rate):
+        if not self._line:
+            return
+        threading.Thread(target=self._worker, args=(self._line, self._lang, rate), daemon=True).start()
+
+    def _worker(self, line, lang, rate):
+        try:
+            tmp = speak_edge_tts(line, lang, rate)
+            if not tmp:
+                return
+            import vlc
+            if self._tts_player is None:
+                self._tts_inst = vlc.Instance("--quiet", "--no-video")
+                self._tts_player = self._tts_inst.media_player_new()
+            self._tts_player.stop()
+            self._tts_player.set_media(self._tts_inst.media_new(tmp))
+            self._tts_player.audio_set_volume(100)
+            self._tts_player.play()
+        except Exception as e:
+            log(f"pron: {e}")
 
 
 class MainWindow(QMainWindow):
@@ -2874,6 +3087,7 @@ class MainWindow(QMainWindow):
     def _setup(self):
         self.video_path = None; self.mgr = StudyMgr()
         self._playlist = []; self._pl_idx = -1
+        self._cur_sub = ""        # última legenda visível (p/ a aba Pronúncia)
         self._rate = 1.0; self._vol = 50; self._seeking = False
         self._tools_visible = True
         self._overlay_shown = False
@@ -2888,6 +3102,7 @@ class MainWindow(QMainWindow):
         self.engine.duration_changed.connect(self._on_dur)
         # Wire overlay signals
         self.engine.subtitle_changed.connect(self.overlay.show_subtitle)
+        self.engine.subtitle_changed.connect(self._remember_sub)
         self.engine.vocab_triggered.connect(self.overlay.show_vocab)
         self.overlay.add_word.connect(self._on_overlay_add)
         self.overlay.ask_ai.connect(self._on_overlay_ask)
@@ -3077,12 +3292,13 @@ class MainWindow(QMainWindow):
         b_rep = prac_btn(T("repeat"), T("prac_repeat_tip")); b_rep.clicked.connect(self.engine.replay_sub)
         b_prev = prac_btn(T("previous"), T("prac_prev_tip")); b_prev.clicked.connect(self.engine.prev_sub)
         b_next = prac_btn(T("next"), T("prac_next_tip")); b_next.clicked.connect(self.engine.next_sub)
+        b_pron = prac_btn("\U0001F5E3 " + T("pron_title"), T("pron_open_tip")); b_pron.clicked.connect(self._open_pronunciation)
         b_a = prac_btn("A", T("prac_loop_a_tip")); b_a.clicked.connect(self._set_loop_a)
         b_b = prac_btn("B", T("prac_loop_b_tip")); b_b.clicked.connect(self._set_loop_b)
         self.btn_loop = prac_btn(T("loop"), T("prac_loop_tip"), True); self.btn_loop.clicked.connect(self._toggle_loop)
         self.btn_ap = prac_btn(T("autopause"), T("prac_autopause_tip"), True); self.btn_ap.clicked.connect(self._toggle_autopause)
         self.btn_hide = prac_btn(T("hide_sub"), T("prac_hide_tip"), True); self.btn_hide.clicked.connect(self._toggle_hide_subs)
-        for b in (b_rep, b_prev, b_next, b_a, b_b): ppl.addWidget(b)
+        for b in (b_rep, b_prev, b_next, b_pron, b_a, b_b): ppl.addWidget(b)
         ppl.addStretch()
         for b in (self.btn_loop, self.btn_ap, self.btn_hide): ppl.addWidget(b)
         left_lo.addWidget(pbar)
@@ -3205,8 +3421,11 @@ class MainWindow(QMainWindow):
         self.word_details = WordDetailsPanel(self, self.chat)
         self.overlay.word_clicked.connect(self.word_details.show_for)
         self.chat.setMaximumWidth(420)
+        # Aba Pronúncia — ouvir a legenda atual em várias velocidades (voz natural)
+        self.pron_panel = PronunciationPanel(self)
 
         body_lo.addWidget(self.word_details)   # left details panel (hidden until a word is clicked)
+        body_lo.addWidget(self.pron_panel)     # left pronunciation panel (hidden until opened)
         body_lo.addWidget(left, 1)
         body_lo.addWidget(self.chat)
         outer.addWidget(body, 1)
@@ -3636,6 +3855,21 @@ class MainWindow(QMainWindow):
             # Make sure chat is visible
             self.chat_toggle.setChecked(True)
             self.chat.setVisible(True)
+
+    def _remember_sub(self, text):
+        """Guarda a última legenda NÃO vazia — fonte da aba Pronúncia."""
+        if text and text.strip():
+            self._cur_sub = text.strip()
+
+    def _content_lang(self):
+        """Língua do filme/legenda = língua-alvo da conta, senão inglês."""
+        tgt = getattr(getattr(self, "chat", None), "_user_target", "") or ""
+        return (tgt[:2] or "en")
+
+    def _open_pronunciation(self):
+        """Abre a aba Pronúncia para a legenda atual (não pausa o filme)."""
+        self.word_details.hide()
+        self.pron_panel.show_for(self._cur_sub, self._content_lang())
 
     # ── Language-learning practice toggles (buttons + keyboard share these) ──
     def _toggle_loop(self):

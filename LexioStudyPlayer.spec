@@ -3,6 +3,14 @@
 # needs NOTHING else installed. One-DIR layout (COLLECT) — faster startup than
 # one-file (no 150 MB re-extraction to %TEMP% on every launch).
 import os, sys
+from PyInstaller.utils.hooks import collect_submodules, collect_data_files
+
+# Pronúncia natural: edge-tts (voz neural Microsoft) + as suas deps async.
+# Import preguiçoso no código → garantir que o PyInstaller os empacota à mão.
+_tts_hidden = (collect_submodules('edge_tts')
+               + ['aiohttp', 'certifi', 'multidict', 'yarl', 'frozenlist',
+                  'aiosignal', 'attr', 'attrs', 'async_timeout'])
+_tts_datas = collect_data_files('edge_tts') + collect_data_files('certifi')
 
 # VLC to bundle. Override with LEXIO_VLC_DIR if installed elsewhere (e.g. CI).
 VLC_DIR = os.environ.get("LEXIO_VLC_DIR", r"C:\Program Files\VideoLAN\VLC")
@@ -26,8 +34,8 @@ a = Analysis(
         ('icon.ico', '.'),
         ('icon.png', '.'),
         ('fonts/Inter.ttf', 'fonts'),
-    ],
-    hiddenimports=['vlc', 'i18n'],
+    ] + _tts_datas,
+    hiddenimports=['vlc', 'i18n'] + _tts_hidden,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
