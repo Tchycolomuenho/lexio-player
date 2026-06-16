@@ -1,0 +1,165 @@
+=== Lexio Study Player — build canónica ===
+[1/5] py_compile (lexio_player.py, scene_agent.py, i18n.py)...
+[2/5] versão = 3.9.1 (version.txt sincronizado)
+[3/5] PyInstaller (pode demorar alguns minutos)...
+954 INFO: PyInstaller: 6.20.0, contrib hooks: 2026.5
+956 INFO: Python: 3.14.0
+1496 INFO: Platform: Windows-10-10.0.19045-SP0
+1496 INFO: Python environment: C:\Python314
+1516 INFO: Removing temporary files and cleaning cache in C:\Users\tchic\AppData\Local\pyinstaller
+9740 INFO: Module search paths (PYTHONPATH):
+['C:\\Users\\tchic\\lexio-player',
+ 'C:\\Python314\\python314.zip',
+ 'C:\\Python314\\DLLs',
+ 'C:\\Python314\\Lib',
+ 'C:\\Python314',
+ 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages',
+ 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\win32',
+ 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\win32\\lib',
+ 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\Pythonwin',
+ 'C:\\Python314\\Lib\\site-packages',
+ 'C:\\Users\\tchic\\lexio-player']
+11737 INFO: Appending 'binaries' from .spec
+11738 INFO: Appending 'datas' from .spec
+11740 INFO: checking Analysis
+11740 INFO: Building Analysis because Analysis-00.toc is non existent
+11741 INFO: Looking for Python shared library...
+11741 INFO: Using Python shared library: C:\Python314\python314.dll
+11741 INFO: Running Analysis Analysis-00.toc
+11741 INFO: Target bytecode optimization level: 0
+11741 INFO: Initializing module dependency graph...
+11745 INFO: Initializing module graph hook caches...
+11958 INFO: Analyzing modules for base_library.zip ...
+19249 INFO: Processing standard module hook 'hook-encodings.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\PyInstaller\\hooks'
+29671 INFO: Processing standard module hook 'hook-difflib.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\PyInstaller\\hooks'
+29751 INFO: Processing standard module hook 'hook-heapq.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\PyInstaller\\hooks'
+30559 INFO: Processing standard module hook 'hook-pickle.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\PyInstaller\\hooks'
+38233 INFO: Caching module dependency graph...
+38477 INFO: Analyzing C:\Users\tchic\lexio-player\lexio_player.py
+41116 INFO: Processing standard module hook 'hook-_ctypes.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\PyInstaller\\hooks'
+42043 INFO: Processing standard module hook 'hook-PyQt5.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\PyInstaller\\hooks'
+47703 INFO: Processing standard module hook 'hook-PyQt5.QtCore.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\PyInstaller\\hooks'
+63129 INFO: Processing standard module hook 'hook-PyQt5.QtWidgets.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\PyInstaller\\hooks'
+80919 INFO: Processing standard module hook 'hook-PyQt5.QtGui.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\PyInstaller\\hooks'
+159323 INFO: Processing standard module hook 'hook-PyQt5.QtWebEngineWidgets.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\PyInstaller\\hooks'
+163092 INFO: Processing standard module hook 'hook-PyQt5.QtNetwork.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\PyInstaller\\hooks'
+168320 INFO: Processing standard module hook 'hook-PyQt5.QtPrintSupport.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\PyInstaller\\hooks'
+171891 INFO: Processing standard module hook 'hook-PyQt5.QtWebEngineCore.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\PyInstaller\\hooks'
+179156 INFO: Processing standard module hook 'hook-PyQt5.QtWebChannel.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\PyInstaller\\hooks'
+181530 INFO: Processing standard module hook 'hook-platform.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\PyInstaller\\hooks'
+182134 INFO: Processing standard module hook 'hook-multiprocessing.util.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\PyInstaller\\hooks'
+182459 INFO: Processing standard module hook 'hook-xml.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\PyInstaller\\hooks'
+185564 INFO: Processing pre-safe-import-module hook 'hook-typing_extensions.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+185569 INFO: SetuptoolsInfo: initializing cached setuptools info...
+190463 INFO: Processing standard module hook 'hook-pydantic.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+193306 INFO: Processing standard module hook 'hook-rich.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+196080 INFO: Processing standard module hook 'hook-IPython.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+204240 INFO: Processing standard module hook 'hook-xml.dom.domreg.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\PyInstaller\\hooks'
+206582 INFO: Processing standard module hook 'hook-sysconfig.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\PyInstaller\\hooks'
+209638 INFO: Processing standard module hook 'hook-pycparser.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+211752 INFO: Processing standard module hook 'hook-setuptools.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\PyInstaller\\hooks'
+211813 INFO: Processing pre-safe-import-module hook 'hook-distutils.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+211919 INFO: Processing pre-safe-import-module hook 'hook-jaraco.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+211921 INFO: Setuptools: 'jaraco' appears to be a partial setuptools-vendored copy - extending search paths to ['C:\\Python314\\Lib\\site-packages\\jaraco', 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\setuptools\\_vendor\\jaraco']!
+211923 INFO: Processing pre-safe-import-module hook 'hook-jaraco.functools.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+211958 INFO: Processing pre-safe-import-module hook 'hook-more_itertools.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+212957 INFO: Processing pre-safe-import-module hook 'hook-packaging.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+213573 INFO: Processing pre-safe-import-module hook 'hook-jaraco.text.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+213574 INFO: Setuptools: 'jaraco.text' appears to be a setuptools-vendored copy - creating alias to 'setuptools._vendor.jaraco.text'!
+213622 INFO: Processing standard module hook 'hook-setuptools._vendor.jaraco.text.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\PyInstaller\\hooks'
+213626 INFO: Processing pre-safe-import-module hook 'hook-importlib_resources.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+213629 INFO: Processing pre-safe-import-module hook 'hook-jaraco.context.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+213671 INFO: Processing pre-safe-import-module hook 'hook-backports.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+213673 INFO: Setuptools: 'backports' appears to be a full setuptools-vendored copy - creating alias to 'setuptools._vendor.backports'!
+214354 INFO: Processing pre-safe-import-module hook 'hook-importlib_metadata.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+214468 INFO: Processing standard module hook 'hook-importlib_metadata.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\PyInstaller\\hooks'
+214573 INFO: Processing pre-safe-import-module hook 'hook-zipp.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+215507 INFO: Processing pre-safe-import-module hook 'hook-tomli.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+217425 INFO: Processing pre-safe-import-module hook 'hook-wheel.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+217426 INFO: Setuptools: 'wheel' appears to be a setuptools-vendored copy - creating alias to 'setuptools._vendor.wheel'!
+222275 INFO: Processing standard module hook 'hook-wcwidth.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\PyInstaller\\hooks'
+225254 INFO: Processing standard module hook 'hook-jedi.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+229020 INFO: Processing standard module hook 'hook-parso.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+232136 INFO: Processing standard module hook 'hook-pkg_resources.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\PyInstaller\\hooks'
+233006 INFO: Processing pre-safe-import-module hook 'hook-platformdirs.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+233042 INFO: Processing standard module hook 'hook-platformdirs.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+234139 INFO: Processing standard module hook 'hook-sqlite3.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\PyInstaller\\hooks'
+236633 INFO: Processing standard module hook 'hook-dateutil.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+237037 INFO: Processing pre-safe-import-module hook 'hook-six.moves.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+237920 INFO: Processing standard module hook 'hook-psutil.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+238859 INFO: Processing pre-safe-import-module hook 'hook-gi.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+241027 INFO: Processing standard module hook 'hook-zoneinfo.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+242760 INFO: Processing standard module hook 'hook-certifi.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+242852 INFO: Processing standard module hook 'hook-anyio.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+250956 INFO: Processing standard module hook 'hook-dns.rdata.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+254351 INFO: Processing standard module hook 'hook-pythoncom.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+254623 INFO: Processing standard module hook 'hook-pywintypes.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+261599 INFO: Analyzing hidden import 'edge_tts.__main__'
+261912 INFO: Processing module hooks (post-graph stage)...
+266275 INFO: Processing standard module hook 'hook-PyQt5.QtQuick.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\PyInstaller\\hooks'
+269055 INFO: Processing standard module hook 'hook-PyQt5.QtQml.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\PyInstaller\\hooks'
+351782 INFO: Processing standard module hook 'hook-PyQt5.QtPositioning.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\PyInstaller\\hooks'
+355858 INFO: Processing standard module hook 'hook-PyQt5.QtQuickWidgets.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\PyInstaller\\hooks'
+357959 INFO: Processing standard module hook 'hook-tzdata.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+360338 INFO: Performing binary vs. data reclassification (3931 entries)
+363593 INFO: Looking for ctypes DLLs
+364749 INFO: Analyzing run-time hooks ...
+364763 INFO: Including run-time hook 'pyi_rth_inspect.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\PyInstaller\\hooks\\rthooks'
+364773 INFO: Including run-time hook 'pyi_rth_pythoncom.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\_pyinstaller_hooks_contrib\\rthooks'
+364776 INFO: Including run-time hook 'pyi_rth_pywintypes.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\_pyinstaller_hooks_contrib\\rthooks'
+364779 INFO: Including run-time hook 'pyi_rth_pkgutil.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\PyInstaller\\hooks\\rthooks'
+364788 INFO: Including run-time hook 'pyi_rth_multiprocessing.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\PyInstaller\\hooks\\rthooks'
+364794 INFO: Including run-time hook 'pyi_rth_setuptools.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\PyInstaller\\hooks\\rthooks'
+364798 INFO: Including run-time hook 'pyi_rth_traitlets.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\_pyinstaller_hooks_contrib\\rthooks'
+364801 INFO: Including run-time hook 'pyi_rth_pkgres.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\PyInstaller\\hooks\\rthooks'
+364824 INFO: Including run-time hook 'pyi_rth_pyqt5.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\PyInstaller\\hooks\\rthooks'
+364829 INFO: Processing pre-find-module-path hook 'hook-_pyi_rth_utils.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\PyInstaller\\hooks\\pre_find_module_path'
+364838 INFO: Processing standard module hook 'hook-_pyi_rth_utils.py' from 'C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\PyInstaller\\hooks'
+365259 INFO: Creating base_library.zip...
+365318 INFO: Looking for dynamic libraries
+C:\Users\tchic\AppData\Roaming\Python\Python314\site-packages\PyInstaller\building\build_main.py:227: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  __import__(package)
+0.03s - Debugger warning: It seems that frozen modules are being used, which may
+0.00s - make the debugger miss breakpoints. Please pass -Xfrozen_modules=off
+0.00s - to python to disable frozen modules.
+0.00s - Note: Debugging will proceed. Set PYDEVD_DISABLE_FILE_VALIDATION=1 to disable this validation.
+386313 INFO: Extra DLL search directories (AddDllDirectory): ['C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\PyQt5\\Qt5\\bin']
+386313 INFO: Extra DLL search directories (PATH): ['C:\\Users\\tchic\\AppData\\Roaming\\Python\\Python314\\site-packages\\PyQt5\\Qt5\\bin']
+405117 INFO: Warnings written to C:\Users\tchic\lexio-player\build\LexioStudyPlayer\warn-LexioStudyPlayer.txt
+405812 INFO: Graph cross-reference written to C:\Users\tchic\lexio-player\build\LexioStudyPlayer\xref-LexioStudyPlayer.html
+406277 INFO: checking Tree
+406278 INFO: Building Tree because Tree-00.toc is non existent
+406278 INFO: Building Tree Tree-00.toc
+406446 INFO: checking PYZ
+406446 INFO: Building PYZ because PYZ-00.toc is non existent
+406446 INFO: Building PYZ (ZlibArchive) C:\Users\tchic\lexio-player\build\LexioStudyPlayer\PYZ-00.pyz
+408647 INFO: Building PYZ (ZlibArchive) C:\Users\tchic\lexio-player\build\LexioStudyPlayer\PYZ-00.pyz completed successfully.
+408736 INFO: checking PKG
+408737 INFO: Building PKG because PKG-00.toc is non existent
+408737 INFO: Building PKG (CArchive) LexioStudyPlayer.pkg
+409422 INFO: Building PKG (CArchive) LexioStudyPlayer.pkg completed successfully.
+409425 INFO: Bootloader C:\Users\tchic\AppData\Roaming\Python\Python314\site-packages\PyInstaller\bootloader\Windows-64bit-intel\runw.exe
+409425 INFO: checking EXE
+409425 INFO: Building EXE because EXE-00.toc is non existent
+409426 INFO: Building EXE from EXE-00.toc
+409427 INFO: Copying bootloader EXE to C:\Users\tchic\lexio-player\build\LexioStudyPlayer\LexioStudyPlayer.exe
+409441 INFO: Copying icon to EXE
+409452 INFO: Copying 0 resources to EXE
+409453 INFO: Embedding manifest in EXE
+409462 INFO: Appending PKG archive to EXE
+409509 INFO: Fixing EXE headers
+409854 INFO: Building EXE from EXE-00.toc completed successfully.
+410061 INFO: checking COLLECT
+410062 INFO: Building COLLECT because COLLECT-00.toc is non existent
+410063 INFO: Removing dir C:\Users\tchic\lexio-player\dist\LexioStudyPlayer
+416072 INFO: Building COLLECT COLLECT-00.toc
+440200 INFO: Building COLLECT COLLECT-00.toc completed successfully.
+440872 INFO: Build complete! The results are available in: C:\Users\tchic\lexio-player\dist
+[4/5] Inno Setup (ISCC)...
+
+Successful compile (280.218 sec). Resulting Setup program filename is:
+C:\Users\tchic\lexio-player\installer\LexioStudyPlayer-3.9.1-Setup.exe
+[5/5] OK → installer/LexioStudyPlayer-3.9.1-Setup.exe
+         135489295 bytes   Jun 16 00:04
+>>> Para instalar: ./build.sh --install   (ou dá duplo-clique em installer/LexioStudyPlayer-3.9.1-Setup.exe)
+=== Feito (v3.9.1) ===

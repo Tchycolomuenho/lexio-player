@@ -19,7 +19,7 @@ def log(msg):
             f.write(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}\n")
     except: pass
 
-log("=== LEXIO PLAYER v3.8.0 === (pyinstaller-friendly)")
+log("=== LEXIO PLAYER a arrancar === (pyinstaller-friendly)")  # versão real logada após APP_VERSION
 
 # ── VLC path ──
 # A self-contained build ships libvlc.dll + libvlccore.dll + the plugins folder
@@ -79,7 +79,8 @@ try:
         QLabel, QPushButton, QSlider, QFileDialog, QListWidget, QListWidgetItem,
         QMenu, QMessageBox, QTextEdit, QLineEdit,
         QTabWidget, QStatusBar, QScrollArea, QSizePolicy, QDialog,
-        QGraphicsOpacityEffect, QStyle, QStyleOptionSlider, QFileIconProvider, QComboBox
+        QGraphicsOpacityEffect, QStyle, QStyleOptionSlider, QFileIconProvider, QComboBox,
+        QLayout, QWidgetItem, QSplitter
     )
     from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEngineProfile, QWebEnginePage
     from PyQt5.QtWebChannel import QWebChannel
@@ -116,7 +117,8 @@ ACC_HOVER = "#cfcfcf"  # dimmer white on hover
 ON_ACC = "#000000"   # text/icon ON white accent
 
 APP_NAME = "Lexio Study Player"
-APP_VERSION = "3.8.0"
+APP_VERSION = "3.9.5"
+log(f"=== LEXIO PLAYER v{APP_VERSION} ===")  # versão REAL (o banner de cima já não tem versão hardcoded)
 DATA_DIR = Path.home() / '.lexio-player'; DATA_DIR.mkdir(exist_ok=True)
 RECENT_FILE = DATA_DIR / 'recent.json'
 STUDY_FILE = DATA_DIR / 'study-data.json'
@@ -146,30 +148,126 @@ def speak_edge_tts(text, lang="en", rate=0):
     de pronúncia. 0/None = velocidade normal. Devolve None se falhar (offline)."""
     if not text or not text.strip():
         return None
+    import asyncio, tempfile
     try:
-        import edge_tts, asyncio, tempfile
-        voice = EDGE_VOICES.get(lang, "en-US-AriaNeural")
-        out = os.path.join(tempfile.gettempdir(), f"lexio_tts_{int(time.time() * 1000)}.mp3")
-        kwargs = {}
-        if rate:
-            rr = max(-50, min(50, int(rate)))
-            kwargs["rate"] = f"+{rr}%" if rr >= 0 else f"{rr}%"
-        loop = asyncio.new_event_loop()
-        try:
-            loop.run_until_complete(edge_tts.Communicate(text.strip(), voice, **kwargs).save(out))
-        finally:
-            loop.close()
-        if os.path.exists(out) and os.path.getsize(out) > 0:
-            return out
+        import edge_tts
     except Exception as e:
-        log(f"edge-tts: {e}")
+        log(f"edge-tts import: {e}")
+        return None
+    voice = EDGE_VOICES.get(lang, "en-US-AriaNeural")
+    kwargs = {}
+    if rate:
+        rr = max(-50, min(50, int(rate)))
+        kwargs["rate"] = f"+{rr}%" if rr >= 0 else f"{rr}%"
+    # Retry: a 1ª ligação ao serviço da Microsoft falha às vezes (rede/token) — uma
+    # 2ª tentativa resolve a maioria das "vozes robóticas" (que eram o fallback SAPI).
+    for attempt in (1, 2):
+        out = os.path.join(tempfile.gettempdir(), f"lexio_tts_{int(time.time() * 1000)}_{attempt}.mp3")
+        try:
+            loop = asyncio.new_event_loop()
+            try:
+                loop.run_until_complete(edge_tts.Communicate(text.strip(), voice, **kwargs).save(out))
+            finally:
+                loop.close()
+            if os.path.exists(out) and os.path.getsize(out) > 0:
+                return out
+        except Exception as e:
+            log(f"edge-tts (tentativa {attempt}): {e}")
     return None
-SUPABASE_ANON = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImxvYndkc3R3cGNidWxqZmVyeXlvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzk3NDI5MTIsImV4cCI6MjA5NTMxODkxMn0.GvJRLDE6yLhgDQUq-ckjgRZWbpvS4eKsUZglNyBsjSA"
+
+
+def speak_local_sapi(text, lang="en"):
+    """Fallback offline: voz nativa do Windows (SAPI). Não tão boa, mas nunca silêncio
+    quando o edge-tts neural falha (rede). Usado pela aba Pronúncia e detalhes."""
+    if sys.platform != "win32" or not text or not text.strip():
+        return False
+    culture = {
+        "en": "en-US", "pt": "pt-PT", "es": "es-ES", "fr": "fr-FR", "de": "de-DE",
+        "it": "it-IT", "ja": "ja-JP", "zh": "zh-CN", "ko": "ko-KR", "ru": "ru-RU",
+        "ar": "ar-SA", "nl": "nl-NL",
+    }.get((lang or "en")[:2], "en-US")
+    safe = text.replace("'", "''")
+    ps = ("Add-Type -AssemblyName System.Speech;"
+          "$s=New-Object System.Speech.Synthesis.SpeechSynthesizer;"
+          "try{$s.SelectVoiceByHints([System.Speech.Synthesis.VoiceGender]::NotSet,"
+          "[System.Speech.Synthesis.VoiceAge]::NotSet,0,"
+          f"[System.Globalization.CultureInfo]'{culture}')}}catch{{}};$s.Speak('{safe}')")
+    try:
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        subprocess.Popen(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                         startupinfo=si, creationflags=0x08000000)
+        return True
+    except Exception as e:
+        log(f"sapi: {e}")
+        return False
+
+
+class _SlowSpeaker:
+    """Diz uma frase/legenda com voz NEURAL natural (edge-tts) a uma velocidade mais
+    lenta, mantendo a naturalidade (não estica o áudio — re-sintetiza mais devagar),
+    com fallback para a voz do Windows (SAPI). Um único player VLC partilhado por
+    todos os pontos que pedem áudio (cartões Twitch, chat, aba Pronúncia)."""
+    def __init__(self):
+        self._player = None
+        self._inst = None
+
+    def speak(self, text, lang="en", rate=-25):
+        text = (text or "").strip()
+        if not text:
+            return
+        threading.Thread(target=self._work, args=(text, (lang or "en")[:2], rate),
+                         daemon=True).start()
+
+    def stop(self):
+        try:
+            if self._player:
+                self._player.stop()
+        except Exception:
+            pass
+
+    def _work(self, text, lang, rate):
+        try:
+            tmp = speak_edge_tts(text, lang, rate)
+            if not tmp:
+                speak_local_sapi(text, lang)   # nunca silêncio
+                return
+            import vlc
+            if self._player is None:
+                self._inst = vlc.Instance("--quiet", "--no-video",
+                    "--audio-resampler=soxr", "--aout=wasapi")
+                self._player = self._inst.media_player_new()
+            self._player.stop()
+            self._player.set_media(self._inst.media_new(tmp))
+            self._player.audio_set_volume(100)
+            self._player.play()
+        except Exception as e:
+            log(f"slow speak: {e}")
+            try: speak_local_sapi(text, lang)
+            except Exception: pass
+
+
+SLOW_TTS = _SlowSpeaker()
+
+SUPABASE_ANON ="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImxvYndkc3R3cGNidWxqZmVyeXlvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzk3NDI5MTIsImV4cCI6MjA5NTMxODkxMn0.GvJRLDE6yLhgDQUq-ckjgRZWbpvS4eKsUZglNyBsjSA"
 
 # ── i18n: UI traduzida; a língua é ESCOLHIDA pelo utilizador no player e fica
 # guardada localmente. Conteúdo (dicionário/chat) herda a língua nativa da conta.
 import i18n
 from i18n import T, set_lang, set_native, native_language_name
+try:
+    import scene_agent   # cérebro do Scene Agent (deteção de missões + avaliação IA)
+except Exception as _e:
+    scene_agent = None
+    log(f"scene_agent import falhou: {_e}")
+
+# Tipos de missão que o player trata com os seus próprios diálogos (UI + avaliação
+# dedicada), em vez do SceneMissionDialog genérico. Mantido aqui para não depender
+# de scene_agent ter importado.
+_PLAYER_EXERCISE_KINDS = frozenset((
+    "fluency_translate", "paraphrase_line", "describe_scene", "describe_take",
+    "dialogue_roleplay",
+))
 
 i18n.set_cache_dir(str(DATA_DIR / 'i18n-cache'))   # traduções IA on-demand ficam aqui
 _UI_LANG_FILE = DATA_DIR / 'ui-lang.txt'
@@ -229,6 +327,112 @@ def translate_ui_via_ai(code):
         log(f"ui translate {code}: {e}")
     return False
 
+def topup_ui_via_ai(code):
+    """Traduz APENAS as chaves de UI que faltam numa língua já em cache (ex.: novas
+    strings adicionadas depois de a língua ter sido traduzida) e junta-as à cache.
+    Garante que QUALQUER língua suportada — não só as 12 embutidas — recebe as
+    strings novas, sem reescrever as traduções já existentes. Devolve True se
+    preencheu alguma coisa."""
+    try:
+        missing = i18n.missing_ui_keys(code)
+        if not missing:
+            return False
+        base = i18n.base_strings()
+        subset = {k: base[k] for k in missing if k in base}
+        if not subset:
+            return False
+        lang_en = i18n.language_en_name(code)
+        sys_p = (
+            "You are a professional software UI translator. You receive a JSON object "
+            f"of UI strings. Translate every VALUE into {lang_en}. Keep every KEY exactly "
+            "as-is. Preserve placeholders such as {score}, {lang}, {where} verbatim. Keep "
+            "translations short (these are buttons, labels, tooltips). Reply with ONLY the "
+            "translated JSON object — no markdown, no prose.")
+        body = json.dumps({"model": "deepseek-chat", "max_tokens": 2000, "temperature": 0.1,
+            "messages": [{"role": "system", "content": sys_p},
+                         {"role": "user", "content": json.dumps(subset, ensure_ascii=False)}]}).encode()
+        r = urlopen(Request(f"{LEXIO_API}/api/deepseek-chat", data=body,
+                            headers={"Content-Type": "application/json"}), timeout=90)
+        d = json.loads(r.read().decode())
+        raw = (d.get("text") or "").strip()
+        if not raw and d.get("choices"):
+            raw = d["choices"][0].get("message", {}).get("content", "")
+        raw = raw.strip().strip("`")
+        mapping = json.loads(raw[raw.find("{"): raw.rfind("}") + 1])
+        mapping = {k: str(v) for k, v in mapping.items() if k in subset and v}
+        if mapping:
+            i18n.register_translations(code, mapping, merge=True)
+            log(f"ui topup {code}: +{len(mapping)} strings")
+            return True
+    except Exception as e:
+        log(f"ui topup {code}: {e}")
+    return False
+
+def _openrouter_key():
+    """Chave OpenRouter para o fallback de visão direto. Lida do ambiente ou de um
+    ficheiro LOCAL em DATA_DIR — NUNCA hardcoded no código (não vai para o git nem
+    para o .exe distribuído)."""
+    try:
+        k = os.environ.get("OPENROUTER_API_KEY", "").strip()
+        if k:
+            return k
+        f = DATA_DIR / "openrouter-key.txt"
+        if f.exists():
+            return f.read_text(encoding="utf-8").strip()
+    except Exception:
+        pass
+    return ""
+
+def call_vision(prompt, system="", images=None, model="google/gemini-2.0-flash-001",
+                max_tokens=700, temperature=0.3, json_mode=True, timeout=75):
+    """Chama um modelo de visão. Tenta o backend partilhado /api/vision (chave no
+    servidor); se falhar e houver chave OpenRouter local, chama o OpenRouter
+    diretamente. Devolve o texto da resposta (string) ou levanta exceção."""
+    images = images or []
+    # 1) Backend partilhado (preferido — chave fica no servidor).
+    try:
+        body = json.dumps({
+            "prompt": prompt, "system": system, "json": json_mode,
+            "model": model, "maxTokens": max_tokens, "temperature": temperature,
+            "images": images,
+        }).encode()
+        r = urlopen(Request(f"{LEXIO_API}/api/vision", data=body,
+                            headers={"Content-Type": "application/json"}), timeout=timeout)
+        d = json.loads(r.read().decode())
+        txt = (d.get("text") or "").strip()
+        if txt:
+            return txt
+        raise RuntimeError("empty /api/vision response")
+    except Exception as e:
+        log(f"vision via backend falhou: {e}")
+    # 2) Fallback: OpenRouter direto (chave local).
+    key = _openrouter_key()
+    if not key:
+        raise RuntimeError("no OpenRouter key for direct vision")
+    content = [{"type": "text", "text": prompt}]
+    for img in images:
+        data = img.get("data") if isinstance(img, dict) else None
+        if data:
+            mime = (img.get("mimeType") or "image/jpeg")
+            url = data if str(data).startswith("data:") else f"data:{mime};base64,{data}"
+            content.append({"type": "image_url", "image_url": {"url": url}})
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": content})
+    payload = {"model": model, "messages": messages, "max_tokens": max_tokens,
+               "temperature": temperature}
+    if json_mode:
+        payload["response_format"] = {"type": "json_object"}
+    r = urlopen(Request("https://openrouter.ai/api/v1/chat/completions",
+                        data=json.dumps(payload).encode(),
+                        headers={"Content-Type": "application/json",
+                                 "Authorization": f"Bearer {key}",
+                                 "HTTP-Referer": "https://lexio.app",
+                                 "X-Title": "Lexio Player"}), timeout=timeout)
+    d = json.loads(r.read().decode())
+    return (((d.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
+
 set_lang(load_ui_lang())   # aplica antes de construir a UI
 set_native(load_ui_lang())  # conteúdo (dicionário/chat) na língua escolhida; conta pode sobrepor no login
 
@@ -272,6 +476,76 @@ def showToast(msg, style="", duration=2000):
                     sb.showMessage(msg, duration)
                     return
     except: pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FLOW LAYOUT — quebra os widgets para a linha seguinte quando não cabem
+# (usado na barra de Prática, p/ os botões NUNCA cortarem o texto)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class FlowLayout(QLayout):
+    def __init__(self, parent=None, margin=0, hspacing=6, vspacing=6):
+        super().__init__(parent)
+        self._items = []
+        self._hsp = hspacing
+        self._vsp = vspacing
+        if parent is not None:
+            self.setContentsMargins(margin, margin, margin, margin)
+
+    def addItem(self, item):
+        self._items.append(item)
+
+    def count(self):
+        return len(self._items)
+
+    def itemAt(self, i):
+        return self._items[i] if 0 <= i < len(self._items) else None
+
+    def takeAt(self, i):
+        return self._items.pop(i) if 0 <= i < len(self._items) else None
+
+    def expandingDirections(self):
+        return Qt.Orientations(Qt.Orientation(0))
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, width):
+        return self._do(QRect(0, 0, width, 0), True)
+
+    def setGeometry(self, rect):
+        super().setGeometry(rect)
+        self._do(rect, False)
+
+    def sizeHint(self):
+        return self.minimumSize()
+
+    def minimumSize(self):
+        s = QSize()
+        for it in self._items:
+            s = s.expandedTo(it.minimumSize())
+        m = self.contentsMargins()
+        s += QSize(m.left() + m.right(), m.top() + m.bottom())
+        return s
+
+    def _do(self, rect, test):
+        m = self.contentsMargins()
+        x = rect.x() + m.left()
+        y = rect.y() + m.top()
+        right = rect.right() - m.right()
+        line_h = 0
+        for it in self._items:
+            w = it.sizeHint().width()
+            h = it.sizeHint().height()
+            if x + w > right and line_h > 0:
+                x = rect.x() + m.left()
+                y += line_h + self._vsp
+                line_h = 0
+            if not test:
+                it.setGeometry(QRect(QPoint(x, y), it.sizeHint()))
+            x += w + self._hsp
+            line_h = max(line_h, h)
+        return y + line_h - rect.y() + m.bottom()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -377,6 +651,54 @@ class SubEntry:
     def __init__(self, start, end, text):
         self.start = start; self.end = end; self.text = text
 
+
+class DialogueTurn:
+    """Um TURNO de fala (uma personagem a falar de seguida), já agrupado a partir de
+    várias legendas. O problema que isto resolve: uma personagem que fala muito aparece
+    repartida por 2-3 legendas, e o role-play tratava cada legenda como uma personagem
+    diferente. Aqui juntamos as legendas da mesma fala num só turno."""
+    __slots__ = ('start', 'end', 'text', 'speaker')
+    def __init__(self, start, end, text, speaker):
+        self.start = start; self.end = end; self.text = text; self.speaker = speaker
+
+
+# Marca de mudança de falante dentro de uma legenda: traço inicial ou " - " no meio.
+# (parse_srt junta as linhas da legenda com espaço, por isso os traços sobrevivem.)
+_SPK_DASH_RE = re.compile(r'(?:^|\s)[-–—]\s+')
+# Prefixo de nome de personagem no início de uma fala: "JOHN:", "Maria:" etc.
+_SPK_NAME_RE = re.compile(r'^([^\W\d_][\w\'’.\- ]{0,18}):\s+(.+)$', re.UNICODE)
+# Início que indica continuação da MESMA fala (minúscula ou conjunção).
+_CONT_START_RE = re.compile(
+    r'^(?:and|but|so|or|because|cause|’cause|that|which|who|when|while|though|'
+    r'although|e|mas|porque|que|para|então|ou|y|pero|porque)\b', re.I)
+# A fala anterior NÃO terminou (sem pontuação final) → mesma personagem continua.
+_SENTENCE_END_RE = re.compile(r'[.!?…"”’\)]\s*$')
+
+
+def _split_speaker_segments(text):
+    """Reparte UMA legenda em segmentos de falante. Devolve lista de
+    (nome|None, texto, fronteira_explicita_bool). Traço inicial / nome são fronteiras."""
+    text = (text or "").strip()
+    if not text:
+        return []
+    # Traços a marcar dois falantes na mesma legenda → segmentos separados (fronteira).
+    if _SPK_DASH_RE.search(text):
+        parts = [p.strip() for p in _SPK_DASH_RE.split(text) if p and p.strip()]
+        if len(parts) > 1:
+            segs = []
+            for p in parts:
+                m = _SPK_NAME_RE.match(p)
+                if m:
+                    segs.append((m.group(1).strip(), m.group(2).strip(), True))
+                else:
+                    segs.append((None, p, True))
+            return segs
+    # Sem traços: legenda inteira é um segmento; pode ter prefixo de nome.
+    m = _SPK_NAME_RE.match(text)
+    if m:
+        return [(m.group(1).strip(), m.group(2).strip(), True)]
+    return [(None, text, False)]
+
 # A single timestamp: optional hours, then MM:SS,mmm (SRT) or MM:SS.mmm (VTT).
 _TS_RE = re.compile(r'(?:(\d{1,2}):)?(\d{1,2}):(\d{2})[,.](\d{1,3})')
 
@@ -438,6 +760,8 @@ class PlayerEngine(QWidget):
     media_ended = pyqtSignal()
     vocab_triggered = pyqtSignal(str)
     subtitle_changed = pyqtSignal(str)  # current subtitle text
+    subtitle_exited = pyqtSignal(int)   # index of subtitle that just finished
+    ai_loop_changed = pyqtSignal(int)   # remaining loops for current sub, 0 = off
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -461,6 +785,12 @@ class PlayerEngine(QWidget):
         self._ap_armed = False  # armed while inside a subtitle
         self._ap_last = -1      # last subtitle index we were inside
         self._last_sub = ""     # last non-empty subtitle text (stays on pause)
+        self._last_sub_idx = -1 # index of last subtitle
+        # ── AI Auto-Loop: each sentence repeats n times ──
+        self._ai_loop = False       # toggle
+        self._ai_loop_count = 2     # default repetitions per subtitle
+        self._ai_loop_idx = -1      # which subtitle index we're counting loops for
+        self._ai_loop_played = 0    # how many times played so far
 
         self.ph = QLabel("", self)
         self.ph.setAlignment(Qt.AlignCenter)
@@ -484,10 +814,20 @@ class PlayerEngine(QWidget):
         try:
             if not _VLC_PATH:
                 self.ph.setText("VLC nao encontrado\nhttps://videolan.org"); return
+            # scaletempo2: estica o áudio no tempo MANTENDO o tom ao abrandar/acelerar,
+            # com MUITO menos "cacos"/robótica que o scaletempo antigo (é o mesmo
+            # algoritmo que os navegadores usam). É transparente a 1x — só atua quando a
+            # velocidade ≠ 1, por isso não afeta a reprodução normal. Garante também que
+            # o time-stretch está ligado para o shadowing devagar soar limpo.
+            # soxr: resampler de altíssima qualidade (SoX Resampler) — áudio mais natural
+            # e limpo, especialmente em taxas de amostragem não nativas.
             self._inst = vlc.Instance(["--no-xlib","--quiet","--no-video-title-show",
                 "--intf","dummy","--no-osd","--no-stats","--avcodec-hw=none",
                 "--network-caching=300","--file-caching=300",
-                "--text-renderer=freetype"])
+                "--audio-time-stretch","--audio-filter=scaletempo2",
+                "--audio-resampler=soxr",
+                "--text-renderer=freetype",
+                "--aout=wasapi"])
             self._player = self._inst.media_player_new()
             if sys.platform == "win32": self._player.set_hwnd(int(self.winId()))
             ev = self._player.event_manager()
@@ -510,31 +850,76 @@ class PlayerEngine(QWidget):
                 self.position_changed.emit(p)
             # Find current subtitle — keep last active visible when paused
             current_sub = ""
-            for sub in self._subs:
+            current_idx = -1
+            for i, sub in enumerate(self._subs):
                 if sub.start <= p <= sub.end:
                     current_sub = sub.text
+                    current_idx = i
                     break
             if current_sub:
                 self._last_sub = current_sub
+                self._last_sub_idx = current_idx
             elif not is_playing and self._last_sub:
                 current_sub = self._last_sub
             self.subtitle_changed.emit(current_sub)
+            # Detect subtitle exit for listening mode
+            if is_playing and self._last_sub_idx >= 0:
+                inside = False
+                for s in self._subs:
+                    if s.start <= p <= s.end:
+                        inside = True; break
+                if not inside and p < self._duration - 1:
+                    idx = self._last_sub_idx
+                    self._last_sub_idx = -1
+                    self.subtitle_exited.emit(idx)
             # ── A-B loop of the current line ──
             if self._loop and is_playing and p > self._loop[1] + 0.05:
                 log(f"loop back {p:.1f}s -> {self._loop[0]:.1f}s")
                 self.seek(self._loop[0])
-            # ── Auto-pause at the end of each subtitle (shadowing) ──
+            # ── Auto-pause SEMPRE no FIM de cada fala (shadowing) ──
+            # Regra coerente: enquanto estamos DENTRO de uma legenda, ficamos "armados".
+            # A pausa só dispara DEPOIS de a fala terminar — no silêncio a seguir (fim +
+            # margem) ou, em falas seguidas sem silêncio, no instante em que começa a
+            # próxima (= fim da anterior). Nunca pausa no meio/início de uma fala.
             elif self._autopause and is_playing:
+                AP_PAD = 0.35   # margem: .srt mal sincronizado não corta a última palavra
+                cur = -1
+                for i, s in enumerate(self._subs):
+                    if s.start <= p <= s.end:
+                        cur = i; break
+                if cur >= 0:
+                    if (self._ap_armed and self._ap_last >= 0 and cur != self._ap_last
+                            and p >= self._subs[self._ap_last].end - 0.05):
+                        # Falas seguidas: a anterior acabou agora mesmo → pausa no fim dela.
+                        self._ap_armed = False
+                        self._player.pause()
+                    else:
+                        self._ap_last = cur; self._ap_armed = True   # dentro da fala → arma
+                elif self._ap_armed and self._ap_last >= 0:
+                    # Silêncio depois da fala: pausa quando passámos o fim + margem.
+                    if p >= self._subs[self._ap_last].end + AP_PAD:
+                        self._ap_armed = False
+                        self._player.pause()
+            # ── AI Auto-Loop: repeat each sentence N times ──
+            if self._ai_loop and is_playing:
                 inside = -1
                 for i, s in enumerate(self._subs):
                     if s.start <= p <= s.end:
                         inside = i; break
                 if inside >= 0:
-                    if self._ap_last >= 0 and inside != self._ap_last:
-                        self._player.pause()            # back-to-back lines → pause at boundary
-                    self._ap_last = inside; self._ap_armed = True
-                elif self._ap_armed:
-                    self._ap_armed = False; self._player.pause()  # entered the gap → pause
+                    if inside != self._ai_loop_idx:
+                        self._ai_loop_idx = inside
+                        self._ai_loop_played = 1
+                    elif p >= self._subs[inside].end - 0.1:
+                        # About to exit — loop back if not played enough
+                        if self._ai_loop_played < self._ai_loop_count:
+                            self._ai_loop_played += 1
+                            log(f"AI loop {inside} play {self._ai_loop_played}/{self._ai_loop_count}")
+                            self.ai_loop_changed.emit(self._ai_loop_count - self._ai_loop_played)
+                            self.seek(self._subs[inside].start)
+                elif self._ai_loop_idx >= 0 and p > self._subs[self._ai_loop_idx].end + 0.5:
+                    # Past the current subtitle, into gap or next
+                    self._ai_loop_idx = -1; self._ai_loop_played = 0
             # Check subs for vocab overlay (only while playing)
             if is_playing:
                 for i, sub in enumerate(self._subs):
@@ -581,6 +966,14 @@ class PlayerEngine(QWidget):
             QTimer.singleShot(500, self._disable_native_subs)
             log(f"Playing: {path}")
         except Exception as e: log(f"open: {e}")
+
+    def show_subtitle_reset(self):
+        """Esquece a última legenda mostrada e emite uma legenda vazia. Chamado ao
+        trocar de filme para que a legenda do filme anterior não reapareça no intervalo
+        entre stop() e o novo open() (o _poll mostra _last_sub quando está em pausa)."""
+        self._last_sub = ""
+        self._last_sub_idx = -1
+        self.subtitle_changed.emit("")
 
     def _disable_native_subs(self):
         """Turn off VLC's own subtitle rendering — the Qt overlay handles subs."""
@@ -659,12 +1052,66 @@ class PlayerEngine(QWidget):
         if self._player.is_playing(): self._player.pause()
         else: self._player.play()
 
+    def play(self):
+        if self._player and not self._player.is_playing():
+            try: self._player.play()
+            except: pass
+
+    def pause(self):
+        if self._player and self._player.is_playing():
+            try: self._player.pause()
+            except: pass
+
+    def loop_range(self, start, end):
+        """Loop an explicit time span — used by the Describe-scene exercise to keep
+        the whole scene repeating while the user watches and describes it."""
+        if start is None or end is None or end <= start:
+            return
+        self._loop = (float(start), float(end)); self._loop_a = None
+        self.seek(start); self.play()
+
+    def clear_loop(self):
+        self._loop = None; self._loop_a = None
+
+    def snapshot_b64(self, max_w=768):
+        """Grab the current video frame as base64 (JPEG/PNG) for the vision model.
+        Returns (data_b64, mime) or None. Used by Describe-scene/take so the AI can
+        actually SEE the frame and compare it with what's being said."""
+        if not self._player:
+            return None
+        try:
+            import base64, tempfile
+            vw, vh = self.video_size()
+            w = 0
+            if vw and vh and vw > max_w:
+                w = max_w   # let VLC scale down; height 0 keeps aspect ratio
+            fd, path = tempfile.mkstemp(suffix=".png", prefix="lexio_snap_")
+            os.close(fd)
+            ok = self._player.video_take_snapshot(0, path, w, 0)
+            # video_take_snapshot returns 0 on success; the file is written async-ish,
+            # but VLC writes it before returning for the current frame.
+            data = None
+            if os.path.exists(path):
+                with open(path, "rb") as f:
+                    raw = f.read()
+                if raw:
+                    data = base64.b64encode(raw).decode("ascii")
+                try: os.remove(path)
+                except Exception: pass
+            if ok == 0 and data:
+                return data, "image/png"
+            return (data, "image/png") if data else None
+        except Exception as e:
+            log(f"snapshot: {e}")
+            return None
+
     def stop(self):
         self._timer.stop()
         if self._player:
             self._player.stop(); self._media = None
         self._path = None; self._duration = 0; self._subs = []; self._played_ids = set()
         self._last_sub = ""
+        self._ai_loop_idx = -1; self._ai_loop_played = 0
         self._show_ph()
         self._timer.start(self._poll_ms)
 
@@ -715,6 +1162,153 @@ class PlayerEngine(QWidget):
         nxt = min((i + 1) if i >= 0 else 0, len(self._subs) - 1)
         self.seek(self._subs[nxt].start)
 
+    def _sub_cluster(self, min_n=3, max_n=5, gap=2.5):
+        """The 'strategic' cluster of consecutive subtitle lines around the current
+        moment — the same group that's feeding the Twitch cards on screen. Returns
+        (indices, current_index): a list of indices into self._subs, plus the index
+        of the line that's actually playing now (the focus). Lines that belong to
+        one scene are kept together — the cluster stops at a long silence between
+        lines — and is sized 3-5 (fewer only if the scene genuinely has fewer)."""
+        if not self._subs:
+            return [], -1
+        i = self._sub_idx_at(self.get_pos())
+        if i < 0:
+            i = self._last_sub_idx if self._last_sub_idx >= 0 else 0
+        i = max(0, min(i, len(self._subs) - 1))
+        idxs = [i]
+        # Grow forward while consecutive lines stay close (same scene beat).
+        j = i
+        while len(idxs) < max_n and j + 1 < len(self._subs):
+            if self._subs[j + 1].start - self._subs[j].end <= gap:
+                j += 1; idxs.append(j)
+            else:
+                break
+        # Too short for a meaningful passage → pull in lines before it (scene gap
+        # allowed a touch wider going back), then, if still short, ignore gaps.
+        k = i
+        while len(idxs) < min_n and k - 1 >= 0:
+            if self._subs[k].start - self._subs[k - 1].end <= gap * 1.6:
+                k -= 1; idxs.insert(0, k)
+            else:
+                break
+        while len(idxs) < min_n and j + 1 < len(self._subs):
+            j += 1; idxs.append(j)
+        while len(idxs) < min_n and idxs[0] - 1 >= 0:
+            idxs.insert(0, idxs[0] - 1)
+        return idxs, i
+
+    def fluency_group(self, min_n=3, max_n=5, gap=2.5):
+        """The cluster of subtitle lines for the Fluency exercise (translate the
+        whole passage fluently to your own language)."""
+        idxs, _ = self._sub_cluster(min_n, max_n, gap)
+        return [self._subs[g] for g in idxs]
+
+    def paraphrase_group(self, min_n=3, max_n=5, gap=2.5):
+        """Same cluster, but for Paraphrase: returns (lines, focus_pos) where
+        focus_pos is the index INSIDE `lines` of the line that's playing now — the
+        one the user rewrites. The rest are passed to the AI as scene context so
+        the paraphrase stays coherent with the surrounding dialogue."""
+        idxs, cur = self._sub_cluster(min_n, max_n, gap)
+        lines = [self._subs[g] for g in idxs]
+        focus = idxs.index(cur) if cur in idxs else (0 if lines else -1)
+        return lines, focus
+
+    def dialogue_turns(self, max_turns=8, gap=2.2):
+        """Reúne a conversa atual (legendas consecutivas a partir da posição) e AGRUPA-as
+        em TURNOS de fala por heurística (marcadores de traço/nome + pontuação +
+        continuação de frase), em vez de tratar cada legenda como uma personagem
+        diferente. Devolve lista de DialogueTurn com falante
+        atribuído (nome real se existir, senão A/B/C... alternados nas fronteiras)."""
+        if not self._subs:
+            return []
+        i = self._sub_idx_at(self.get_pos())
+        if i < 0:
+            i = self._last_sub_idx if self._last_sub_idx >= 0 else 0
+        i = max(0, min(i, len(self._subs) - 1))
+        # Reúne a corrida de legendas da conversa atual (até quebrar por silêncio longo).
+        # Reúne mais legendas do que turnos, porque o agrupamento reduz a contagem.
+        cues = [self._subs[i]]; j = i
+        while len(cues) < max_turns * 2 + 2 and j + 1 < len(self._subs):
+            if self._subs[j + 1].start - self._subs[j].end <= gap:
+                j += 1; cues.append(self._subs[j])
+            else:
+                break
+        return self._group_turns(cues, max_turns)
+
+    @staticmethod
+    def _group_turns(cues, max_turns=8):
+        """Agrupa SubEntry consecutivos em DialogueTurn. Junta a mesma personagem
+        (frase que continua, mesmo nome) e abre turno novo nas fronteiras (traço,
+        nome diferente, ou frase anterior terminada + nova começa em maiúscula)."""
+        turns = []   # cada: {name, segs:[(text,start,end)], start, end}
+        cur = None
+
+        def text_of(t):
+            return " ".join(s[0] for s in t["segs"]).strip()
+
+        for cue in cues:
+            segs = _split_speaker_segments(cue.text)
+            n = len(segs)
+            for k, (name, seg_text, explicit) in enumerate(segs):
+                # Tempo do segmento: reparte a duração da legenda pelos seus segmentos.
+                if n > 1:
+                    span = (cue.end - cue.start) / float(n)
+                    s_start = cue.start + span * k
+                    s_end = cue.start + span * (k + 1)
+                else:
+                    s_start, s_end = cue.start, cue.end
+
+                if cur is None:
+                    cur = {"name": name, "segs": [(seg_text, s_start, s_end)],
+                           "start": s_start, "end": s_end}
+                    continue
+
+                # Decidir: mesmo falante (continua) ou turno novo?
+                if name is not None and cur["name"] is not None:
+                    new_turn = (name.lower() != cur["name"].lower())
+                elif explicit:
+                    new_turn = True            # traço/nome → mudou de falante
+                else:
+                    prev = text_of(cur)
+                    cont = (not _SENTENCE_END_RE.search(prev)        # frase aberta
+                            or (seg_text[:1].islower())               # começa minúscula
+                            or _CONT_START_RE.match(seg_text))        # conjunção
+                    new_turn = not cont
+
+                if new_turn:
+                    turns.append(cur)
+                    cur = {"name": name, "segs": [(seg_text, s_start, s_end)],
+                           "start": s_start, "end": s_end}
+                else:
+                    if name and not cur["name"]:
+                        cur["name"] = name
+                    cur["segs"].append((seg_text, s_start, s_end))
+                    cur["end"] = s_end
+        if cur is not None:
+            turns.append(cur)
+
+        turns = turns[:max_turns]
+        # Atribuir etiqueta de falante: nome real se houver; senão A/B/C alternados.
+        named = any(t["name"] for t in turns)
+        result = []
+        if named:
+            order = []
+            for t in turns:
+                nm = t["name"] or "?"
+                if nm not in order:
+                    order.append(nm)
+            for t in turns:
+                result.append(DialogueTurn(t["start"], t["end"], text_of(t),
+                                           t["name"] or (order[0] if order else "A")))
+        else:
+            # Sem nomes: assume diálogo a dois e alterna A/B a cada turno (o caso comum).
+            # Os turnos da mesma personagem já foram juntos antes, por isso cada fronteira
+            # restante é, quase sempre, uma troca de falante.
+            for li, t in enumerate(turns):
+                spk = "A" if li % 2 == 0 else "B"
+                result.append(DialogueTurn(t["start"], t["end"], text_of(t), spk))
+        return result
+
     def toggle_loop(self):
         """Loop the current subtitle line until toggled off. Returns new bool state."""
         if self._loop:
@@ -734,6 +1328,14 @@ class PlayerEngine(QWidget):
 
     def set_autopause(self, b):
         self._autopause = bool(b); self._ap_armed = False; self._ap_last = -1
+
+    def set_ai_loop(self, count):
+        """Enable/disable AI auto-loop with given repetitions per subtitle."""
+        self._ai_loop = count > 0
+        self._ai_loop_count = count if count > 0 else 2
+        if not self._ai_loop:
+            self._ai_loop_idx = -1; self._ai_loop_played = 0
+        return self._ai_loop
 
     # ── Manual A-B loop (mark A, then B) ──
     def set_loop_a(self):
@@ -773,6 +1375,43 @@ class PlayerEngine(QWidget):
     def set_rate(self, r):
         if self._player: self._player.set_rate(max(0.25,min(4.0,r)))
 
+    def duck_volume(self, level=22):
+        """Baixa o volume (sem mutar) guardando o anterior. Usado no exercício de
+        diálogo/shadowing: o filme continua a ouvir-se baixinho enquanto o aluno fala
+        por cima — em vez de pausar/mutar de repente."""
+        if not self._player: return
+        try:
+            if getattr(self, "_vol_before_duck", None) is None:
+                cur = self._player.audio_get_volume()
+                self._vol_before_duck = cur if cur is not None and cur >= 0 else 100
+            self._player.audio_set_volume(max(0, min(200, level)))
+        except Exception as e:
+            log(f"duck_volume: {e}")
+
+    def restore_volume(self):
+        """Repõe o volume guardado por duck_volume (se houver)."""
+        if not self._player: return
+        try:
+            v = getattr(self, "_vol_before_duck", None)
+            if v is not None and v >= 0:
+                self._player.audio_set_volume(v)
+        except Exception as e:
+            log(f"restore_volume: {e}")
+        self._vol_before_duck = None
+
+    def nearest_sub_text(self):
+        """Texto da legenda 'atual' para os exercícios: a última mostrada, senão a que
+        está no tempo atual, senão a 1ª. Evita que o exercício falhe só porque o filme
+        não está exatamente em cima de uma legenda."""
+        if self._last_sub:
+            return self._last_sub
+        if not self._subs:
+            return ""
+        i = self._sub_idx_at(self.get_pos())
+        if i < 0:
+            i = 0
+        return (self._subs[i].text or "").strip()
+
     def cleanup(self):
         self._timer.stop(); self.stop()
         if self._player: self._player.release()
@@ -786,10 +1425,30 @@ class PlayerEngine(QWidget):
 # ═══════════════════════════════════════════════════════════════════════════
 
 TWITCH_COLORS = [
-    "#ff0000", "#0000ff", "#00ff00", "#ff00ff", "#ffff00",
+    "#ff0000", "#1e90ff", "#00ff00", "#ff00ff", "#ffd700",
     "#ff69b4", "#00ffff", "#ff4500", "#7b68ee", "#32cd32",
-    "#ff1493", "#1e90ff", "#ffd700", "#00fa9a", "#ff6347",
+    "#ff1493", "#00bfff", "#ffd700", "#00fa9a", "#ff6347",
 ]
+
+# "Utilizadores" do chat Twitch — nomes gerados e cores associadas
+TWITCH_USERS = [
+    ("StreamLover",     "#ff0000"),
+    ("PolyglotPro",     "#1e90ff"),
+    ("WordHunter",      "#00ff00"),
+    ("LinguaLeo",       "#ff00ff"),
+    ("FluentFox",       "#ffd700"),
+    ("ChatVibe",        "#ff69b4"),
+    ("EchoSpeaker",     "#00ffff"),
+    ("LingoNinja",      "#ff4500"),
+    ("TalkMaster",      "#7b68ee"),
+    ("PhraseKing",      "#32cd32"),
+    ("AccentAce",       "#ff1493"),
+    ("DialogueDiver",   "#00bfff"),
+    ("LexiLearner",     "#ffd700"),
+    ("SentenceSmith",   "#00fa9a"),
+    ("VocalVoyager",    "#ff6347"),
+]
+_TWITCH_USER_IDX = 0  # cycling counter — each new card gets the NEXT user
 
 # Soft, high-contrast palette to tint only the KEY words inside a subtitle line
 # (content words) — the rest of the line stays white, so it's legible, not a
@@ -892,11 +1551,12 @@ def mark_tokens(words):
     return out
 
 class VocabCard:
-    __slots__ = ('text', 'time', 'color', 'slide_start', 'saved', 'word_rects')
-    def __init__(self, text, time, color, slide_start):
+    __slots__ = ('text', 'time', 'color', 'slide_start', 'saved', 'word_rects', 'username')
+    def __init__(self, text, time, color, slide_start, username=''):
         self.text = text; self.time = time; self.color = color
         self.slide_start = slide_start; self.saved = False
         self.word_rects = []   # [(x, y, w, h, word)] of clickable key words (set in paint)
+        self.username = username or "Anon"
 
 class VideoOverlay(QWidget):
     """Top-level frameless window — sits ABOVE VLC's DirectX output.
@@ -904,6 +1564,7 @@ class VideoOverlay(QWidget):
     """
     add_word = pyqtSignal(str)
     ask_ai = pyqtSignal(str)
+    speak_card = pyqtSignal(str)       # speaker button on a card → hear it slowly
     video_clicked = pyqtSignal()
     toggle_fullscreen = pyqtSignal()
     word_clicked = pyqtSignal(str)     # underlined key word clicked → details panel
@@ -929,16 +1590,19 @@ class VideoOverlay(QWidget):
         self._no_sub_hint = False # show a clickable "load a subtitle" banner over the video
         self._no_sub_rect = None  # QRect of that banner (for click hit-testing)
         self._mouse_y = 0
+        self._transport_h = 0      # altura do transport flutuante (study mode); legenda+cartões sobem acima dele
         self._loop_active = False  # show a LOOP badge while the A-B loop is on
+        self._ai_loop_active = False  # show AI loop badge
+        self._ai_loop_remaining = 0   # loops left for current subtitle
         self._flash_msg = ""       # transient banner (e.g. "Guardado em Vídeos") for fullscreen
         self._flash_until = 0.0
         self._is_playing = True    # while paused we FREEZE card aging (the user may be
                                    # chatting with the AI / reading details — subs stay)
 
-        # Animation timer: ~60fps for fluid Twitch-style card motion
+        # Animation timer: ~120fps for fluid Twitch-style card motion
         self._anim_timer = QTimer()
         self._anim_timer.timeout.connect(self._tick)
-        self._anim_timer.start(16)
+        self._anim_timer.start(8)
 
         # Reposition timer: every 300ms ensure we cover the engine
         self._pos_timer = QTimer()
@@ -968,8 +1632,17 @@ class VideoOverlay(QWidget):
                 # Keep the floating transport (study mode) ABOVE this overlay so
                 # its buttons stay clickable and visible over the subtitles.
                 tov = getattr(w, "_transport_overlay", None)
-                if tov is not None and tov.isVisible():
-                    tov.raise_()
+                # Reserve the transport's height for the WHOLE time we're in study
+                # mode — even while it's auto-hidden — so the subtitle and Twitch
+                # cards keep a FIXED lowest point and don't jump up/down every time
+                # the controls fade in or out. (Outside study mode the controls are
+                # docked below the video, so nothing needs reserving here.)
+                if getattr(w, "_study_mode", False) and tov is not None:
+                    self._transport_h = (tov.height() or 90) + 10
+                    if tov.isVisible():
+                        tov.raise_()
+                else:
+                    self._transport_h = 0
                 break
 
     def _video_rect(self):
@@ -1039,7 +1712,26 @@ class VideoOverlay(QWidget):
         self.update()
 
     def show_subtitle(self, text):
-        self._current_sub = text
+        # Repintar SEMPRE que o texto muda — em especial quando passa a vazio. Sem
+        # isto, ao trocar de filme a última legenda do filme antigo ficava "colada":
+        # o _tick só repinta enquanto houver legenda ou cartões, por isso ao limpar
+        # (texto = "") nunca chegava a apagar o que estava desenhado.
+        if text != self._current_sub:
+            self._current_sub = text
+            self.update()
+
+    def reset_for_new_video(self):
+        """Limpa todo o estado visual ao trocar de filme: legenda, cartões Twitch e
+        banners. Evita que legendas/cartões do filme anterior fiquem congelados sobre
+        o novo vídeo enquanto este ainda não emitiu nada."""
+        self._current_sub = ""
+        self._cards = []
+        self._hover_idx = -1
+        self._flash_msg = ""
+        self._flash_until = 0.0
+        self._no_sub_hint = False
+        self._no_sub_rect = None
+        self.update()
 
     def set_no_sub_hint(self, on):
         """Show/hide the clickable 'this video has no subtitle — load one' banner."""
@@ -1054,10 +1746,14 @@ class VideoOverlay(QWidget):
         """Called when a subtitle triggers a new phrase. Cards are kept by COUNT,
         not by time: we keep the newest MAX_CARDS and never expire them on a clock.
         New cards only arrive WHILE PLAYING, so during a pause nothing is removed —
-        the cards (and subtitle) stay put for as long as the user studies."""
+        the cards (and subtitle) stay put for as long as the user studies.
+        Each card gets a ROTATING "user" identity (name+color) — like a chat room
+        where different people are reacting in real time."""
+        global _TWITCH_USER_IDX
         now = time.time()
-        color = TWITCH_COLORS[hash(text) % len(TWITCH_COLORS)]
-        self._cards.append(VocabCard(text, now, color, now))
+        uname, color = TWITCH_USERS[_TWITCH_USER_IDX % len(TWITCH_USERS)]
+        _TWITCH_USER_IDX += 1
+        self._cards.append(VocabCard(text, now, color, now, username=uname))
         if len(self._cards) > self.MAX_CARDS:
             self._cards = self._cards[-self.MAX_CARDS:]
 
@@ -1080,6 +1776,15 @@ class VideoOverlay(QWidget):
         elif self._hide_subs and self._current_sub:
             self.update()   # so the subtitle reveals/hides as the mouse nears the bottom
 
+    def leaveEvent(self, e):
+        # Quando o rato sai do vídeo, esquece a posição: senão, se a última posição era
+        # em baixo, a legenda escondida ficava revelada para sempre (queixa "esconder
+        # legenda não funciona bem").
+        self._mouse_y = 0
+        if self._hide_subs and self._current_sub:
+            self.update()
+        super().leaveEvent(e)
+
     def mousePressEvent(self, e):
         # "Load a subtitle" banner takes priority — it sits at the top, clear of cards.
         if self._no_sub_rect is not None and self._no_sub_rect.contains(e.pos()):
@@ -1089,10 +1794,11 @@ class VideoOverlay(QWidget):
         if idx >= 0 and idx < len(self._cards):
             card = self._cards[idx]
             mx, my = e.pos().x(), e.pos().y()
-            # 1) Clicked an underlined key word → open its details panel
+            # 1) Clicked an underlined key word → open details panel + send to Chat IA
             for (wx, wy, ww, wh, word) in card.word_rects:
                 if wx <= mx <= wx + ww and wy <= my <= wy + wh:
                     self.word_clicked.emit(word)
+                    self.ask_ai.emit(word)
                     return
             # 2) Otherwise the +/AI buttons
             self._handle_vocab_click(mx, card, idx)
@@ -1102,6 +1808,7 @@ class VideoOverlay(QWidget):
         for (wx, wy, ww, wh, word) in self._sub_word_rects:
             if wx <= mx <= wx + ww and wy <= my <= wy + wh:
                 self.word_clicked.emit(word)
+                self.ask_ai.emit(word)
                 return
         self.video_clicked.emit()
 
@@ -1117,11 +1824,20 @@ class VideoOverlay(QWidget):
         land on black bars, screen corners or off-screen window areas."""
         ax0, ay0, ax1, ay1 = self._active_rect()
         col_w = min(350, int((ax1 - ax0) * 0.4))
-        y = min(getattr(self, "_sub_top", ay1), ay1) - 8
+        # Cards stack ABOVE a STABLE reserved band sized for a 2-line subtitle. This
+        # mirrors the subtitle geometry in paintEvent (fs = ah//26, etc.) but for a
+        # FIXED 2 lines — so the cards (a) never cover the subtitle, and (b) never jump
+        # when the subtitle appears/disappears or switches between 1 and 2 lines.
+        ah = ay1 - ay0
+        fs = max(9, min(24, ah // 26))
+        line_h = QFontMetrics(QFont("Inter", fs, QFont.Bold)).height() + 2
+        margin_b = max(12, ah // 14) + self._transport_h
+        sub_reserve = 2 * line_h + 14 + margin_b   # 2-line subtitle box + gap (+ transport)
+        y = ay1 - sub_reserve - 8
         now = time.time()
         for i, card in enumerate(self._cards):
             nlines = max(len(card.text.split('\n')), 1)
-            h = nlines * 18 + 20
+            h = nlines * 18 + 20 + 18  # +18 for username header
             y -= h + 4
             if y < ay0:
                 break
@@ -1141,7 +1857,10 @@ class VideoOverlay(QWidget):
         x = ax1 - col_w - 20
         btn_x = x + col_w - 52
         chat_x = btn_x + 24
-        if btn_x <= mx <= btn_x + 22:
+        spk_x = btn_x - 24
+        if spk_x <= mx <= spk_x + 22:
+            self.speak_card.emit(card.text)   # ouvir a frase devagar
+        elif btn_x <= mx <= btn_x + 22:
             card.saved = True          # instant visual feedback (✓), even in fullscreen
             self.update()
             self.add_word.emit(card.text)
@@ -1179,7 +1898,17 @@ class VideoOverlay(QWidget):
             p.drawRoundedRect(ax0 + 16, ay0 + 16, bw, 26, 13, 13)
             p.setPen(QColor(0, 0, 0)); p.drawText(QRect(ax0 + 16, ay0 + 16, bw, 26), Qt.AlignCenter, "LOOP")
 
-        # ── Transient flash banner (save confirmation, visible in fullscreen) ──
+        # ── AI LOOP badge ──
+        if self._ai_loop_active:
+            ai_label = f"AI LOOP {self._ai_loop_remaining}×" if self._ai_loop_remaining > 0 else "AI LOOP"
+            bf = QFont("Inter", 11, QFont.Bold); p.setFont(bf)
+            bw = QFontMetrics(bf).horizontalAdvance(ai_label) + 24
+            bx = ax0 + 26 + (bw if self._loop_active else 16)
+            p.setPen(Qt.NoPen); p.setBrush(QColor(75, 170, 230, 230))
+            p.drawRoundedRect(bx, ay0 + 16, bw, 26, 13, 13)
+            p.setPen(QColor(0, 0, 0)); p.drawText(QRect(bx, ay0 + 16, bw, 26), Qt.AlignCenter, ai_label)
+
+        # ── Transient flash banner
         if self._flash_msg and time.time() < self._flash_until:
             ff = QFont("Inter", 12, QFont.DemiBold); p.setFont(ff)
             fm2 = QFontMetrics(ff)
@@ -1213,7 +1942,11 @@ class VideoOverlay(QWidget):
         # subtitle renderer is disabled (single source, nothing over the controls). ──
         if self._current_sub:
             aw = ax1 - ax0; ah = ay1 - ay0
-            reveal = (not self._hide_subs) or (self._mouse_y > ay1 - 170)
+            # Banda de "espreitar" proporcional à altura do vídeo: 170px fixos eram
+            # maiores que o vídeo em janela pequena → a legenda revelava SEMPRE, por
+            # isso o "esconder legenda" só parecia funcionar no modo expandido.
+            peek = min(150, max(44, int(ah * 0.28)))
+            reveal = (not self._hide_subs) or (self._mouse_y > ay1 - peek)
             if reveal:
                 # Responsive size: the font scales with the VISIBLE video height, so
                 # a small (windowed) player gets smaller subtitles that fit, and a
@@ -1248,7 +1981,9 @@ class VideoOverlay(QWidget):
 
                 box_h = len(lines) * line_h + 14
                 sw = min(maxw, max((line_width(ln) for ln in lines), default=0) + 2 * pad)
-                margin_b = max(12, ah // 14)        # responsive bottom gap
+                # Sobe a legenda acima do transport flutuante (study mode) para os
+                # controlos NUNCA a taparem.
+                margin_b = max(12, ah // 14) + self._transport_h
                 sy = ay1 - box_h - margin_b         # bottom of the VISIBLE video
                 sx = acx - sw // 2                  # centred on the visible video
                 self._sub_top = sy                  # cards stack above this (no overlap)
@@ -1292,6 +2027,15 @@ class VideoOverlay(QWidget):
             p.end()
             return
 
+        # Esconder os cartões Twitch JUNTO com a legenda: em recall ativo (esconder
+        # legenda ON) os cartões revelariam o vocabulário da fala. Só aparecem quando a
+        # legenda também está revelada (rato no fundo do vídeo).
+        if self._hide_subs:
+            peek = min(150, max(44, int((ay1 - ay0) * 0.28)))
+            if not (self._mouse_y > ay1 - peek):
+                p.end()
+                return
+
         fm = QFontMetrics(QFont("Inter", 11))
         now = time.time()
         # Fixed-width right column: max 350px or 40% of the visible video
@@ -1308,8 +2052,8 @@ class VideoOverlay(QWidget):
             target_x = ax1 - col_w - margin
             start_x = ax1  # slides in from the visible right edge
 
-            # Slide animation: 400ms ease-out
-            slide_t = min(1.0, (now - card.slide_start) / 0.4)
+            # Slide animation: 150ms ease-out (rapido)
+            slide_t = min(1.0, (now - card.slide_start) / 0.15)
             ease = 1.0 - (1.0 - slide_t) * (1.0 - slide_t)  # ease-out quad
             cur_x = int(start_x + (target_x - start_x) * ease)
 
@@ -1325,6 +2069,13 @@ class VideoOverlay(QWidget):
             p.setBrush(col)
             p.drawRoundedRect(cur_x, y, 4, h - 2, 2, 2)
 
+            # Username header — colorized, like a Twitch user name
+            uf = QFont("Inter", 9, QFont.Bold)
+            p.setFont(uf)
+            col2 = QColor(card.color); col2.setAlpha(alpha)
+            p.setPen(col2)
+            p.drawText(QRect(cur_x + 12, y + 3, col_w - 24, 16), Qt.AlignLeft | Qt.AlignVCenter, card.username)
+
             # Text — word by word: tint + underline KEY words (clickable for details)
             base_font = QFont("Inter", 11)
             ul_font = QFont("Inter", 11); ul_font.setUnderline(True)
@@ -1332,12 +2083,14 @@ class VideoOverlay(QWidget):
             sp_w = fmc.horizontalAdvance(" ")
             card.word_rects = []
             lines = card.text.split('\n')
-            # Reserva uma faixa à direita para os botões (+ / AI / ✓) — sem isto o
+            # Reserva uma faixa à direita para os botões (♪ / + / AI / ✓) — sem isto o
             # texto comprido passava POR BAIXO dos botões ("botões em cima das letras").
-            text_right = cur_x + col_w - 58
+            text_right = cur_x + col_w - 82
+            # Text starts below the username header
+            text_y_offset = 20
             for li, line in enumerate(lines[:2]):
                 wx = cur_x + 14
-                wy = y + 4 + li * 18
+                wy = y + text_y_offset + li * 18
                 words = line[:70].split(" ")
                 marks = mark_tokens(words)
                 for word, mk in zip(words, marks):
@@ -1368,9 +2121,17 @@ class VideoOverlay(QWidget):
 
             # Buttons on hover — fundos opacos para não deixarem ver o texto por trás
             if hovering:
+                bx = cur_x + col_w - 52
+                # ♪ ouvir devagar — à esquerda do +. Ícone do Segoe (sem emojis).
+                spk_bx = bx - 24
+                p.setBrush(QColor(45, 45, 45, 245))
+                p.drawRoundedRect(spk_bx, y + (h - 22) // 2, 20, 18, 4, 4)
+                p.setPen(QColor(210, 210, 210, alpha))
+                p.setFont(QFont("Segoe Fluent Icons", 9))
+                p.drawText(QRect(spk_bx, y + (h - 22) // 2, 20, 18), Qt.AlignCenter, chr(0xE767))
+
                 add_bg = QColor(34, 120, 60, 245) if card.saved else QColor(45, 45, 45, 245)
                 p.setBrush(add_bg)
-                bx = cur_x + col_w - 52
                 p.drawRoundedRect(bx, y + (h - 22) // 2, 20, 18, 4, 4)
                 p.setPen(QColor(255, 255, 255, alpha))
                 p.setFont(QFont("Inter", 9, QFont.Bold))
@@ -1601,6 +2362,11 @@ _OS_LANG_ORDER = ["en", "es", "pt", "fr", "de", "it", "nl", "ru", "ar", "zh",
                   "ja", "ko", "hi", "tr", "pl", "sv", "vi", "th", "id", "uk",
                   "ro", "el", "cs", "da", "fi", "no", "hu", "he", "fa"]
 _OS_UA = "TemporaryUserAgent"   # OpenSubtitles' documented keyless test UA
+# A API legacy (rest.opensubtitles.org) bloqueia/limita por User-Agent e anda muitas
+# vezes em baixo. Sem chave, a única forma de falhar menos é tentar vários User-Agents
+# conhecidos (todos públicos/de teste) até um responder. Ordem = do mais fiável p/ menos.
+_OS_UAS = ["TemporaryUserAgent", "VLSub 0.10.2", "trailers.to-UA", "SubDownloader/1.0"]
+_OS_HOSTS = ["https://rest.opensubtitles.org", "https://api.opensubtitles.org"]
 
 def _clean_sub_query(stem):
     """Turn a video filename into a clean search query: drop release tags
@@ -1691,21 +2457,33 @@ class SubSearchDialog(QDialog):
         threading.Thread(target=self._search_worker, args=(q, lang3), daemon=True).start()
 
     def _search_worker(self, q, lang3):
-        try:
-            from urllib.parse import quote
-            url = (f"https://rest.opensubtitles.org/search/"
-                   f"query-{quote(q)}/sublanguageid-{lang3}")
-            req = Request(url, headers={"X-User-Agent": _OS_UA, "User-Agent": _OS_UA})
-            raw = urlopen(req, timeout=25).read().decode("utf-8", "replace")
-            data = json.loads(raw)
-            if not isinstance(data, list):
-                data = []
-            # Keep the most-downloaded first, cap the list.
-            data.sort(key=lambda d: int(d.get("SubDownloadsCnt") or 0), reverse=True)
-            self._search_done.emit(data[:40], None)
-        except Exception as e:
-            log(f"subsearch: {e}")
-            self._search_done.emit(None, str(e))
+        from urllib.parse import quote
+        path = f"/search/query-{quote(q)}/sublanguageid-{lang3}"
+        last_err = None
+        # Sem chave: tenta cada host x cada User-Agent até um devolver uma lista válida.
+        for host in _OS_HOSTS:
+            for ua in _OS_UAS:
+                try:
+                    req = Request(host + path, headers={
+                        "X-User-Agent": ua, "User-Agent": ua, "Accept": "application/json"})
+                    raw = urlopen(req, timeout=20).read().decode("utf-8", "replace")
+                    data = json.loads(raw)
+                    if not isinstance(data, list):
+                        data = []
+                    if not data:
+                        last_err = "empty"
+                        continue
+                    data.sort(key=lambda d: int(d.get("SubDownloadsCnt") or 0), reverse=True)
+                    self._search_done.emit(data[:40], None)
+                    return
+                except Exception as e:
+                    last_err = str(e)
+                    log(f"subsearch {host} [{ua}]: {e}")
+        # Nada respondeu com resultados.
+        if last_err == "empty":
+            self._search_done.emit([], None)        # serviço respondeu, mas sem matches
+        else:
+            self._search_done.emit(None, last_err or "fail")
 
     def _on_search_done(self, data, err):
         self._busy = False; self.btn.setEnabled(True)
@@ -1733,10 +2511,18 @@ class SubSearchDialog(QDialog):
         threading.Thread(target=self._dl_worker, args=(link,), daemon=True).start()
 
     def _dl_worker(self, link):
+        import gzip
+        blob = None; last_err = None
+        for ua in _OS_UAS:
+            try:
+                req = Request(link, headers={"X-User-Agent": ua, "User-Agent": ua})
+                blob = urlopen(req, timeout=30).read()
+                break
+            except Exception as e:
+                last_err = str(e); log(f"subdl [{ua}]: {e}")
+        if blob is None:
+            self._dl_done.emit(None, last_err or "fail"); return
         try:
-            import gzip
-            req = Request(link, headers={"X-User-Agent": _OS_UA, "User-Agent": _OS_UA})
-            blob = urlopen(req, timeout=30).read()
             try:
                 srt_bytes = gzip.decompress(blob)
             except Exception:
@@ -1890,7 +2676,7 @@ class LoginDialog(QDialog):
 _LOGIN_DONE_HTML = """<!doctype html><html><head><meta charset="utf-8">
 <title>Lexio Player</title><style>
 html,body{height:100%;margin:0}
-body{background:#121212;color:#fff;font-family:'Inter',system-ui,sans-serif;
+body{background:#121212;color:#fff;font-family:'Inter','Segoe UI',sans-serif;
 display:flex;align-items:center;justify-content:center}
 .card{text-align:center;padding:40px 48px;border:1px solid rgba(255,255,255,.1);
 border-radius:14px;background:#1a1a1a}
@@ -1978,6 +2764,9 @@ class ChatPanel(QWidget):
     chat_result = pyqtSignal(object, object, object, bool)  # (resp, err, loader, relogin)
     promote_result = pyqtSignal(object, object)        # (word, error | None) — add-to-main-vocab
     user_ctx_ready = pyqtSignal(object)                # (dict) — perfil + atividade lidos da conta
+    speak_requested = pyqtSignal(str)                  # ♪ ouvir a legenda devagar (texto do input ou legenda atual)
+    user_sent = pyqtSignal(str)                        # o utilizador enviou uma mensagem (texto) — usado pelo modo Listening
+    eval_result = pyqtSignal(object, object)           # (response_text | None, error | None) — usado pelos diálogos de avaliação
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -2090,12 +2879,14 @@ class ChatPanel(QWidget):
         hdr.setStyleSheet(f"background:{ELV};border-bottom:1px solid {BRD};")
         hl = QHBoxLayout(hdr); hl.setContentsMargins(12,0,8,0)
         title = QLabel(T("chat_ai"))
-        title.setStyleSheet(f"color:{TXT};font-size:14px;font-weight:600;font-family:'Inter';background:transparent;")
+        title.setStyleSheet(f"color:{TXT};font-size:14px;font-weight:600;font-family:'Inter','Segoe UI',sans-serif;background:transparent;")
         hl.addWidget(title)
         hl.addStretch()
         self.login_btn = QPushButton(T("login") if not self._token else T("account"))
-        self.login_btn.setFixedSize(46,22)
-        self.login_btn.setStyleSheet(f"QPushButton{{background:transparent;border:1px solid {BRD};border-radius:11px;color:{TS2};font-size:11px;}}QPushButton:hover{{background:{HVR};color:{TXT};}}")
+        # Altura fixa mas largura ajusta-se ao texto (Login/Conta/Account não cortam).
+        self.login_btn.setFixedHeight(24); self.login_btn.setMinimumWidth(56)
+        self.login_btn.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
+        self.login_btn.setStyleSheet(f"QPushButton{{background:transparent;border:1px solid {BRD};border-radius:12px;color:{TS2};font-size:11px;padding:0 12px;}}QPushButton:hover{{background:{HVR};color:{TXT};}}")
         self.login_btn.clicked.connect(self._handle_login)
         hl.addWidget(self.login_btn)
         lo.addWidget(hdr)
@@ -2110,15 +2901,25 @@ class ChatPanel(QWidget):
         lo.addWidget(scroll, 1)
 
         self.welcome = QLabel(T("chat_welcome"))
-        self.welcome.setStyleSheet(f"color:{TMT};font-size:12.5px;font-family:'Inter';line-height:1.6;background:transparent;padding:24px;")
+        self.welcome.setStyleSheet(f"color:{TMT};font-size:12.5px;font-family:'Inter','Segoe UI',sans-serif;line-height:1.6;background:transparent;padding:24px;")
         self.welcome.setWordWrap(True); self.welcome.setAlignment(Qt.AlignCenter)
         self.ml.insertWidget(0, self.welcome)
 
         inp = QWidget(); inp.setStyleSheet(f"background:{ELV};border-top:1px solid {BRD};")
         il = QHBoxLayout(inp); il.setContentsMargins(6,6,6,6)
+        # ♪ ouvir devagar — diz a legenda (ou o texto escrito) com voz neural lenta.
+        speak = QPushButton(chr(0xE767)); speak.setFixedSize(36, 36)
+        speak.setToolTip(T("chat_speak_tip"))
+        speak.setCursor(Qt.PointingHandCursor)
+        speak.setStyleSheet(
+            f"QPushButton{{background:transparent;border:1px solid {BRD};border-radius:15px;"
+            f"color:{TS2};font-family:'Segoe Fluent Icons','Segoe MDL2 Assets';font-size:14px;}}"
+            f"QPushButton:hover{{border-color:{ACC};color:{TXT};background:{HVR};}}")
+        speak.clicked.connect(lambda: self.speak_requested.emit(self.input.text().strip()))
+        il.addWidget(speak)
         self.input = QLineEdit()
         self.input.setPlaceholderText(T("chat_placeholder"))
-        self.input.setStyleSheet(f"QLineEdit{{background:{ELV};color:{TXT};border:1px solid {BRD};border-radius:19px;padding:9px 15px;font-size:12.5px;font-family:'Inter';}}QLineEdit:focus{{border-color:{ACC};background:{HVR};}}")
+        self.input.setStyleSheet(f"QLineEdit{{background:{ELV};color:{TXT};border:1px solid {BRD};border-radius:19px;padding:9px 15px;font-size:12.5px;font-family:'Inter','Segoe UI',sans-serif;}}QLineEdit:focus{{border-color:{ACC};background:{HVR};}}")
         self.input.returnPressed.connect(self._send)
         il.addWidget(self.input, 1)
         send = QPushButton("->")
@@ -2251,6 +3052,7 @@ class ChatPanel(QWidget):
         t = self.input.text().strip()
         if not t: return
         self.input.clear(); self._add_msg(t, "user"); self.welcome.hide()
+        self.user_sent.emit(t)   # modo Listening usa isto para retomar o filme com "continuar"
         # Keep a rolling conversation history so the chat has memory (last ~20 turns).
         self._messages.append({"role": "user", "content": t})
         if len(self._messages) > 20:
@@ -2372,6 +3174,54 @@ class ChatPanel(QWidget):
             except Exception as e:
                 log(f"Chat err: {e}")
                 self.chat_result.emit(None, str(e), lc, False)
+        threading.Thread(target=work, daemon=True).start()
+
+    def request_evaluation(self, system_extra, user_text):
+        """Envia um pedido de avaliação (Fluência/Paráfrase) através do chat IA,
+        herdando todo o contexto do utilizador (nome, nível, vídeo atual, palavras
+        guardadas). O resultado vem pelo sinal eval_result.
+        A resposta NÃO é adicionada ao histórico do chat visível."""
+        import ssl
+        def work():
+            try:
+                parts = ["You are Lexio's in-player AI tutor for a language learner watching a video.",
+                         f"Always reply in the user's native language ({native_language_name()}), "
+                         f"warm and concise. Respond ONLY with valid JSON."]
+                if self._user_name:
+                    parts.append(f"The user's name is {self._user_name}.")
+                if self._activity_summary:
+                    parts.append("User activity: " + self._activity_summary)
+                if self.parent() and hasattr(self.parent(), 'engine') and self.parent().engine.path():
+                    vn = Path(self.parent().engine.path()).name
+                    parts.append(f"Currently watching: {vn}")
+                try:
+                    _vf = DATA_DIR / 'saved-vocab.json'
+                    if _vf.exists():
+                        _saved = json.loads(_vf.read_text(encoding='utf-8'))
+                        _words = [s.get('text', '') for s in _saved[-30:] if s.get('text')]
+                        if _words:
+                            parts.append("Saved vocab: " + "; ".join(_words))
+                except: pass
+                parts.append(system_extra)
+                ctx = "\n".join(parts)
+                hdrs = {"Content-Type": "application/json"}
+                auth_header = self._get_token_header()
+                if auth_header:
+                    hdrs["Authorization"] = auth_header
+                msgs = [{"role": "system", "content": ctx},
+                        {"role": "user", "content": user_text}]
+                payload = {"model": "deepseek-chat", "max_tokens": 800, "temperature": 0.3,
+                           "feature": "evaluation", "messages": msgs}
+                body = json.dumps(payload).encode()
+                ctx_ssl = ssl._create_unverified_context()
+                r = urlopen(Request(f"{LEXIO_API}/api/deepseek-chat", data=body, headers=hdrs),
+                            timeout=15, context=ctx_ssl)
+                d = json.loads(r.read().decode())
+                c = d.get("text") or d.get("content") or ""
+                self.eval_result.emit(c.strip(), None)
+            except Exception as e:
+                log(f"eval err: {e}")
+                self.eval_result.emit(None, str(e))
         threading.Thread(target=work, daemon=True).start()
 
     def _on_chat_result(self, resp, err, lc, relogin):
@@ -2670,6 +3520,7 @@ class WordDetailsPanel(QWidget):
     illustrates THAT example, synonyms, collocations, note."""
     _ready = pyqtSignal(object, object)
     _img_ready = pyqtSignal(object)    # (example_index, image_bytes)
+    _tts_done = pyqtSignal()           # áudio pronto/falhou → parar o spinner do botão
 
     def __init__(self, parent, chat):
         super().__init__(parent)
@@ -2677,6 +3528,16 @@ class WordDetailsPanel(QWidget):
         self._word = ""; self._lang = "en"; self._meaning = ""
         self._examples = []; self._ex_idx = 0
         self._tts_player = None; self._tts_inst = None
+        # ── Spinner de "a processar" para os botões ouvir/youglish ──
+        self._spin_frames = ["◜", "◝", "◟", "◞"]  # arco a rodar
+        self._spin_i = 0
+        self._spin_btn = None
+        self._spin_orig = ""
+        self._spin_css = ""
+        self._spin_timer = QTimer(self)
+        self._spin_timer.setInterval(110)
+        self._spin_timer.timeout.connect(self._spin_tick)
+        self._tts_done.connect(self._stop_spin)
         self.setStyleSheet(f"background:{SRF};border-right:1px solid {BRD};")
         self.setMinimumWidth(330); self.setMaximumWidth(440)
         lo = QVBoxLayout(self); lo.setContentsMargins(0, 0, 0, 0); lo.setSpacing(0)
@@ -2684,7 +3545,7 @@ class WordDetailsPanel(QWidget):
         hdr = QWidget(); hdr.setStyleSheet(f"background:{ELV};border-bottom:1px solid {BRD};")
         hl = QHBoxLayout(hdr); hl.setContentsMargins(16, 10, 10, 10)
         ht = QLabel(T("details")); ht.setStyleSheet(
-            f"color:{TXT};font-size:13px;font-weight:600;font-family:'Inter';background:transparent;")
+            f"color:{TXT};font-size:13px;font-weight:600;font-family:'Inter','Segoe UI',sans-serif;background:transparent;")
         hl.addWidget(ht); hl.addStretch()
         close = QPushButton("×"); close.setFixedSize(24, 24); close.setCursor(Qt.PointingHandCursor)
         close.setStyleSheet(f"QPushButton{{background:transparent;border:none;color:{TMT};font-size:17px;}}"
@@ -2702,33 +3563,34 @@ class WordDetailsPanel(QWidget):
         wr = QHBoxLayout(); wr.setSpacing(8)
         self.word_lbl = QLabel(""); self.word_lbl.setWordWrap(True)
         self.word_lbl.setStyleSheet(
-            f"color:{TXT};font-size:22px;font-weight:800;font-family:'Inter';background:transparent;")
+            f"color:{TXT};font-size:22px;font-weight:800;font-family:'Inter','Segoe UI',sans-serif;background:transparent;")
         wr.addWidget(self.word_lbl)
         # Pronunciation button — fone/headphone icon (ouvir a pronúncia da palavra)
-        self.listen_btn = QPushButton("\U0001F3A7"); self.listen_btn.setCursor(Qt.PointingHandCursor); self.listen_btn.setFixedSize(28, 28)
+        # Ícone Segoe MDL2 (altifalante) — sem emojis.
+        self.listen_btn = QPushButton(chr(0xE767)); self.listen_btn.setCursor(Qt.PointingHandCursor); self.listen_btn.setFixedSize(28, 28)
         self.listen_btn.setToolTip(T("listen"))
         self.listen_btn.setStyleSheet(
             f"QPushButton{{background:transparent;color:{TS2};border:1px solid {BRD};border-radius:14px;"
-            f"font-size:14px;font-family:'Inter';}}QPushButton:hover{{border-color:{ACC};color:{TXT};}}")
+            f"font-size:13px;font-family:'Segoe Fluent Icons','Segoe MDL2 Assets';}}QPushButton:hover{{border-color:{ACC};color:{TXT};}}")
         self.listen_btn.clicked.connect(self._play_tts)
         wr.addWidget(self.listen_btn)
-        # YouGlish button — camera icon (ver a pronúncia em vídeo no YouGlish)
-        self.yg_btn = QPushButton("\U0001F4F9"); self.yg_btn.setCursor(Qt.PointingHandCursor); self.yg_btn.setFixedSize(28, 28)
+        # YouGlish — ícone de vídeo (Segoe MDL2), sem emojis.
+        self.yg_btn = QPushButton(chr(0xE714)); self.yg_btn.setCursor(Qt.PointingHandCursor); self.yg_btn.setFixedSize(28, 28)
         self.yg_btn.setToolTip(T("yg_tip"))
         self.yg_btn.setStyleSheet(
             f"QPushButton{{background:transparent;color:{TS2};border:1px solid {BRD};border-radius:14px;"
-            f"font-size:14px;font-family:'Inter';}}"
+            f"font-size:13px;font-family:'Segoe Fluent Icons','Segoe MDL2 Assets';}}"
             f"QPushButton:hover{{border-color:{ACC};color:{TXT};}}")
         self.yg_btn.clicked.connect(self._open_youglish)
         wr.addWidget(self.yg_btn); wr.addStretch()
         il.addLayout(wr)
 
         self.meta_lbl = QLabel(""); self.meta_lbl.setWordWrap(True)
-        self.meta_lbl.setStyleSheet(f"color:{TMT};font-size:12px;font-family:'Inter';background:transparent;")
+        self.meta_lbl.setStyleSheet(f"color:{TMT};font-size:12px;font-family:'Inter','Segoe UI',sans-serif;background:transparent;")
         il.addWidget(self.meta_lbl)
 
         self.meaning_lbl = QLabel(""); self.meaning_lbl.setWordWrap(True)
-        self.meaning_lbl.setStyleSheet(f"color:{TXT};font-size:13.5px;font-family:'Inter';background:transparent;")
+        self.meaning_lbl.setStyleSheet(f"color:{TXT};font-size:13.5px;font-family:'Inter','Segoe UI',sans-serif;background:transparent;")
         il.addWidget(self.meaning_lbl)
 
         # ── Examples block: counter + nav, example text, and an image of it ──
@@ -2752,7 +3614,7 @@ class WordDetailsPanel(QWidget):
         exhead.addWidget(self.ex_prev); exhead.addWidget(self.ex_next)
         exl.addLayout(exhead)
         self.ex_text = QLabel(""); self.ex_text.setWordWrap(True)
-        self.ex_text.setStyleSheet(f"color:{TXT};font-size:13px;font-style:italic;font-family:'Inter';background:transparent;")
+        self.ex_text.setStyleSheet(f"color:{TXT};font-size:13px;font-style:italic;font-family:'Inter','Segoe UI',sans-serif;background:transparent;")
         exl.addWidget(self.ex_text)
         # Image thumbnails (web AI-sidebar style): a few small, friendly-sized
         # pictures of THIS example — each with 👍/👎 rating that biases future picks.
@@ -2772,7 +3634,7 @@ class WordDetailsPanel(QWidget):
 
         self.extra_lbl = QLabel(""); self.extra_lbl.setWordWrap(True); self.extra_lbl.setTextFormat(Qt.RichText)
         self.extra_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse); self.extra_lbl.setAlignment(Qt.AlignTop)
-        self.extra_lbl.setStyleSheet(f"color:{TXT};font-size:12.5px;font-family:'Inter';background:transparent;")
+        self.extra_lbl.setStyleSheet(f"color:{TXT};font-size:12.5px;font-family:'Inter','Segoe UI',sans-serif;background:transparent;")
         il.addWidget(self.extra_lbl); il.addStretch()
         scroll.setWidget(inner); lo.addWidget(scroll, 1)
 
@@ -2781,7 +3643,7 @@ class WordDetailsPanel(QWidget):
         self.add_btn = QPushButton(T("add_vocab")); self.add_btn.setCursor(Qt.PointingHandCursor)
         self.add_btn.setStyleSheet(
             f"QPushButton{{background:{ACC};color:{ON_ACC};border:none;border-radius:14px;padding:9px;"
-            f"font-size:12px;font-weight:600;font-family:'Inter';}}QPushButton:hover{{background:{ACC_HOVER};}}")
+            f"font-size:12px;font-weight:600;font-family:'Inter','Segoe UI',sans-serif;}}QPushButton:hover{{background:{ACC_HOVER};}}")
         self.add_btn.clicked.connect(self._add)
         fl.addWidget(self.add_btn); lo.addWidget(ftr)
 
@@ -2918,9 +3780,39 @@ class WordDetailsPanel(QWidget):
         ex = self._examples[idx] if 0 <= idx < len(self._examples) else ""
         thumb.set_image(local_card_pixmap(self._word, ex), self._word, "")
 
+    # ── Spinner "a processar" (ouvir / youglish) ──
+    def _start_spin(self, btn):
+        if self._spin_btn is btn:
+            return
+        self._spin_btn = btn
+        self._spin_orig = btn.text()
+        self._spin_css = btn.styleSheet()
+        self._spin_i = 0
+        btn.setEnabled(False)
+        # Segoe UI Symbol tem os glifos do arco (Inter não tem) → render garantido.
+        btn.setStyleSheet(
+            f"QPushButton{{background:transparent;color:{ACC};border:1px solid {ACC};"
+            f"border-radius:14px;font-size:13px;font-family:'Segoe UI Symbol';}}")
+        self._spin_timer.start()
+
+    def _spin_tick(self):
+        if not self._spin_btn:
+            self._spin_timer.stop(); return
+        self._spin_btn.setText(self._spin_frames[self._spin_i % len(self._spin_frames)])
+        self._spin_i += 1
+
+    def _stop_spin(self):
+        self._spin_timer.stop()
+        if self._spin_btn:
+            self._spin_btn.setText(self._spin_orig)
+            self._spin_btn.setStyleSheet(self._spin_css)
+            self._spin_btn.setEnabled(True)
+            self._spin_btn = None
+
     def _play_tts(self, rate=0):
         if not self._word:
             return
+        self._start_spin(self.listen_btn)   # mostra "a processar" enquanto gera o áudio
         threading.Thread(target=self._tts_worker,
                          args=(self._word, self._lang or "en", rate), daemon=True).start()
 
@@ -2937,7 +3829,8 @@ class WordDetailsPanel(QWidget):
             import vlc
             # Instância VLC dedicada + media_new + set_media (padrão fiável do motor).
             if self._tts_player is None:
-                self._tts_inst = vlc.Instance("--quiet", "--no-video")
+                self._tts_inst = vlc.Instance("--quiet", "--no-video",
+                    "--audio-resampler=soxr", "--aout=wasapi")
                 self._tts_player = self._tts_inst.media_player_new()
             self._tts_player.stop()
             self._tts_player.set_media(self._tts_inst.media_new(tmp))
@@ -2949,6 +3842,9 @@ class WordDetailsPanel(QWidget):
                 self._speak_local(word, lang)
             except Exception:
                 pass
+        finally:
+            # Para o spinner na GUI thread (sinal é thread-safe).
+            self._tts_done.emit()
 
     def _speak_local(self, text, lang):
         """Fallback offline: voz nativa do Windows (SAPI via System.Speech).
@@ -2989,8 +3885,10 @@ class WordDetailsPanel(QWidget):
         """Open the word on YouGlish for pronunciation in context."""
         if self._word:
             import urllib.parse
+            self._start_spin(self.yg_btn)   # feedback "a abrir..." enquanto o browser arranca
             query = urllib.parse.quote(self._word)
             webbrowser.open(f"https://youglish.com/pronounce/{query}/english/us")
+            QTimer.singleShot(1100, self._stop_spin)
 
 
 class PronunciationPanel(QWidget):
@@ -3007,8 +3905,8 @@ class PronunciationPanel(QWidget):
 
         hdr = QWidget(); hdr.setStyleSheet(f"background:{ELV};border-bottom:1px solid {BRD};")
         hl = QHBoxLayout(hdr); hl.setContentsMargins(16, 10, 10, 10)
-        ht = QLabel("\U0001F5E3  " + T("pron_title")); ht.setStyleSheet(
-            f"color:{TXT};font-size:13px;font-weight:600;font-family:'Inter';background:transparent;")
+        ht = QLabel(T("pron_title")); ht.setStyleSheet(
+            f"color:{TXT};font-size:13px;font-weight:600;font-family:'Inter','Segoe UI',sans-serif;background:transparent;")
         hl.addWidget(ht); hl.addStretch()
         close = QPushButton("×"); close.setFixedSize(24, 24); close.setCursor(Qt.PointingHandCursor)
         close.setStyleSheet(f"QPushButton{{background:transparent;border:none;color:{TMT};font-size:17px;}}"
@@ -3020,7 +3918,7 @@ class PronunciationPanel(QWidget):
         il = QVBoxLayout(inner); il.setContentsMargins(16, 16, 16, 16); il.setSpacing(14)
         self.line_lbl = QLabel(T("pron_empty")); self.line_lbl.setWordWrap(True)
         self.line_lbl.setStyleSheet(
-            f"color:{TXT};font-size:17px;font-weight:600;font-family:'Inter';background:transparent;")
+            f"color:{TXT};font-size:17px;font-weight:600;font-family:'Inter','Segoe UI',sans-serif;background:transparent;")
         il.addWidget(self.line_lbl)
         hint = QLabel(T("pron_hint")); hint.setWordWrap(True)
         hint.setStyleSheet(f"color:{TMT};font-size:11px;background:transparent;")
@@ -3028,10 +3926,10 @@ class PronunciationPanel(QWidget):
 
         # Botões de velocidade — cada um (re)toca a linha a essa velocidade.
         for label, rate in ((T("pron_normal"), 0), (T("pron_slow"), -25), (T("pron_slower"), -45)):
-            b = QPushButton("\U0001F50A  " + label); b.setCursor(Qt.PointingHandCursor); b.setFixedHeight(42)
+            b = QPushButton(label); b.setCursor(Qt.PointingHandCursor); b.setFixedHeight(42)
             b.setStyleSheet(
                 f"QPushButton{{background:{ELV};color:{TXT};border:1px solid {BRD};border-radius:10px;"
-                f"font-size:13px;font-weight:600;font-family:'Inter';text-align:left;padding:0 16px;}}"
+                f"font-size:13px;font-weight:600;font-family:'Inter','Segoe UI',sans-serif;text-align:left;padding:0 16px;}}"
                 f"QPushButton:hover{{border-color:{ACC};background:{HVR};}}")
             b.clicked.connect(lambda _checked=False, r=rate: self._play(r))
             il.addWidget(b)
@@ -3057,10 +3955,14 @@ class PronunciationPanel(QWidget):
         try:
             tmp = speak_edge_tts(line, lang, rate)
             if not tmp:
+                # Nunca silêncio: voz do Windows como último recurso (a aba
+                # "não funcionava" porque aqui retornava sem tocar nada).
+                speak_local_sapi(line, lang)
                 return
             import vlc
             if self._tts_player is None:
-                self._tts_inst = vlc.Instance("--quiet", "--no-video")
+                self._tts_inst = vlc.Instance("--quiet", "--no-video",
+                    "--audio-resampler=soxr", "--aout=wasapi")
                 self._tts_player = self._tts_inst.media_player_new()
             self._tts_player.stop()
             self._tts_player.set_media(self._tts_inst.media_new(tmp))
@@ -3068,6 +3970,986 @@ class PronunciationPanel(QWidget):
             self._tts_player.play()
         except Exception as e:
             log(f"pron: {e}")
+            try:
+                speak_local_sapi(line, lang)
+            except Exception:
+                pass
+
+
+class ExerciseDialog(QDialog):
+    """AI-generated comprehension exercise from the current subtitle.
+    Multiple-choice question with 4 options. Uses DeepSeek."""
+
+    def __init__(self, parent, engine):
+        super().__init__(parent)
+        self._engine = engine
+        self._answer = ""; self._answered = False
+        self.setWindowTitle(T("exercise_btn"))
+        self.setMinimumSize(300, 300)   # estreito: encaixa na sidebar
+        self.setStyleSheet(f"background:{BG};")
+        lo = QVBoxLayout(self); lo.setContentsMargins(20,18,20,18); lo.setSpacing(10)
+
+        hdr = QLabel(T("exercise_btn")); hdr.setStyleSheet(
+            f"color:{TXT};font-size:15px;font-weight:700;background:transparent;")
+        lo.addWidget(hdr)
+
+        self.sub_lbl = QLabel(""); self.sub_lbl.setWordWrap(True)
+        self.sub_lbl.setStyleSheet(f"color:{TMT};font-size:12px;font-style:italic;background:transparent;padding:6px 0;")
+        lo.addWidget(self.sub_lbl)
+
+        self.q_lbl = QLabel(""); self.q_lbl.setWordWrap(True)
+        self.q_lbl.setStyleSheet(f"color:{TXT};font-size:13px;font-weight:600;background:transparent;")
+        lo.addWidget(self.q_lbl)
+
+        self.opts = []
+        self.opt_btns = []
+        for i in range(4):
+            b = QPushButton(""); b.setCursor(Qt.PointingHandCursor)
+            b.setStyleSheet(
+                f"QPushButton{{background:{ELV};color:{TXT};border:1px solid {BRD};border-radius:10px;"
+                f"padding:10px 14px;text-align:left;font-size:12px;font-family:'Inter','Segoe UI',sans-serif;}}"
+                f"QPushButton:hover{{background:{HVR};border-color:{ACC};}}"
+                f"QPushButton:disabled{{color:{TMT};border-color:{BRD};}}")
+            b.clicked.connect(lambda _, i=i: self._check(i))
+            lo.addWidget(b)
+            self.opt_btns.append(b)
+            self.opts.append("")
+
+        self.fb_lbl = QLabel(""); self.fb_lbl.setWordWrap(True)
+        self.fb_lbl.setStyleSheet(f"color:{TXT};font-size:12px;background:transparent;padding:4px 0;")
+        lo.addWidget(self.fb_lbl)
+
+        bb = QHBoxLayout(); bb.setSpacing(8)
+        self.next_btn = QPushButton(T("exercise_next")); self.next_btn.setCursor(Qt.PointingHandCursor)
+        self.next_btn.setStyleSheet(
+            f"QPushButton{{background:{ACC};color:{ON_ACC};border:none;border-radius:14px;"
+            f"padding:8px 20px;font-size:12px;font-weight:600;font-family:'Inter','Segoe UI',sans-serif;}}"
+            f"QPushButton:hover{{background:{ACC_HOVER};}}")
+        self.next_btn.clicked.connect(self._gen)
+        bb.addWidget(self.next_btn)
+        bb.addStretch()
+        cl = QPushButton(T("exercise_close")); cl.setCursor(Qt.PointingHandCursor)
+        cl.setStyleSheet(f"QPushButton{{background:transparent;color:{TS2};border:1px solid {BRD};"
+                         f"border-radius:14px;padding:8px 16px;font-size:11px;}}"
+                         f"QPushButton:hover{{color:{TXT};border-color:{ACC};}}")
+        cl.clicked.connect(self.close)
+        bb.addWidget(cl)
+        lo.addLayout(bb)
+        lo.addStretch()
+
+        QTimer.singleShot(100, self._gen)
+
+    def _gen(self):
+        sub = self._engine.nearest_sub_text()
+        if not sub:
+            self.q_lbl.setText(T("exercise_failed")); return
+        self.sub_lbl.setText(f"\u201c{sub}\u201d")
+        self.q_lbl.setText(T("exercise_loading"))
+        self.fb_lbl.setText("")
+        self._answered = False
+        self._answer = ""
+        for b in self.opt_btns:
+            b.setText(""); b.setEnabled(False)
+            b.setStyleSheet(
+                f"QPushButton{{background:{ELV};color:{TXT};border:1px solid {BRD};border-radius:10px;"
+                f"padding:10px 14px;text-align:left;font-size:12px;font-family:'Inter','Segoe UI',sans-serif;}}"
+                f"QPushButton:hover{{background:{HVR};border-color:{ACC};}}"
+                f"QPushButton:disabled{{color:{TMT};border-color:{BRD};}}")
+        threading.Thread(target=self._work, args=(sub,), daemon=True).start()
+
+    def _work(self, sub):
+        try:
+            from urllib.request import urlopen, Request
+            import ssl
+            log(f"exercise: a gerar (sub={sub[:40]!r})")
+            nat = native_language_name()
+            sys_p = (
+                f"Generate ONE multiple-choice comprehension question about this sentence in the target language.\n"
+                f"Respond ONLY with JSON:\n"
+                '{"question":"<question in target language>",'
+                '"options":["<option A>","<option B>","<option C>","<option D>"],'
+                '"correct":0}\n'
+                f"correct is the 0-based index of the right answer. "
+                f"The question tests understanding, not vocabulary. Include context. "
+                f"Include a brief explanation in {nat} as the 4th option (index 3) that says why the answer is right.")
+            body = json.dumps({"model": "deepseek-chat", "max_tokens": 700, "temperature": 0.3,
+                "messages": [{"role": "system", "content": sys_p},
+                             {"role": "user", "content": sub}]}).encode()
+            ctx = ssl._create_unverified_context()
+            r = urlopen(Request(f"{LEXIO_API}/api/deepseek-chat", data=body,
+                                headers={"Content-Type": "application/json"}),
+                        timeout=15, context=ctx)
+            d = json.loads(r.read().decode())
+            raw = (d.get("text") or "").strip().strip("`")
+            parsed = json.loads(raw[raw.find("{"):raw.rfind("}")+1])
+            log("exercise: gerado OK")
+            QTimer.singleShot(0, lambda: self._show(parsed))
+        except Exception as e:
+            log(f"exercise FALHOU: {type(e).__name__}: {e}")
+            QTimer.singleShot(0, lambda: self.q_lbl.setText(T("exercise_failed")))
+
+    def _show(self, data):
+        self.q_lbl.setText(data.get("question", "?"))
+        opts = data.get("options", ["","","",""])
+        self._answer = opts[data.get("correct", 0)] if len(opts) > 0 else ""
+        for i in range(min(4, len(opts))):
+            self.opts[i] = opts[i]
+            b = self.opt_btns[i]; b.setText(opts[i]); b.setEnabled(True)
+        self.next_btn.setText(T("exercise_next"))
+
+    def _check(self, idx):
+        if self._answered:
+            return
+        self._answered = True
+        chosen = self.opts[idx] if 0 <= idx < len(self.opts) else ""
+        correct = chosen == self._answer
+        for i, b in enumerate(self.opt_btns):
+            b.setEnabled(False)
+            bg = "#1a4a2a" if 0 <= i < len(self.opts) and self.opts[i] == self._answer else ELV
+            b.setStyleSheet(
+                f"QPushButton{{background:{bg};color:{TXT};border:1px solid {BRD};border-radius:10px;"
+                f"padding:10px 14px;text-align:left;font-size:12px;font-family:'Inter','Segoe UI',sans-serif;}}"
+                f"QPushButton:disabled{{color:{TXT};}}")
+        if correct:
+            self.fb_lbl.setText(T("exercise_correct"))
+            self.fb_lbl.setStyleSheet(f"color:#5ae05a;font-size:12px;background:transparent;padding:4px 0;")
+        else:
+            self.fb_lbl.setText(T("exercise_wrong", answer=self._answer))
+            self.fb_lbl.setStyleSheet(f"color:#e05a5a;font-size:12px;background:transparent;padding:4px 0;")
+
+
+def _esc_html(s):
+    """Escape text going into a rich-text QLabel so user/AI content can't break markup."""
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+class FluencyDialog(QDialog):
+    """Exercício de Fluência (versão player do 'Fluency' da web). O filme já está na
+    língua que o utilizador está a APRENDER, por isso aqui o exercício inverte-se:
+    mostra um GRUPO de legendas (o cluster da cena atual, o mesmo que alimenta os
+    cartões Twitch) e pede uma tradução FLUENTE para a língua nativa. A IA (DeepSeek)
+    avalia fluência+precisão e mostra uma tradução-modelo."""
+
+    def __init__(self, parent, engine, chat_panel=None):
+        super().__init__(parent)
+        self._engine = engine
+        self._chat_panel = chat_panel or (parent.chat if hasattr(parent, 'chat') else None)
+        self._group = []
+        self._checking = False
+        self.setWindowTitle(T("fluency_btn"))
+        self.setMinimumSize(300, 360)   # estreito: encaixa na sidebar
+        self.setStyleSheet(f"background:{BG};")
+        lo = QVBoxLayout(self); lo.setContentsMargins(20, 18, 20, 18); lo.setSpacing(10)
+
+        hdr = QLabel(T("fluency_btn")); hdr.setStyleSheet(
+            f"color:{TXT};font-size:15px;font-weight:700;background:transparent;")
+        lo.addWidget(hdr)
+
+        self.instr = QLabel(T("fluency_instruction"))
+        self.instr.setWordWrap(True)
+        self.instr.setStyleSheet(f"color:{TMT};font-size:12px;background:transparent;")
+        lo.addWidget(self.instr)
+
+        # Grupo de legendas na língua-alvo (o que o utilizador tem de traduzir).
+        self.group_lbl = QLabel(""); self.group_lbl.setWordWrap(True)
+        self.group_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.group_lbl.setStyleSheet(
+            f"color:{TS2};font-size:14px;background:{ELV};"
+            f"border:1px solid {BRD};border-radius:10px;padding:12px 14px;")
+        lo.addWidget(self.group_lbl)
+
+        self.answer = QTextEdit(); self.answer.setPlaceholderText(T("fluency_placeholder"))
+        self.answer.setStyleSheet(f"QTextEdit{{background:{ELV};color:{TXT};border:1px solid {BRD};"
+                                  f"border-radius:8px;padding:10px;font-size:13px;font-family:'Inter','Segoe UI',sans-serif;}}")
+        self.answer.setMinimumHeight(80)
+        lo.addWidget(self.answer)
+
+        self.fb = QLabel(""); self.fb.setWordWrap(True); self.fb.setVisible(False)
+        self.fb.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.fb.setStyleSheet(f"color:{TXT};font-size:12px;background:{ELV};"
+                              f"border:1px solid {BRD};border-radius:8px;padding:10px 12px;")
+        lo.addWidget(self.fb)
+
+        bb = QHBoxLayout(); bb.setSpacing(8)
+        self.check_btn = QPushButton(T("fluency_check")); self.check_btn.setCursor(Qt.PointingHandCursor)
+        self.check_btn.setStyleSheet(
+            f"QPushButton{{background:{ACC};color:{ON_ACC};border:none;border-radius:14px;"
+            f"padding:8px 20px;font-size:12px;font-weight:600;font-family:'Inter','Segoe UI',sans-serif;}}"
+            f"QPushButton:hover{{background:{ACC_HOVER};}}"
+            f"QPushButton:disabled{{background:{ELV};color:{TMT};}}")
+        self.check_btn.clicked.connect(self._check)
+        bb.addWidget(self.check_btn)
+
+        self.next_btn = QPushButton(T("fluency_next")); self.next_btn.setCursor(Qt.PointingHandCursor)
+        self.next_btn.setStyleSheet(f"QPushButton{{background:transparent;color:{TS2};border:1px solid {BRD};"
+                                    f"border-radius:14px;padding:8px 16px;font-size:11px;}}"
+                                    f"QPushButton:hover{{color:{TXT};border-color:{ACC};}}")
+        self.next_btn.setToolTip(T("fluency_next_tip"))
+        self.next_btn.clicked.connect(self._load_group)
+        bb.addWidget(self.next_btn)
+
+        bb.addStretch()
+        cl = QPushButton(T("exercise_close")); cl.setCursor(Qt.PointingHandCursor)
+        cl.setStyleSheet(f"QPushButton{{background:transparent;color:{TS2};border:1px solid {BRD};"
+                         f"border-radius:14px;padding:8px 16px;font-size:11px;}}"
+                         f"QPushButton:hover{{color:{TXT};border-color:{ACC};}}")
+        cl.clicked.connect(self.close)
+        bb.addWidget(cl)
+        lo.addLayout(bb)
+
+        QTimer.singleShot(80, self._load_group)
+
+    def _load_group(self):
+        self.fb.setVisible(False); self.fb.setText("")
+        self.answer.clear(); self.answer.setFocus()
+        self._group = self._engine.fluency_group()
+        if not self._group:
+            log(f"fluency: grupo vazio (subs_loaded={self._engine.subs_loaded()})")
+            self.group_lbl.setText(T("fluency_no_subs"))
+            self.check_btn.setEnabled(False)
+            return
+        self.check_btn.setEnabled(True)
+        self.group_lbl.setText("\n".join(s.text.replace("\n", " ").strip() for s in self._group))
+
+    def _passage(self):
+        return "\n".join(s.text.replace("\n", " ").strip() for s in self._group)
+
+    def _check(self):
+        if self._checking:
+            return
+        ans = self.answer.toPlainText().strip()
+        if not ans or not self._group:
+            return
+        self._checking = True
+        self.check_btn.setEnabled(False)
+        self.fb.setVisible(True)
+        self.fb.setText(T("fluency_checking"))
+        threading.Thread(target=self._work, args=(self._passage(), ans), daemon=True).start()
+
+    def _work(self, passage, ans):
+        try:
+            import ssl
+            log("fluency: a avaliar...")
+            nat = native_language_name()
+            sys_p = (
+                "You are a fluency coach. The user is learning a language by watching a film. "
+                "Below is a short passage of consecutive subtitle lines in the language they are "
+                f"LEARNING, plus the user's translation of that whole passage into their native "
+                f"language ({nat}). Judge how FLUENT and ACCURATE the user's {nat} translation is — "
+                "reward natural, native-sounding phrasing over word-for-word literalness, but penalise "
+                "real meaning errors. Respond ONLY with JSON:\n"
+                '{"score": <integer 0-100>, '
+                f'"feedback": "<2-3 sentences in {nat}: what was good and what to improve>", '
+                f'"model": "<the most fluent, natural {nat} translation of the whole passage>"}}')
+            user_p = f"PASSAGE (language being learned):\n{passage}\n\nUSER TRANSLATION ({nat}):\n{ans}"
+            # Usa o Chat IA em vez de chamada direta — herda contexto do utilizador
+            cp = self._chat_panel
+            if cp:
+                cp.eval_result.connect(self._on_eval)
+                cp.request_evaluation(sys_p, user_p)
+            else:
+                raise Exception("ChatPanel nao disponivel")
+        except Exception as e:
+            log(f"fluency FALHOU: {type(e).__name__}: {e}")
+            QTimer.singleShot(0, self._fail)
+
+    def _on_eval(self, resp, err):
+        # Desliga o sinal para nao acumular chamadas
+        cp = self._chat_panel
+        if cp:
+            try: cp.eval_result.disconnect(self._on_eval)
+            except: pass
+        if err or not resp:
+            log(f"fluency eval error: {err or 'resposta vazia'}")
+            QTimer.singleShot(0, self._fail)
+            return
+        try:
+            raw = resp.strip().strip("`")
+            parsed = json.loads(raw[raw.find("{"):raw.rfind("}") + 1])
+            QTimer.singleShot(0, lambda: self._show(parsed))
+        except Exception as e:
+            log(f"fluency parse FALHOU: {type(e).__name__}: {e}")
+            QTimer.singleShot(0, self._fail)
+
+    def _fail(self):
+        self._checking = False
+        self.check_btn.setEnabled(True)
+        self.fb.setText(T("exercise_failed"))
+
+    def _show(self, data):
+        self._checking = False
+        self.check_btn.setEnabled(True)
+        try:
+            score = max(0, min(100, int(data.get("score", 0))))
+        except Exception:
+            score = 0
+        color = "#5ae05a" if score >= 75 else ("#e0c05a" if score >= 50 else "#e07a5a")
+        fb = _esc_html(data.get("feedback", "")).replace("\n", "<br>")
+        model = _esc_html(data.get("model", "")).replace("\n", "<br>")
+        self.fb.setText(
+            f"<span style='color:{color};font-weight:700;'>{T('fluency_score', score=score)}</span><br>"
+            f"<span style='color:{TXT};'>{fb}</span><br><br>"
+            f"<span style='color:{TMT};font-weight:600;'>{T('fluency_model')}</span><br>"
+            f"<span style='color:{TS2};'>{model}</span>")
+
+
+class ParaphraseDialog(QDialog):
+    """Exercício de Paráfrase (versão player do 'Paraphrase' da web). Mostra o grupo
+    de legendas da cena atual (o mesmo que alimenta os cartões Twitch), com a linha
+    que está a tocar EM DESTAQUE, e pede ao utilizador para a reescrever de outra
+    forma — na MESMA língua (a que está a aprender), mantendo o sentido. A IA recebe
+    TODAS as legendas do grupo como contexto, para a paráfrase ficar coerente com a
+    cena, e avalia (mantém o sentido? palavras diferentes? natural?) + mostra modelo."""
+
+    def __init__(self, parent, engine, chat_panel=None):
+        super().__init__(parent)
+        self._engine = engine
+        self._chat_panel = chat_panel or (parent.chat if hasattr(parent, 'chat') else None)
+        self._lines = []
+        self._focus = -1
+        self._checking = False
+        self.setWindowTitle(T("paraphrase_btn"))
+        self.setMinimumSize(300, 360)   # estreito: encaixa na sidebar
+        self.setStyleSheet(f"background:{BG};")
+        lo = QVBoxLayout(self); lo.setContentsMargins(20, 18, 20, 18); lo.setSpacing(10)
+
+        hdr = QLabel(T("paraphrase_btn")); hdr.setStyleSheet(
+            f"color:{TXT};font-size:15px;font-weight:700;background:transparent;")
+        lo.addWidget(hdr)
+
+        self.instr = QLabel(T("paraphrase_instruction")); self.instr.setWordWrap(True)
+        self.instr.setStyleSheet(f"color:{TMT};font-size:12px;background:transparent;")
+        lo.addWidget(self.instr)
+
+        # Grupo de legendas (contexto da cena) com a linha-foco destacada.
+        self.group_lbl = QLabel(""); self.group_lbl.setWordWrap(True)
+        self.group_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.group_lbl.setStyleSheet(
+            f"color:{TS2};font-size:14px;background:{ELV};"
+            f"border:1px solid {BRD};border-radius:10px;padding:12px 14px;")
+        lo.addWidget(self.group_lbl)
+
+        self.answer = QTextEdit(); self.answer.setPlaceholderText(T("paraphrase_placeholder"))
+        self.answer.setStyleSheet(f"QTextEdit{{background:{ELV};color:{TXT};border:1px solid {BRD};"
+                                  f"border-radius:8px;padding:10px;font-size:13px;font-family:'Inter','Segoe UI',sans-serif;}}")
+        self.answer.setMinimumHeight(80)
+        lo.addWidget(self.answer)
+
+        self.fb = QLabel(""); self.fb.setWordWrap(True); self.fb.setVisible(False)
+        self.fb.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.fb.setStyleSheet(f"color:{TXT};font-size:12px;background:{ELV};"
+                              f"border:1px solid {BRD};border-radius:8px;padding:10px 12px;")
+        lo.addWidget(self.fb)
+
+        bb = QHBoxLayout(); bb.setSpacing(8)
+        self.check_btn = QPushButton(T("paraphrase_check")); self.check_btn.setCursor(Qt.PointingHandCursor)
+        self.check_btn.setStyleSheet(
+            f"QPushButton{{background:{ACC};color:{ON_ACC};border:none;border-radius:14px;"
+            f"padding:8px 20px;font-size:12px;font-weight:600;font-family:'Inter','Segoe UI',sans-serif;}}"
+            f"QPushButton:hover{{background:{ACC_HOVER};}}"
+            f"QPushButton:disabled{{background:{ELV};color:{TMT};}}")
+        self.check_btn.clicked.connect(self._check)
+        bb.addWidget(self.check_btn)
+
+        self.next_btn = QPushButton(T("fluency_next")); self.next_btn.setCursor(Qt.PointingHandCursor)
+        self.next_btn.setStyleSheet(f"QPushButton{{background:transparent;color:{TS2};border:1px solid {BRD};"
+                                    f"border-radius:14px;padding:8px 16px;font-size:11px;}}"
+                                    f"QPushButton:hover{{color:{TXT};border-color:{ACC};}}")
+        self.next_btn.setToolTip(T("fluency_next_tip"))
+        self.next_btn.clicked.connect(self._load_group)
+        bb.addWidget(self.next_btn)
+
+        bb.addStretch()
+        cl = QPushButton(T("exercise_close")); cl.setCursor(Qt.PointingHandCursor)
+        cl.setStyleSheet(f"QPushButton{{background:transparent;color:{TS2};border:1px solid {BRD};"
+                         f"border-radius:14px;padding:8px 16px;font-size:11px;}}"
+                         f"QPushButton:hover{{color:{TXT};border-color:{ACC};}}")
+        cl.clicked.connect(self.close)
+        bb.addWidget(cl)
+        lo.addLayout(bb)
+
+        QTimer.singleShot(80, self._load_group)
+
+    def _load_group(self):
+        self.fb.setVisible(False); self.fb.setText("")
+        self.answer.clear(); self.answer.setFocus()
+        self._lines, self._focus = self._engine.paraphrase_group()
+        if not self._lines or self._focus < 0:
+            log(f"paraphrase: grupo vazio/sem foco (subs_loaded={self._engine.subs_loaded()})")
+            self.group_lbl.setText(T("fluency_no_subs"))
+            self.check_btn.setEnabled(False)
+            return
+        self.check_btn.setEnabled(True)
+        parts = []
+        for n, s in enumerate(self._lines):
+            txt = _esc_html(s.text.replace("\n", " ").strip())
+            if n == self._focus:
+                parts.append(f"<span style='color:{ACC};font-weight:700;'>▸ {txt}</span>")
+            else:
+                parts.append(f"<span style='color:{TMT};'>{txt}</span>")
+        self.group_lbl.setText("<br>".join(parts))
+
+    def _check(self):
+        if self._checking:
+            return
+        ans = self.answer.toPlainText().strip()
+        if not ans or not self._lines or self._focus < 0:
+            return
+        self._checking = True
+        self.check_btn.setEnabled(False)
+        self.fb.setVisible(True)
+        self.fb.setText(T("fluency_checking"))
+        scene = "\n".join(
+            (("[FOCUS] " if n == self._focus else "") + s.text.replace("\n", " ").strip())
+            for n, s in enumerate(self._lines))
+        focus = self._lines[self._focus].text.replace("\n", " ").strip()
+        threading.Thread(target=self._work, args=(scene, focus, ans), daemon=True).start()
+
+    def _work(self, scene, focus, ans):
+        try:
+            import ssl
+            log("paraphrase: a avaliar...")
+            nat = native_language_name()
+            sys_p = (
+                "You are a paraphrasing coach. The user is learning a language by watching a film. "
+                "Below is a short scene of consecutive subtitle lines in the language they are LEARNING. "
+                "One line is marked [FOCUS]. The user rewrote ONLY that focus line, in the SAME language, "
+                "trying to keep the same meaning while using different words, and it must still fit the "
+                "surrounding lines. Judge the user's paraphrase: does it preserve the meaning of the focus "
+                "line, use genuinely different wording (not a trivial copy), sound natural, and stay coherent "
+                "with the rest of the scene? Respond ONLY with JSON:\n"
+                '{"score": <integer 0-100>, '
+                f'"feedback": "<2-3 sentences in {nat}: what was good and what to improve>", '
+                '"model": "<one strong, natural paraphrase of the FOCUS line, in the language being learned>"}')
+            user_p = f"SCENE (language being learned):\n{scene}\n\nFOCUS LINE:\n{focus}\n\nUSER PARAPHRASE:\n{ans}"
+            # Usa o Chat IA em vez de chamada direta — herda contexto do utilizador
+            cp = self._chat_panel
+            if cp:
+                cp.eval_result.connect(self._on_eval)
+                cp.request_evaluation(sys_p, user_p)
+            else:
+                raise Exception("ChatPanel nao disponivel")
+        except Exception as e:
+            log(f"paraphrase FALHOU: {type(e).__name__}: {e}")
+            QTimer.singleShot(0, self._fail)
+
+    def _on_eval(self, resp, err):
+        cp = self._chat_panel
+        if cp:
+            try: cp.eval_result.disconnect(self._on_eval)
+            except: pass
+        if err or not resp:
+            log(f"paraphrase eval error: {err or 'resposta vazia'}")
+            QTimer.singleShot(0, self._fail)
+            return
+        try:
+            raw = resp.strip().strip("`")
+            parsed = json.loads(raw[raw.find("{"):raw.rfind("}") + 1])
+            QTimer.singleShot(0, lambda: self._show(parsed))
+        except Exception as e:
+            log(f"paraphrase parse FALHOU: {type(e).__name__}: {e}")
+            QTimer.singleShot(0, self._fail)
+
+    def _fail(self):
+        self._checking = False
+        self.check_btn.setEnabled(True)
+        self.fb.setText(T("exercise_failed"))
+
+    def _show(self, data):
+        self._checking = False
+        self.check_btn.setEnabled(True)
+        try:
+            score = max(0, min(100, int(data.get("score", 0))))
+        except Exception:
+            score = 0
+        color = "#5ae05a" if score >= 75 else ("#e0c05a" if score >= 50 else "#e07a5a")
+        fb = _esc_html(data.get("feedback", "")).replace("\n", "<br>")
+        model = _esc_html(data.get("model", "")).replace("\n", "<br>")
+        self.fb.setText(
+            f"<span style='color:{color};font-weight:700;'>{T('fluency_score', score=score)}</span><br>"
+            f"<span style='color:{TXT};'>{fb}</span><br><br>"
+            f"<span style='color:{TMT};font-weight:600;'>{T('paraphrase_model')}</span><br>"
+            f"<span style='color:{TS2};'>{model}</span>")
+
+
+class DescribeDialog(QDialog):
+    """Exercício de descrição na língua-alvo. Dois modos:
+      • 'scene' — descrever a CENA. Ao abrir, o filme entra em LOOP sobre o grupo de
+        legendas (a cena repete enquanto o utilizador a observa e descreve).
+      • 'take'  — descrever um TAKE/plano. Ao abrir, o filme PAUSA no fotograma atual.
+    A IA recebe as legendas do grupo como contexto e avalia a descrição (riqueza,
+    correção, coerência com a cena) + mostra uma descrição-modelo. Ao fechar, o
+    estado anterior do filme (loop / reprodução) é reposto."""
+
+    def __init__(self, parent, engine, mode="scene"):
+        super().__init__(parent)
+        self._engine = engine
+        self._mode = "take" if mode == "take" else "scene"
+        self._lines = []
+        self._checking = False
+        # Guardar estado para repor ao fechar.
+        self._prev_loop = engine._loop
+        self._was_playing = engine.is_playing()
+
+        self._lines = engine.fluency_group()
+        # Aplicar o comportamento pedido: cena → loop; take → pause.
+        if self._mode == "scene" and self._lines:
+            engine.loop_range(self._lines[0].start, self._lines[-1].end)
+        elif self._mode == "take":
+            engine.pause()
+
+        title = T("describe_take_btn") if self._mode == "take" else T("describe_scene_btn")
+        self.setWindowTitle(title)
+        self.setMinimumSize(300, 360)   # estreito: encaixa na sidebar
+        self.setStyleSheet(f"background:{BG};")
+        lo = QVBoxLayout(self); lo.setContentsMargins(20, 18, 20, 18); lo.setSpacing(10)
+
+        hdr = QLabel(title); hdr.setStyleSheet(
+            f"color:{TXT};font-size:15px;font-weight:700;background:transparent;")
+        lo.addWidget(hdr)
+
+        mode_note = T("describe_take_mode") if self._mode == "take" else T("describe_scene_mode")
+        badge = QLabel(mode_note); badge.setStyleSheet(
+            f"color:{ACC};font-size:10px;font-weight:700;letter-spacing:.06em;background:transparent;")
+        lo.addWidget(badge)
+
+        instr_key = "describe_take_instruction" if self._mode == "take" else "describe_scene_instruction"
+        self.instr = QLabel(T(instr_key)); self.instr.setWordWrap(True)
+        self.instr.setStyleSheet(f"color:{TMT};font-size:12px;background:transparent;")
+        lo.addWidget(self.instr)
+
+        # Legendas da cena como contexto (o que está a ser dito).
+        self.ctx_lbl = QLabel(""); self.ctx_lbl.setWordWrap(True)
+        self.ctx_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.ctx_lbl.setStyleSheet(
+            f"color:{TMT};font-size:12px;font-style:italic;background:{ELV};"
+            f"border:1px solid {BRD};border-radius:10px;padding:10px 12px;")
+        if self._lines:
+            self.ctx_lbl.setText(T("describe_context") + "\n" +
+                                 "\n".join(s.text.replace("\n", " ").strip() for s in self._lines))
+        else:
+            self.ctx_lbl.setVisible(False)
+        lo.addWidget(self.ctx_lbl)
+
+        self.answer = QTextEdit(); self.answer.setPlaceholderText(T("describe_placeholder"))
+        self.answer.setStyleSheet(f"QTextEdit{{background:{ELV};color:{TXT};border:1px solid {BRD};"
+                                  f"border-radius:8px;padding:10px;font-size:13px;font-family:'Inter','Segoe UI',sans-serif;}}")
+        self.answer.setMinimumHeight(90)
+        lo.addWidget(self.answer)
+
+        self.fb = QLabel(""); self.fb.setWordWrap(True); self.fb.setVisible(False)
+        self.fb.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.fb.setStyleSheet(f"color:{TXT};font-size:12px;background:{ELV};"
+                              f"border:1px solid {BRD};border-radius:8px;padding:10px 12px;")
+        lo.addWidget(self.fb)
+
+        bb = QHBoxLayout(); bb.setSpacing(8)
+        self.check_btn = QPushButton(T("describe_check")); self.check_btn.setCursor(Qt.PointingHandCursor)
+        self.check_btn.setStyleSheet(
+            f"QPushButton{{background:{ACC};color:{ON_ACC};border:none;border-radius:14px;"
+            f"padding:8px 20px;font-size:12px;font-weight:600;font-family:'Inter','Segoe UI',sans-serif;}}"
+            f"QPushButton:hover{{background:{ACC_HOVER};}}"
+            f"QPushButton:disabled{{background:{ELV};color:{TMT};}}")
+        self.check_btn.clicked.connect(self._check)
+        if not self._lines:
+            self.check_btn.setEnabled(False)
+        bb.addWidget(self.check_btn)
+        bb.addStretch()
+        cl = QPushButton(T("exercise_close")); cl.setCursor(Qt.PointingHandCursor)
+        cl.setStyleSheet(f"QPushButton{{background:transparent;color:{TS2};border:1px solid {BRD};"
+                         f"border-radius:14px;padding:8px 16px;font-size:11px;}}"
+                         f"QPushButton:hover{{color:{TXT};border-color:{ACC};}}")
+        cl.clicked.connect(self.close)
+        bb.addWidget(cl)
+        lo.addLayout(bb)
+        QTimer.singleShot(60, self.answer.setFocus)
+
+    def _scene_text(self):
+        return "\n".join(s.text.replace("\n", " ").strip() for s in self._lines)
+
+    def _check(self):
+        if self._checking:
+            return
+        ans = self.answer.toPlainText().strip()
+        if not ans:
+            return
+        self._checking = True
+        self.check_btn.setEnabled(False)
+        self.fb.setVisible(True)
+        self.fb.setText(T("describe_seeing") if self._vision_ok() else T("fluency_checking"))
+        # Captura o fotograma atual NA THREAD da UI (VLC) e passa-o à avaliação.
+        frame = None
+        try:
+            frame = self._engine.snapshot_b64()
+        except Exception:
+            frame = None
+        threading.Thread(target=self._work, args=(self._scene_text(), ans, frame), daemon=True).start()
+
+    def _vision_ok(self):
+        # Só tentamos visão se há imagem possível (player ativo). A própria captura
+        # confirma; aqui é só para a mensagem "a ver…".
+        return self._engine is not None and getattr(self._engine, "_player", None) is not None
+
+    def _work(self, scene, ans, frame=None):
+        try:
+            nat = native_language_name()
+            unit = "single shot (a take)" if self._mode == "take" else "scene"
+            if frame:
+                # ── Visão real (OpenRouter via /api/vision): o modelo VÊ o fotograma
+                # e compara o que aparece com o que foi dito e com a descrição do aluno.
+                sys_p = (
+                    "You are a language coach with vision. You can SEE one frame from a film. "
+                    f"The user is learning a language and is describing this {unit} in the language "
+                    "they are LEARNING. You are given: the image (what actually appears on screen) and "
+                    "the subtitle lines (what is being SAID). Compare the three — image, dialogue and the "
+                    "user's description. Reward a description that matches what is genuinely visible and is "
+                    "rich, natural and grammatical in the target language; gently flag anything the user "
+                    "claims that the image does NOT support. Be specific and encouraging. "
+                    "Respond ONLY with JSON:\n"
+                    '{"score": <integer 0-100>, '
+                    f'"feedback": "<2-3 sentences in {nat}: accuracy vs the image, language quality, what to improve>", '
+                    f'"seen": "<1 sentence in {nat}: what the image actually shows>", '
+                    '"model": "<a vivid, accurate model description, in the language being learned>"}')
+                user_p = (f"SUBTITLES (what is being said, language being learned):\n{scene or '(no dialogue here)'}\n\n"
+                          f"USER DESCRIPTION:\n{ans}")
+                data, mime = frame
+                raw = call_vision(user_p, system=sys_p,
+                                  images=[{"data": data, "mimeType": mime}],
+                                  model="google/gemini-2.0-flash-001",
+                                  max_tokens=700, temperature=0.3, json_mode=True).strip().strip("`")
+                parsed = json.loads(raw[raw.find("{"):raw.rfind("}") + 1])
+                QTimer.singleShot(0, lambda: self._show(parsed))
+                return
+            # ── Sem imagem (offline / captura falhou): avaliação só por texto. ──
+            sys_p = (
+                "You are a language coach. The user is learning a language by watching a film and is "
+                f"describing a {unit} in the language they are LEARNING. Below are the subtitle lines of "
+                "that part of the film, as context for what is happening. Evaluate the user's description: "
+                "is it in the target language, rich and varied in vocabulary, grammatically natural, and "
+                "coherent with what the dialogue suggests is happening? Be encouraging but specific. "
+                "Respond ONLY with JSON:\n"
+                '{"score": <integer 0-100>, '
+                f'"feedback": "<2-3 sentences in {nat}: what was good and what to improve>", '
+                '"model": "<a vivid, natural model description, in the language being learned>"}')
+            user_p = f"SCENE SUBTITLES (language being learned):\n{scene or '(no dialogue in this moment)'}\n\nUSER DESCRIPTION:\n{ans}"
+            body = json.dumps({"model": "deepseek-chat", "max_tokens": 800, "temperature": 0.3,
+                "messages": [{"role": "system", "content": sys_p},
+                             {"role": "user", "content": user_p}]}).encode()
+            r = urlopen(Request(f"{LEXIO_API}/api/deepseek-chat", data=body,
+                                headers={"Content-Type": "application/json"}), timeout=60)
+            d = json.loads(r.read().decode())
+            raw = (d.get("text") or "").strip().strip("`")
+            parsed = json.loads(raw[raw.find("{"):raw.rfind("}") + 1])
+            QTimer.singleShot(0, lambda: self._show(parsed))
+        except Exception as e:
+            log(f"describe: {e}")
+            QTimer.singleShot(0, self._fail)
+
+    def _fail(self):
+        self._checking = False
+        self.check_btn.setEnabled(True)
+        self.fb.setText(T("exercise_failed"))
+
+    def _show(self, data):
+        self._checking = False
+        self.check_btn.setEnabled(True)
+        try:
+            score = max(0, min(100, int(data.get("score", 0))))
+        except Exception:
+            score = 0
+        color = "#5ae05a" if score >= 75 else ("#e0c05a" if score >= 50 else "#e07a5a")
+        fb = _esc_html(data.get("feedback", "")).replace("\n", "<br>")
+        model = _esc_html(data.get("model", "")).replace("\n", "<br>")
+        seen = _esc_html(data.get("seen", "")).replace("\n", "<br>")
+        seen_html = (f"<span style='color:{TMT};font-weight:600;'>{T('describe_seen')}</span><br>"
+                     f"<span style='color:{TS2};'>{seen}</span><br><br>") if seen else ""
+        self.fb.setText(
+            f"<span style='color:{color};font-weight:700;'>{T('fluency_score', score=score)}</span><br>"
+            f"<span style='color:{TXT};'>{fb}</span><br><br>"
+            f"{seen_html}"
+            f"<span style='color:{TMT};font-weight:600;'>{T('describe_model')}</span><br>"
+            f"<span style='color:{TS2};'>{model}</span>")
+
+    def closeEvent(self, e):
+        # Repor o estado do filme: tirar o loop da cena (a menos que já existisse) e
+        # retomar a reprodução se o take a tinha pausado.
+        try:
+            if self._mode == "scene":
+                self._engine._loop = self._prev_loop
+                self._engine._loop_a = None
+            elif self._mode == "take" and self._was_playing:
+                self._engine.play()
+        except Exception:
+            pass
+        super().closeEvent(e)
+
+
+class DialogueDialog(QDialog):
+    """Diálogo + Shadowing (linha-a-linha). Sem adivinhar quem fala: o filme toca uma
+    fala (legenda) a volume normal; no fim, em vez de pausar/mutar, BAIXA o volume e
+    repete a fala em loop suave para o aluno a dizer por cima (shadowing). 'Continuar'
+    repõe o volume e avança. Funciona com qualquer legenda (não precisa de marcas de
+    personagem, que a maioria dos .srt não tem)."""
+
+    def __init__(self, parent, engine):
+        super().__init__(parent)
+        self._engine = engine
+        self._lines = self._collect_lines(engine)   # corrida de legendas a partir da posição
+        self._idx = -1
+        self._done = False
+        self._phase = "listen"   # "listen" (volume normal) | "shadow" (loop a volume baixo)
+
+        self.setWindowTitle(T("dialogue_btn"))
+        self.setMinimumWidth(300)   # estreito: encaixa na sidebar
+        self.setStyleSheet(f"background:{BG};")
+        lo = QVBoxLayout(self); lo.setContentsMargins(20, 18, 20, 18); lo.setSpacing(10)
+
+        hdr = QLabel(T("dialogue_btn")); hdr.setStyleSheet(
+            f"color:{TXT};font-size:15px;font-weight:700;background:transparent;")
+        lo.addWidget(hdr)
+
+        self.role_lbl = QLabel(T("dialogue_echo_hint")); self.role_lbl.setWordWrap(True)
+        self.role_lbl.setStyleSheet(f"color:{TMT};font-size:11px;background:transparent;")
+        lo.addWidget(self.role_lbl)
+
+        self.turn_lbl = QLabel(""); self.turn_lbl.setStyleSheet(
+            f"color:{ACC};font-size:12px;font-weight:800;letter-spacing:.08em;background:transparent;")
+        lo.addWidget(self.turn_lbl)
+
+        self.line_lbl = QLabel(""); self.line_lbl.setWordWrap(True)
+        self.line_lbl.setMinimumHeight(64)
+        self.line_lbl.setStyleSheet(
+            f"color:{TS2};font-size:16px;background:{ELV};border:1px solid {BRD};"
+            f"border-radius:10px;padding:14px 16px;")
+        lo.addWidget(self.line_lbl)
+
+        bb = QHBoxLayout(); bb.setSpacing(8)
+        self.cont_btn = QPushButton(T("dialogue_continue")); self.cont_btn.setCursor(Qt.PointingHandCursor)
+        self.cont_btn.setStyleSheet(
+            f"QPushButton{{background:{ACC};color:{ON_ACC};border:none;border-radius:14px;"
+            f"padding:8px 20px;font-size:12px;font-weight:700;font-family:'Inter','Segoe UI',sans-serif;}}"
+            f"QPushButton:hover{{background:{ACC_HOVER};}}"
+            f"QPushButton:disabled{{background:{ELV};color:{TMT};}}")
+        self.cont_btn.clicked.connect(self._on_continue)
+        bb.addWidget(self.cont_btn)
+
+        def ghost(txt, fn):
+            b = QPushButton(txt); b.setCursor(Qt.PointingHandCursor)
+            b.setStyleSheet(f"QPushButton{{background:transparent;color:{TS2};border:1px solid {BRD};"
+                            f"border-radius:14px;padding:8px 14px;font-size:11px;}}"
+                            f"QPushButton:hover{{color:{TXT};border-color:{ACC};}}")
+            b.clicked.connect(fn); return b
+        self.replay_btn = ghost(T("dialogue_replay"), self._replay)
+        bb.addWidget(self.replay_btn)
+        bb.addWidget(ghost(T("dialogue_restart"), self._start))
+        bb.addStretch()
+        bb.addWidget(ghost(T("exercise_close"), self.close))
+        lo.addLayout(bb)
+
+        self._timer = QTimer(self); self._timer.setInterval(90)
+        self._timer.timeout.connect(self._drive)
+
+        if len(self._lines) < 1:
+            self.line_lbl.setText(T("dialogue_no_dialogue"))
+            self.cont_btn.setEnabled(False); self.replay_btn.setEnabled(False)
+        else:
+            QTimer.singleShot(60, self._start)
+
+    @staticmethod
+    def _collect_lines(engine, max_lines=12, gap=2.6):
+        """Reúne as legendas consecutivas a partir da posição atual, partindo só quando
+        há um silêncio longo. Cada legenda é uma 'fala' a repetir (sem agrupar por
+        personagem)."""
+        subs = getattr(engine, "_subs", [])
+        if not subs:
+            return []
+        i = engine._sub_idx_at(engine.get_pos())
+        if i < 0:
+            i = getattr(engine, "_last_sub_idx", 0)
+        i = max(0, min(i, len(subs) - 1))
+        run = [subs[i]]; j = i
+        while len(run) < max_lines and j + 1 < len(subs):
+            if subs[j + 1].start - subs[j].end <= gap:
+                j += 1; run.append(subs[j])
+            else:
+                break
+        return run
+
+    # ── condução ──
+    # Fases: "listen" (a fala toca a volume normal) → "shadow" (a MESMA fala fica em
+    # loop a volume BAIXO para o aluno falar por cima; o filme não pausa nem muta).
+    def _start(self):
+        if not self._lines:
+            return
+        self._done = False
+        self._idx = -1
+        self._phase = "listen"
+        self._timer.start()
+        self._enter(0)
+
+    def _enter(self, idx):
+        """Toca a fala idx desde o início a volume normal (fase 'listen')."""
+        self._idx = idx
+        if idx >= len(self._lines):
+            return self._finish()
+        line = self._lines[idx]
+        self._phase = "listen"
+        self.turn_lbl.setText(T("dialogue_listen"))
+        self.line_lbl.setText(line.text.replace(chr(10), " ").strip())
+        self.cont_btn.setEnabled(False)
+        try:
+            self._engine.restore_volume()   # volume normal para ouvir bem
+            self._engine.seek(line.start)
+            self._engine.play()
+        except Exception:
+            pass
+
+    def _drive(self):
+        if self._done or not self._lines or not (0 <= self._idx < len(self._lines)):
+            return
+        line = self._lines[self._idx]
+        pos = self._engine.get_pos()
+        if self._phase == "listen":
+            if pos >= line.end - 0.04:
+                # Acabou de ouvir → passa a shadowing: baixa o volume (NÃO pausa) e
+                # repete a fala em loop para o aluno falar por cima.
+                self._phase = "shadow"
+                try:
+                    self._engine.duck_volume()
+                    self._engine.seek(line.start)
+                    if not self._engine.is_playing():
+                        self._engine.play()
+                except Exception:
+                    pass
+                self.turn_lbl.setText(T("dialogue_your_turn"))
+                self.cont_btn.setEnabled(True)
+        elif self._phase == "shadow":
+            # Mantém a fala em loop suave (volume baixo) até o aluno clicar Continuar.
+            if pos >= line.end - 0.04 or pos < line.start - 0.5:
+                try: self._engine.seek(line.start)
+                except Exception: pass
+
+    def _replay(self):
+        # Voltar a ouvir a fala atual a volume normal.
+        if self._done or not (0 <= self._idx < len(self._lines)):
+            return
+        self._enter(self._idx)
+
+    def _on_continue(self):
+        if self._done:
+            return
+        self.cont_btn.setEnabled(False)
+        try: self._engine.restore_volume()
+        except Exception: pass
+        self._enter(self._idx + 1)
+
+    def _finish(self):
+        self._done = True
+        self._timer.stop()
+        try:
+            self._engine.restore_volume()
+            self._engine.pause()
+        except Exception: pass
+        self.turn_lbl.setText("")
+        self.line_lbl.setText(T("dialogue_done"))
+        self.cont_btn.setEnabled(False)
+
+    def closeEvent(self, e):
+        try: self._timer.stop()
+        except Exception: pass
+        try: self._engine.restore_volume()   # nunca deixar o filme com volume baixo
+        except Exception: pass
+        super().closeEvent(e)
+
+
+class SceneMissionDialog(QDialog):
+    """Missão interativa do Scene Agent: o filme pausa numa cena e pede ao utilizador
+    para agir (assumir personagem, shadowing, resumir, etc.). Avalia a resposta com
+    IA (DeepSeek, via scene_agent) e mostra feedback real. É o 'Deus' a agir."""
+    _eval_ready = pyqtSignal(dict)
+
+    def __init__(self, parent, mission, ctx, auth_header):
+        super().__init__(parent)
+        self._mission = mission
+        self._ctx = ctx
+        self._auth = auth_header
+        self.setWindowTitle(mission.title)
+        self.setMinimumSize(300, 360)   # estreito: encaixa na sidebar
+        self.setStyleSheet(f"background:{BG};")
+        self._eval_ready.connect(self._on_eval)
+
+        lo = QVBoxLayout(self); lo.setContentsMargins(22, 20, 22, 20); lo.setSpacing(10)
+        kicker = QLabel(mission.label.upper() + "  ·  " + FMT(mission.timestamp))
+        kicker.setStyleSheet(f"color:{ACC};font-size:10px;font-weight:700;letter-spacing:.08em;background:transparent;")
+        lo.addWidget(kicker)
+        ttl = QLabel(mission.title); ttl.setWordWrap(True)
+        ttl.setStyleSheet(f"color:{TXT};font-size:18px;font-weight:800;background:transparent;")
+        lo.addWidget(ttl)
+        prompt = QLabel(mission.prompt); prompt.setWordWrap(True)
+        prompt.setStyleSheet(f"color:{TMT};font-size:13px;line-height:1.5;background:transparent;")
+        lo.addWidget(prompt)
+
+        if mission.target_line:
+            tl = QLabel(mission.target_line); tl.setWordWrap(True)
+            tl.setStyleSheet(f"color:{TS2};font-size:14px;background:{ELV};border:1px solid {BRD};"
+                             f"border-radius:8px;padding:10px 12px;")
+            lo.addWidget(tl)
+
+        self.answer = QTextEdit(); self.answer.setPlaceholderText("Escreve (ou dita) a tua resposta...")
+        self.answer.setStyleSheet(f"QTextEdit{{background:{ELV};color:{TXT};border:1px solid {BRD};"
+                                  f"border-radius:8px;padding:10px;font-size:13px;font-family:'Inter','Segoe UI',sans-serif;}}")
+        self.answer.setMinimumHeight(90)
+        lo.addWidget(self.answer)
+
+        self.fb = QLabel(""); self.fb.setWordWrap(True); self.fb.setStyleSheet("background:transparent;")
+        self.fb.hide()
+        lo.addWidget(self.fb)
+        lo.addStretch()
+
+        row = QHBoxLayout(); row.setSpacing(8)
+        self.skip_btn = QPushButton("Saltar")
+        self.skip_btn.setCursor(Qt.PointingHandCursor)
+        self.skip_btn.setStyleSheet(f"QPushButton{{background:transparent;color:{TMT};border:1px solid {BRD};"
+                                    f"border-radius:8px;padding:9px 16px;font-size:12px;}}QPushButton:hover{{color:{TXT};}}")
+        self.skip_btn.clicked.connect(self.reject)
+        self.go_btn = QPushButton("Avaliar"); self.go_btn.setCursor(Qt.PointingHandCursor)
+        self.go_btn.setStyleSheet(f"QPushButton{{background:{ACC};color:{ON_ACC};border:none;border-radius:8px;"
+                                  f"padding:9px 20px;font-size:13px;font-weight:700;}}QPushButton:hover{{background:{ACC_HOVER};}}")
+        self.go_btn.clicked.connect(self._evaluate)
+        row.addWidget(self.skip_btn); row.addStretch(); row.addWidget(self.go_btn)
+        self._row = row
+        lo.addLayout(row)
+
+    def _evaluate(self):
+        ans = self.answer.toPlainText().strip()
+        if not ans:
+            self.reject(); return
+        self.go_btn.setEnabled(False); self.go_btn.setText("A avaliar...")
+        def work():
+            try:
+                res = scene_agent.evaluate_scene_mission(
+                    self._mission, ans,
+                    native_lang=self._ctx.get("native", "pt"),
+                    target_lang=self._ctx.get("target", "en"),
+                    level=self._ctx.get("level", "B1"),
+                    api_base=LEXIO_API, auth_header=self._auth)
+            except Exception as e:
+                log(f"scene mission eval: {type(e).__name__}: {e}")
+                res = {"score": 0, "feedback": f"Erro: {e}", "ai_graded": False}
+            self._eval_ready.emit(res or {"score": 0, "feedback": "Sem resposta da IA.", "ai_graded": False})
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_eval(self, res):
+        score = res.get("score", 0)
+        col = "#5ae05a" if score >= 80 else ("#7dd3fc" if score >= 60 else "#f8b478")
+        parts = [f"<b style='color:{col};font-size:20px'>{score}%</b>"]
+        if res.get("feedback"):
+            parts.append(f"<span style='color:{TMT}'>{res['feedback']}</span>")
+        if res.get("corrected"):
+            parts.append(f"<span style='color:{TS2}'>Versão melhor: <i>{res['corrected']}</i></span>")
+        self.fb.setText("<br><br>".join(parts)); self.fb.show()
+        self.go_btn.setText("Continuar filme"); self.go_btn.setEnabled(True)
+        self.go_btn.clicked.disconnect(); self.go_btn.clicked.connect(self.accept)
 
 
 class MainWindow(QMainWindow):
@@ -3076,6 +4958,7 @@ class MainWindow(QMainWindow):
         self._study_mode = False
         self._transport_overlay = None     # floating seek+controls window (study mode)
         self._transport_floating = False
+        self._transport_opacity = 0.90   # opacidade do transport flutuante (ajustável: clique-direito)
         self._controls_state = {}  # save/restore visibility
         # Sessão do player → enviada p/ player_sessions (a IA da web fica a saber).
         self._session_start = None
@@ -3086,10 +4969,24 @@ class MainWindow(QMainWindow):
 
     def _setup(self):
         self.video_path = None; self.mgr = StudyMgr()
+        self._autopause_on = False
+        # ── Tipo de estudo: desligado | leve | focado. A IA (Scene Agent) está SEMPRE
+        # em modo "Deus" (máxima qualidade); o que muda é QUANTO intervém:
+        #   desligado = sem agente, só ver; leve = poucas missões; focado = muitas + autopause/loop.
+        self._study_kind = "desligado"  # Scene Agent removido — fica sempre desligado
+        self._scene_mode = "off"        # sem missões automáticas (só exercícios manuais)
+        self._scene_missions = []
+        self._scene_done = set()        # ids de missões já feitas/saltadas
+        self._scene_subs_key = None     # rebuild só quando as legendas mudam
+        self._in_mission = False        # evita re-disparar enquanto o diálogo está aberto
+        self._tracks = []          # [{"title": str, "start_idx": int, "end_idx": int}]
+        self._listening_mode = False
+        self._listening_interval = 3  # ask question every N subtitles
+        self._listening_sub_count = 0
+        self._listening_pending = False
         self._playlist = []; self._pl_idx = -1
         self._cur_sub = ""        # última legenda visível (p/ a aba Pronúncia)
         self._rate = 1.0; self._vol = 50; self._seeking = False
-        self._tools_visible = True
         self._overlay_shown = False
         # Auto-hide for the fullscreen transport (seek + controls).
         self._fs_hide_timer = QTimer(self); self._fs_hide_timer.setSingleShot(True)
@@ -3102,10 +4999,13 @@ class MainWindow(QMainWindow):
         self.engine.duration_changed.connect(self._on_dur)
         # Wire overlay signals
         self.engine.subtitle_changed.connect(self.overlay.show_subtitle)
-        self.engine.subtitle_changed.connect(self._remember_sub)
+        self.engine.subtitle_changed.connect(self._remember_last_sub)
+        self.engine.subtitle_exited.connect(self._on_sub_exited)
+        self.engine.ai_loop_changed.connect(self._on_ai_loop)
         self.engine.vocab_triggered.connect(self.overlay.show_vocab)
         self.overlay.add_word.connect(self._on_overlay_add)
         self.overlay.ask_ai.connect(self._on_overlay_ask)
+        self.overlay.speak_card.connect(self._speak_slow)
         self.overlay.video_clicked.connect(self._toggle)
         self.overlay.toggle_fullscreen.connect(self._toggle_fs)
         self.overlay.mouse_moved.connect(self._fs_activity)
@@ -3122,9 +5022,9 @@ class MainWindow(QMainWindow):
         # Fit the window to the user's screen. A fixed 1200x780 default does NOT
         # fit a 1366x768 display (taller than the screen!), so the window opened
         # hanging off-screen and subtitles landed at the screen corner. Clamp the
-        # default to the available work area and open centred; keep the minimum
-        # small enough that "reduced" window sizes are actually possible.
-        self.setMinimumSize(720, 480)
+        # clamp the default to the available work area and open centred; keep the
+        # minimum large enough for all nav/exercise buttons to fit comfortably.
+        self.setMinimumSize(1000, 480)
         try:
             av = QApplication.primaryScreen().availableGeometry()
             w0 = min(1200, av.width() - 24); h0 = min(780, av.height() - 24)
@@ -3151,7 +5051,7 @@ class MainWindow(QMainWindow):
 
         # Chat toggle — clearly labelled ("Chat IA") so it's easy to find; the old
         # bare "Chat" pill was too discreet. Accent-filled when active.
-        self.chat_toggle = QPushButton("\U0001F4AC  Chat IA")
+        self.chat_toggle = QPushButton("Chat IA")
         self.chat_toggle.setFixedHeight(28); self.chat_toggle.setMinimumWidth(92)
         self.chat_toggle.setCursor(Qt.PointingHandCursor)
         self.chat_toggle.setToolTip(T("chat_toggle_tip"))
@@ -3231,7 +5131,9 @@ class MainWindow(QMainWindow):
         self.sub_icon.clicked.connect(self._cycle_subs)
 
         self.vol_icon = QLabel(chr(0xE767)); self.vol_icon.setStyleSheet(f"color:{TS2};font-family:{ICON_F};font-size:15px;background:transparent;")
-        self.vol = QSlider(Qt.Horizontal); self.vol.setRange(0,200); self.vol.setValue(50); self.vol.setFixedWidth(84)
+        # SeekSlider (not plain QSlider): clicking anywhere on the bar jumps the
+        # volume to that point instead of nudging one step toward it.
+        self.vol = SeekSlider(Qt.Horizontal); self.vol.setRange(0,200); self.vol.setValue(50); self.vol.setFixedWidth(84)
         self.vol.setStyleSheet(f"QSlider::groove:horizontal{{background:{HVR};height:3px;border-radius:1.5px;}}QSlider::sub-page:horizontal{{background:{TS2};border-radius:1.5px;}}QSlider::handle:horizontal{{background:{TS2};width:11px;height:11px;margin:-4px 0;border-radius:5.5px;}}")
         self.vol.valueChanged.connect(lambda v: (self.engine.set_vol(v), setattr(self,'_vol',v)))
 
@@ -3260,58 +5162,112 @@ class MainWindow(QMainWindow):
         cl.addWidget(self.sub_btn); cl.addWidget(self.sub_icon); cl.addWidget(self.vol_icon); cl.addWidget(self.vol); cl.addWidget(self.chat_btn); cl.addWidget(self.fs_btn)
         left_lo.addWidget(cb)
 
-        # ── Practice bar: physical buttons for the language-learning tools ──
-        def prac_btn(label, tip, checkable=False):
+        # ── Barra de navegação de legendas (perto dos controlos) ──
+        def nav_btn(label, tip, checkable=False):
             b = QPushButton(label); b.setToolTip(tip); b.setCheckable(checkable)
             b.setCursor(Qt.PointingHandCursor)
             b.setStyleSheet(
                 f"QPushButton{{background:transparent;color:{TS2};border:1px solid {BRD};"
-                f"border-radius:13px;font-size:11px;padding:4px 11px;font-family:'Inter';}}"
+                f"border-radius:13px;font-size:11px;padding:4px 11px;font-family:'Inter','Segoe UI',sans-serif;}}"
                 f"QPushButton:hover{{background:{HVR};color:{TXT};border-color:{ACC};}}"
                 f"QPushButton:checked{{background:{HVR};color:{TXT};border-color:{ACC};}}")
             return b
-        pbar = QWidget(); pbar.setObjectName("practice_bar"); pbar.setFixedHeight(38)
-        pbar.setStyleSheet("#practice_bar{background:#141414;}")
-        ppl = QHBoxLayout(pbar); ppl.setContentsMargins(16,3,16,5); ppl.setSpacing(6)
-        plab = QLabel(T("practice")); plab.setStyleSheet(f"color:{TMT};font-size:10px;font-weight:600;background:transparent;")
-        ppl.addWidget(plab)
-        # Prominent, clearly-labelled subtitle button — the tiny CC icon up in the
-        # controls bar was too easy to miss. Turns green with a ✓ once a sub loads.
-        self.btn_sub = prac_btn(T("sub_add"), T("sub_add_tip"), True)
+        self.nav_bar = QWidget(); self.nav_bar.setObjectName("nav_bar")
+        self.nav_bar.setStyleSheet("#nav_bar{background:#181818;}")
+        nav_lo = QHBoxLayout(self.nav_bar); nav_lo.setContentsMargins(16,2,16,2); nav_lo.setSpacing(6)
+        nav_lo.setAlignment(Qt.AlignLeft)
+        self.btn_sub = nav_btn(T("sub_add"), T("sub_add_tip"), True)
         self.btn_sub.setStyleSheet(
             f"QPushButton{{background:transparent;color:{TS2};border:1px solid {ACC};"
-            f"border-radius:13px;font-size:11px;padding:4px 13px;font-family:'Inter';font-weight:600;}}"
+            f"border-radius:13px;font-size:11px;padding:4px 13px;font-family:'Inter','Segoe UI',sans-serif;font-weight:600;}}"
             f"QPushButton:hover{{background:{HVR};color:{TXT};border-color:{ACC};}}"
             f"QPushButton:checked{{background:rgba(60,180,90,0.18);color:#9EE6A0;border-color:#3CB45A;}}")
         self.btn_sub.clicked.connect(self._load_sub_file)
-        ppl.addWidget(self.btn_sub)
-        self.btn_sub_online = prac_btn(T("sub_online"), T("sub_online_tip"))
+        nav_lo.addWidget(self.btn_sub)
+        self.btn_sub_online = nav_btn(T("sub_online"), T("sub_online_tip"))
         self.btn_sub_online.clicked.connect(self._search_subs_online)
-        ppl.addWidget(self.btn_sub_online)
-        ppl.addSpacing(4)
-        b_rep = prac_btn(T("repeat"), T("prac_repeat_tip")); b_rep.clicked.connect(self.engine.replay_sub)
-        b_prev = prac_btn(T("previous"), T("prac_prev_tip")); b_prev.clicked.connect(self.engine.prev_sub)
-        b_next = prac_btn(T("next"), T("prac_next_tip")); b_next.clicked.connect(self.engine.next_sub)
-        b_pron = prac_btn("\U0001F5E3 " + T("pron_title"), T("pron_open_tip")); b_pron.clicked.connect(self._open_pronunciation)
-        b_a = prac_btn("A", T("prac_loop_a_tip")); b_a.clicked.connect(self._set_loop_a)
-        b_b = prac_btn("B", T("prac_loop_b_tip")); b_b.clicked.connect(self._set_loop_b)
-        self.btn_loop = prac_btn(T("loop"), T("prac_loop_tip"), True); self.btn_loop.clicked.connect(self._toggle_loop)
-        self.btn_ap = prac_btn(T("autopause"), T("prac_autopause_tip"), True); self.btn_ap.clicked.connect(self._toggle_autopause)
-        self.btn_hide = prac_btn(T("hide_sub"), T("prac_hide_tip"), True); self.btn_hide.clicked.connect(self._toggle_hide_subs)
-        for b in (b_rep, b_prev, b_next, b_pron, b_a, b_b): ppl.addWidget(b)
-        ppl.addStretch()
-        for b in (self.btn_loop, self.btn_ap, self.btn_hide): ppl.addWidget(b)
-        left_lo.addWidget(pbar)
+        nav_lo.addWidget(self.btn_sub_online)
+        self.btn_segment = nav_btn(T("track_segment"), T("track_segment_tip"))
+        self.btn_segment.clicked.connect(self._segment_subs)
+        nav_lo.addWidget(self.btn_segment)
+        self.btn_stt = nav_btn(T("stt_btn"), T("stt_tip"))
+        self.btn_stt.clicked.connect(self._generate_auto_captions)
+        nav_lo.addWidget(self.btn_stt)
+        sep1 = QLabel("|"); sep1.setStyleSheet(f"color:{BRD};font-size:11px;padding:0 2px;background:transparent;")
+        nav_lo.addWidget(sep1)
+        b_rep = nav_btn(T("repeat"), T("prac_repeat_tip")); b_rep.clicked.connect(self.engine.replay_sub)
+        b_prev = nav_btn(T("previous"), T("prac_prev_tip")); b_prev.clicked.connect(self.engine.prev_sub)
+        b_next = nav_btn(T("next"), T("prac_next_tip")); b_next.clicked.connect(self.engine.next_sub)
+        for b in (b_rep, b_prev, b_next): nav_lo.addWidget(b)
+        sep2 = QLabel("|"); sep2.setStyleSheet(f"color:{BRD};font-size:11px;padding:0 2px;background:transparent;")
+        nav_lo.addWidget(sep2)
+        b_a = nav_btn("A", T("prac_loop_a_tip")); b_a.clicked.connect(self._set_loop_a)
+        b_b = nav_btn("B", T("prac_loop_b_tip")); b_b.clicked.connect(self._set_loop_b)
+        nav_lo.addWidget(b_a); nav_lo.addWidget(b_b)
+        self.btn_loop = nav_btn(T("loop"), T("prac_loop_tip"), True); self.btn_loop.clicked.connect(self._toggle_loop)
+        self.btn_ap = nav_btn(T("autopause"), T("prac_autopause_tip"), True); self.btn_ap.clicked.connect(self._toggle_autopause)
+        self.btn_ai_loop = nav_btn(T("ai_loop_label"), T("ai_loop_tip"), True); self.btn_ai_loop.clicked.connect(self._toggle_ai_loop)
+        self.btn_hide = nav_btn(T("hide_sub"), T("prac_hide_tip"), True); self.btn_hide.clicked.connect(self._toggle_hide_subs)
+        for b in (self.btn_loop, self.btn_ap, self.btn_hide, self.btn_ai_loop): nav_lo.addWidget(b)
+        nav_lo.addStretch()
+        b_pron = nav_btn(T("pron_title"), T("pron_open_tip")); b_pron.clicked.connect(self._open_pronunciation)
+        nav_lo.addWidget(b_pron)
+        left_lo.addWidget(self.nav_bar)
+
+        # ── Barra de exercícios (separada dos controlos) ──
+        def ex_btn(label, tip, checkable=False):
+            b = QPushButton(label); b.setToolTip(tip); b.setCheckable(checkable)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setStyleSheet(
+                f"QPushButton{{background:transparent;color:{TS2};"
+                f"border:1px solid {BRD};border-radius:13px;font-size:11px;padding:4px 11px;font-family:'Inter','Segoe UI',sans-serif;}}"
+                f"QPushButton:hover{{background:{HVR};color:{TXT};border-color:{ACC};}}"
+                f"QPushButton:checked{{background:{HVR};color:{TXT};border-color:{ACC};}}")
+            return b
+        self.ex_bar = QWidget(); self.ex_bar.setObjectName("ex_bar")
+        self.ex_bar.setStyleSheet("#ex_bar{background:#141414;border-top:1px solid #222;}")
+        ex_lo = QHBoxLayout(self.ex_bar); ex_lo.setContentsMargins(16,2,16,2); ex_lo.setSpacing(6)
+        ex_lo.setAlignment(Qt.AlignLeft)
+        ex_lab = QLabel(T("practice")); ex_lab.setStyleSheet(f"color:{TMT};font-size:10px;font-weight:600;background:transparent;")
+        ex_lo.addWidget(ex_lab)
+        self.btn_listening = ex_btn(T("listening_btn"), T("listening_tip"), True)
+        self.btn_listening.clicked.connect(self._toggle_listening)
+        ex_lo.addWidget(self.btn_listening)
+        b_ex = ex_btn(T("exercise_btn"), T("exercise_tip")); b_ex.clicked.connect(self._open_exercise)
+        b_flu = ex_btn(T("fluency_btn"), T("fluency_tip")); b_flu.clicked.connect(self._open_fluency)
+        b_par = ex_btn(T("paraphrase_btn"), T("paraphrase_tip")); b_par.clicked.connect(self._open_paraphrase)
+        b_dsc = ex_btn(T("describe_scene_btn"), T("describe_scene_tip")); b_dsc.clicked.connect(self._open_describe_scene)
+        b_dtk = ex_btn(T("describe_take_btn"), T("describe_take_tip")); b_dtk.clicked.connect(self._open_describe_take)
+        b_dlg = ex_btn(T("dialogue_btn"), T("dialogue_tip")); b_dlg.clicked.connect(self._open_dialogue)
+        for b in (b_ex, b_flu, b_par, b_dsc, b_dtk, b_dlg): ex_lo.addWidget(b)
+        ex_lo.addStretch()
+        left_lo.addWidget(self.ex_bar)
 
         # ── Collapsible tools section ──
         self.tools_wrap = QWidget()
         self.tools_wrap.setStyleSheet(f"background:{SRF};border-top:1px solid {BRD};")
-        # Cap the tools panel so the VIDEO always dominates the window. Without a
-        # cap, the tab lists' implicit minimums hogged ~340px and squeezed the
-        # video to a sliver in reduced windows (the lists scroll anyway).
-        self.tools_wrap.setMinimumHeight(110)
-        self.tools_wrap.setMaximumHeight(210)
         twl = QVBoxLayout(self.tools_wrap); twl.setContentsMargins(0,0,0,0); twl.setSpacing(0)
+
+        # Header bar with collapse toggle
+        tools_hdr = QWidget(); tools_hdr.setFixedHeight(28)
+        tools_hdr.setStyleSheet(f"background:{ELV};border-bottom:1px solid {BRD};")
+        thl = QHBoxLayout(tools_hdr); thl.setContentsMargins(10,0,8,0)
+        self._tools_collapsed = False
+        self.tools_toggle = QPushButton("\u25be")
+        self.tools_toggle.setFixedSize(24,24)
+        self.tools_toggle.setToolTip("Recolher/expandir painel inferior")
+        self.tools_toggle.setStyleSheet(f"QPushButton{{background:transparent;border:none;color:{TS2};font-size:11px;border-radius:12px;}}QPushButton:hover{{background:{HVR};color:{TXT};}}")
+        self.tools_toggle.clicked.connect(self._toggle_bottom)
+        thl.addWidget(self.tools_toggle)
+        thl.addWidget(QLabel("Ferramentas")); thl.itemAt(1).widget().setStyleSheet(f"color:{TMT};font-size:10px;font-weight:600;background:transparent;")
+        thl.addStretch()
+        twl.addWidget(tools_hdr)
+
+        self._tools_content = QWidget()
+        self._tools_content.setStyleSheet(f"background:transparent;")
+        tcl = QVBoxLayout(self._tools_content); tcl.setContentsMargins(0,0,0,0); tcl.setSpacing(0)
+        self._tools_content.setMinimumHeight(80)
+        self._tools_content.setMaximumHeight(200)
 
         tabs = QTabWidget()
         self.tabs = tabs   # referenced so saving a word can jump to the Vídeos tab
@@ -3319,7 +5275,7 @@ class MainWindow(QMainWindow):
             f"QTabWidget::pane{{background:{SRF};border:none;}}"
             f"QTabBar{{background:{SRF};qproperty-drawBase:0;}}"
             f"QTabBar::tab{{background:transparent;color:{TMT};padding:8px 16px;border:none;"
-            f"font-size:11px;font-weight:600;font-family:'Inter';margin-right:2px;}}"
+            f"font-size:11px;font-weight:600;font-family:'Inter','Segoe UI',sans-serif;margin-right:2px;}}"
             f"QTabBar::tab:hover{{color:{TXT};}}"
             f"QTabBar::tab:selected{{color:{TXT};border-bottom:2px solid {ACC};}}")
 
@@ -3356,6 +5312,29 @@ class MainWindow(QMainWindow):
         vvl.addWidget(self.vv_list)
         tabs.addTab(vvt, T("tab_videos"))
         QTimer.singleShot(0, self._load_video_vocab)   # populate once UI is ready
+
+        # ── Smart Tracks: segmentação IA ──
+        twt = QWidget(); twl2 = QVBoxLayout(twt); twl2.setContentsMargins(6,6,6,6)
+        twl2.setSpacing(4)
+        twhl = QHBoxLayout()
+        self.tw_title = QLabel(T("tab_tracks"))
+        self.tw_title.setStyleSheet(f"color:{TXT};font-size:11px;font-weight:bold;background:transparent;")
+        twhl.addWidget(self.tw_title); twhl.addStretch()
+        twl2.addLayout(twhl)
+        self.tw_list = QListWidget()
+        self.tw_list.setStyleSheet(
+            f"QListWidget{{background:transparent;border:none;color:{TXT};font-size:11px;}}"
+            f"QListWidget::item{{padding:8px 8px;border-radius:4px;border-bottom:1px solid {BRD};}}"
+            f"QListWidget::item:hover{{background:{HVR};}}"
+            f"QListWidget::item:selected{{background:rgba(139,92,246,0.3);}}")
+        self.tw_list.currentRowChanged.connect(self._track_clicked)
+        twl2.addWidget(self.tw_list)
+        self.tw_empty = QLabel(T("track_no_sub"))
+        self.tw_empty.setAlignment(Qt.AlignCenter)
+        self.tw_empty.setStyleSheet(f"color:{TMT};font-size:11px;background:transparent;padding:16px;")
+        twl2.addWidget(self.tw_empty)
+        twl2.addStretch()
+        tabs.addTab(twt, T("tab_tracks"))
 
         # Notes
         awt = QWidget(); awl = QVBoxLayout(awt); awl.setContentsMargins(6,6,6,6)
@@ -3411,21 +5390,48 @@ class MainWindow(QMainWindow):
         tl.addStretch()
         tabs.addTab(tw, T("tab_tools"))
 
-        twl.addWidget(tabs)
+        tcl.addWidget(tabs)
+        twl.addWidget(self._tools_content)
         left_lo.addWidget(self.tools_wrap)
-
+        
         # ── Right: Chat ──
         self.chat = ChatPanel(self)
+        self.chat.speak_requested.connect(self._speak_sub_slow)
+        self.chat.user_sent.connect(self._on_chat_user_sent)
         self.chat.setMinimumWidth(300)
         # Floating word-details panel (click an underlined subtitle word)
         self.word_details = WordDetailsPanel(self, self.chat)
         self.overlay.word_clicked.connect(self.word_details.show_for)
+        # Ao mostrar os detalhes com um exercício já aberto, repartir a coluna em 2.
+        self.overlay.word_clicked.connect(lambda *_: self._balance_left_dock())
         self.chat.setMaximumWidth(420)
         # Aba Pronúncia — ouvir a legenda atual em várias velocidades (voz natural)
         self.pron_panel = PronunciationPanel(self)
 
-        body_lo.addWidget(self.word_details)   # left details panel (hidden until a word is clicked)
-        body_lo.addWidget(self.pron_panel)     # left pronunciation panel (hidden until opened)
+        # ── Sidebar ESQUERDA (encaixada): exercícios + detalhes da palavra + pronúncia.
+        # Antes os exercícios eram popups modais por cima das legendas; agora encaixam
+        # aqui. Quando há mais do que um painel aberto (ex.: exercício + detalhes), o
+        # QSplitter vertical DIVIDE a coluna em 2 (em cima/baixo). Cada painel esconde-se
+        # sozinho; o splitter ignora os escondidos, por isso colapsa quando está vazio.
+        self.ex_host = QWidget()
+        self.ex_host.setStyleSheet(f"background:{BG};border-right:1px solid {BRD};")
+        self.ex_host.setMinimumWidth(300)
+        self.ex_host_lo = QVBoxLayout(self.ex_host)
+        self.ex_host_lo.setContentsMargins(0, 0, 0, 0); self.ex_host_lo.setSpacing(0)
+        self.ex_host.hide()
+        self._ex_current = None
+
+        self.left_dock = QSplitter(Qt.Vertical)
+        self.left_dock.setChildrenCollapsible(False)
+        self.left_dock.setHandleWidth(4)
+        self.left_dock.setStyleSheet(
+            f"QSplitter::handle{{background:{BRD};}}QSplitter::handle:hover{{background:{ACC};}}")
+        self.left_dock.setMaximumWidth(340)   # sidebar estreita, não rouba o vídeo
+        self.left_dock.addWidget(self.ex_host)
+        self.left_dock.addWidget(self.word_details)
+        self.left_dock.addWidget(self.pron_panel)
+
+        body_lo.addWidget(self.left_dock)
         body_lo.addWidget(left, 1)
         body_lo.addWidget(self.chat)
         outer.addWidget(body, 1)
@@ -3543,6 +5549,23 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'chat_toggle'): self.chat_toggle.setChecked(visible)
         if hasattr(self, 'chat_btn'): self.chat_btn.setChecked(visible)
 
+    def _toggle_bottom(self):
+        """Collapse/expand the bottom section: nav_bar, ex_bar, and tools content.
+        The tools header (with toggle button) stays visible as a handle."""
+        self._tools_collapsed = not self._tools_collapsed
+        for name in ('nav_bar', 'ex_bar'):
+            w = self.findChild(QWidget, name)
+            if w: w.setVisible(not self._tools_collapsed)
+        if hasattr(self, '_tools_content'):
+            self._tools_content.setVisible(not self._tools_collapsed)
+        if hasattr(self, 'tools_toggle'):
+            self.tools_toggle.setText("\u25b8" if self._tools_collapsed else "\u25be")
+        # Also collapse seek bar and controls bar — the "groove de controle"
+        # should appear/disappear together with the buttons.
+        for name in ('seek_bar', 'controls_bar'):
+            w = self.findChild(QWidget, name)
+            if w: w.setVisible(not self._tools_collapsed)
+
     def _toggle_chat_btn(self):
         self._toggle_chat(self.chat_btn.isChecked())
 
@@ -3602,11 +5625,36 @@ class MainWindow(QMainWindow):
             ov.setObjectName("transport_overlay")
             ov.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool)
             ov.setAttribute(Qt.WA_ShowWithoutActivating)
-            ov.setStyleSheet("#transport_overlay{background:#0c0c0c;}")
+            ov.setStyleSheet("#transport_overlay{background:#0c0c0c;border-radius:14px;}")
+            ov.setWindowOpacity(self._transport_opacity)
+            # Clique-direito no transport → mudar opacidade.
+            ov.setContextMenuPolicy(Qt.CustomContextMenu)
+            ov.customContextMenuRequested.connect(self._transport_menu)
             lo = QVBoxLayout(ov); lo.setContentsMargins(0, 0, 0, 0); lo.setSpacing(0)
             self._transport_overlay = ov
             self._transport_lo = lo
         return self._transport_overlay
+
+    def _transport_menu(self, _pos):
+        """Menu de opacidade do transport flutuante (clique-direito)."""
+        from PyQt5.QtWidgets import QMenu
+        ov = getattr(self, "_transport_overlay", None)
+        if not ov:
+            return
+        m = QMenu(self)
+        m.setStyleSheet(f"QMenu{{background:{ELV};color:{TXT};border:1px solid {BRD};}}"
+                        f"QMenu::item:selected{{background:{ACC};color:{ON_ACC};}}")
+        for label, val in [("Opaco (100%)", 1.0), ("90%", 0.9), ("75%", 0.75),
+                           ("60%", 0.6), ("Discreto (45%)", 0.45)]:
+            act = m.addAction(("● " if abs(val - self._transport_opacity) < 0.02 else "   ") + label)
+            act.triggered.connect(lambda _=False, v=val: self._set_transport_opacity(v))
+        m.exec_(ov.mapToGlobal(_pos))
+
+    def _set_transport_opacity(self, val):
+        self._transport_opacity = val
+        ov = getattr(self, "_transport_overlay", None)
+        if ov:
+            ov.setWindowOpacity(val)
 
     def _float_transport(self, floating):
         """Move seek_bar + controls_bar between the docked layout and the floating
@@ -3640,7 +5688,13 @@ class MainWindow(QMainWindow):
             return
         h = 90  # seek (34) + controls (56)
         gx, gy, gw, gh = self._engine_global_rect()   # never engine.mapToGlobal (native child)
-        ov.setGeometry(gx, gy + gh - h, gw, h)
+        # Pill centrado em vez de ocupar a largura toda — "não tão comprido" e deixa
+        # ver mais do vídeo nos lados. Margem inferior pequena para flutuar.
+        pw = max(420, min(gw - 24, int(gw * 0.62)))
+        px = gx + (gw - pw) // 2
+        py = gy + gh - h - 10
+        ov.setGeometry(px, py, pw, h)
+        ov.setWindowOpacity(self._transport_opacity)
         ov.raise_()
 
     def _fs_activity(self):
@@ -3666,10 +5720,6 @@ class MainWindow(QMainWindow):
             return
         if ov:
             ov.hide()
-
-    def _toggle_tools(self):
-        self._tools_visible = not self._tools_visible
-        self.tools_wrap.setVisible(self._tools_visible)
 
     # ── Idioma da UI (escolhido pelo utilizador; qualquer língua via IA) ──
     def _change_ui_language(self, code):
@@ -3847,17 +5897,26 @@ class MainWindow(QMainWindow):
             self.chat.promote_word(entry.get("text", ""))
 
     def _on_overlay_ask(self, text):
-        """Called when user clicks the chat icon on a vocab overlay"""
-        # Send text to Chat IA
-        if hasattr(self, 'chat'):
-            self.chat.input.setText(T("chat_explain_prefix", text=text))
-            self.chat.input.setFocus()
+        """Called when user clicks the chat icon on a vocab overlay, or clicks
+        an underlined word in a subtitle/Twitch card. Sends the text DIRECTLY
+        to Chat IA as a query, not just fills the input box."""
+        if hasattr(self, 'chat') and text:
+            # Send directly as a chat message, not just filling the input
+            self.chat._add_msg(text, "user")
+            self.chat._messages.append({"role": "user", "content": text})
+            if len(self.chat._messages) > 20:
+                self.chat._messages = self.chat._messages[-20:]
+            self.chat._call_ai(text)
+            self.chat.welcome.hide()
             # Make sure chat is visible
             self.chat_toggle.setChecked(True)
             self.chat.setVisible(True)
 
-    def _remember_sub(self, text):
-        """Guarda a última legenda NÃO vazia — fonte da aba Pronúncia."""
+    def _remember_last_sub(self, text):
+        """Guarda a última legenda NÃO vazia — fonte da aba Pronúncia.
+        (Renomeado de _remember_sub: havia DOIS métodos com esse nome e o de 2 args
+        sobrepunha este, causando TypeError no sinal subtitle_changed → crash sob
+        pythonw, que não tem stderr para 'engolir' a exceção.)"""
         if text and text.strip():
             self._cur_sub = text.strip()
 
@@ -3870,6 +5929,21 @@ class MainWindow(QMainWindow):
         """Abre a aba Pronúncia para a legenda atual (não pausa o filme)."""
         self.word_details.hide()
         self.pron_panel.show_for(self._cur_sub, self._content_lang())
+        self._balance_left_dock()
+
+    def _speak_slow(self, text):
+        """Diz um texto (frase de cartão Twitch ou legenda) devagar, com voz neural
+        natural, na língua do filme. Usado pelo botão ♪ dos cartões e pelo chat."""
+        SLOW_TTS.speak(text, self._content_lang(), rate=-10)
+
+    def _speak_sub_slow(self, text=""):
+        """Pedido vindo do chat: ouvir uma legenda devagar. Usa o texto enviado; se
+        vazio, recorre à legenda atual do filme."""
+        line = (text or "").strip() or (self._cur_sub or self.engine._last_sub or "")
+        if line:
+            SLOW_TTS.speak(line, self._content_lang(), rate=-10)
+        else:
+            self._notify(T("need_sub_for_tool"))
 
     # ── Language-learning practice toggles (buttons + keyboard share these) ──
     def _toggle_loop(self):
@@ -3915,6 +5989,26 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'btn_ap'): self.btn_ap.setChecked(self._autopause_on)
         self._notify(T("autopause_on") if self._autopause_on else T("autopause_off"))
 
+    def _toggle_ai_loop(self):
+        if not self.engine.subs_loaded():
+            if hasattr(self, 'btn_ai_loop'): self.btn_ai_loop.setChecked(False)
+            self._notify(T("need_sub_for_tool")); return
+        on = not self.engine._ai_loop
+        self.engine.set_ai_loop(2 if on else 0)
+        if hasattr(self, 'btn_ai_loop'): self.btn_ai_loop.setChecked(on)
+        self.overlay._ai_loop_active = on
+        self.overlay._ai_loop_remaining = 2 if on else 0
+        self.overlay.update()
+        if on:
+            self._notify(T("ai_loop_on", n=self.engine._ai_loop_count))
+        else:
+            self._notify(T("ai_loop_off"))
+
+    def _on_ai_loop(self, remaining):
+        """Update overlay badge with remaining loops for current subtitle."""
+        self.overlay._ai_loop_remaining = remaining
+        self.overlay.update()
+
     def _toggle_hide_subs(self):
         if not self.engine.subs_loaded():
             if hasattr(self, 'btn_hide'): self.btn_hide.setChecked(False)
@@ -3923,6 +6017,389 @@ class MainWindow(QMainWindow):
         self.overlay.update()
         if hasattr(self, 'btn_hide'): self.btn_hide.setChecked(self.overlay._hide_subs)
         self._notify(T("subs_hidden") if self.overlay._hide_subs else T("subs_visible"))
+
+    # ── Exercícios encaixados na sidebar esquerda (já não são popups por cima do vídeo) ──
+    def _dock_exercise(self, w, on_close=None):
+        """Encaixa um exercício (antes era um QDialog modal) na sidebar esquerda, em vez
+        de o abrir por cima das legendas. Fecha qualquer exercício anterior. on_close (se
+        dado) corre quando o painel fecha — usado pelas missões da IA para retomar o filme."""
+        # Em ecrã inteiro / modo estudo não há sidebar à vista → mantém o exercício como
+        # janela modal por cima (senão o painel ficava escondido atrás do vídeo).
+        if getattr(self, "_study_mode", False) or self.isFullScreen():
+            try:
+                w.exec_()
+            finally:
+                if on_close:
+                    try: on_close()
+                    except Exception as e: log(f"ex on_close: {e}")
+            return
+        self._close_dock_exercise()
+        self._ex_current = w
+        self._ex_on_close = on_close
+        self.ex_host_lo.addWidget(w)
+        try: w.finished.connect(self._on_ex_finished)
+        except Exception: pass
+        self.ex_host.show()
+        w.show()
+        self._balance_left_dock()
+
+    def _on_ex_finished(self, *_a):
+        self._close_dock_exercise()
+
+    def _close_dock_exercise(self):
+        w = getattr(self, "_ex_current", None)
+        cb = getattr(self, "_ex_on_close", None)
+        self._ex_current = None
+        self._ex_on_close = None
+        if w is not None:
+            try: w.finished.disconnect(self._on_ex_finished)
+            except Exception: pass
+            try: self.ex_host_lo.removeWidget(w)
+            except Exception: pass
+            try: w.close()           # dispara closeEvent → cada exercício repõe o filme
+            except Exception: pass
+            try: w.setParent(None); w.deleteLater()
+            except Exception: pass
+        if hasattr(self, "ex_host"): self.ex_host.hide()
+        self._balance_left_dock()
+        if cb:
+            try: cb()
+            except Exception as e: log(f"ex on_close: {e}")
+
+    def _balance_left_dock(self):
+        """Reparte a altura da coluna esquerda pelos painéis visíveis. O exercício leva a
+        maior parte; detalhes/pronúncia ficam por baixo. Os escondidos são ignorados pelo
+        QSplitter, por isso quando só há um, ele ocupa a coluna toda."""
+        if hasattr(self, "left_dock"):
+            # ex_host, word_details, pron_panel — pesos (exercício maior).
+            self.left_dock.setSizes([1400, 900, 900])
+
+    def _open_exercise(self):
+        if not self.engine.subs_loaded() or not self.engine._last_sub:
+            self._notify(T("need_sub_for_tool")); return
+        self._dock_exercise(ExerciseDialog(self, self.engine))
+
+    def _open_fluency(self):
+        if not self.engine.subs_loaded():
+            self._notify(T("need_sub_for_tool")); return
+        self._dock_exercise(FluencyDialog(self, self.engine))
+
+    def _open_paraphrase(self):
+        if not self.engine.subs_loaded():
+            self._notify(T("need_sub_for_tool")); return
+        self._dock_exercise(ParaphraseDialog(self, self.engine))
+
+    def _open_describe_scene(self):
+        if not self.engine.subs_loaded():
+            self._notify(T("need_sub_for_tool")); return
+        self._dock_exercise(DescribeDialog(self, self.engine, mode="scene"))
+
+    def _open_describe_take(self):
+        if not self.engine.subs_loaded():
+            self._notify(T("need_sub_for_tool")); return
+        self._dock_exercise(DescribeDialog(self, self.engine, mode="take"))
+
+    def _open_dialogue(self):
+        if not self.engine.subs_loaded():
+            self._notify(T("need_sub_for_tool")); return
+        self._dock_exercise(DialogueDialog(self, self.engine))
+
+    def _toggle_listening(self):
+        """Toggle listening mode: hide subs + AI asks comprehension questions."""
+        if not self.engine.subs_loaded():
+            if hasattr(self, 'btn_listening'): self.btn_listening.setChecked(False)
+            self._notify(T("need_sub_for_tool")); return
+        self._listening_mode = not self._listening_mode
+        on = self._listening_mode
+        if hasattr(self, 'btn_listening'): self.btn_listening.setChecked(on)
+        if on:
+            # Hide subs automatically, reset counters
+            self.overlay._hide_subs = True
+            if hasattr(self, 'btn_hide'): self.btn_hide.setChecked(True)
+            self._listening_sub_count = 0
+            self._listening_pending = False
+            self._notify(T("listening_on"))
+        else:
+            self.overlay._hide_subs = False
+            if hasattr(self, 'btn_hide'): self.btn_hide.setChecked(False)
+            self._listening_pending = False
+            self._notify(T("listening_off"))
+        self.overlay.update()
+
+    def _on_sub_exited(self, idx):
+        """Called when a subtitle finishes playing. In listening mode, ask a question."""
+        if not self._listening_mode or self._listening_pending:
+            return
+        self._listening_sub_count += 1
+        if self._listening_sub_count < self._listening_interval:
+            return
+        self._listening_sub_count = 0
+        self._listening_pending = True
+        # Pause the video
+        try: self.engine._player.pause()
+        except: pass
+        self._notify(T("listening_paused"))
+        # Ask AI to generate a question about recent context
+        sub = self.engine._last_sub
+        if not sub:
+            self._listening_pending = False; return
+        self.chat._add_msg(T("listening_question"), "system")
+        self._ask_listening_question(sub)
+
+    def _ask_listening_question(self, sub):
+        """Generate a listening comprehension question in the chat."""
+        def work():
+            try:
+                from urllib.request import urlopen, Request
+                nat = native_language_name()
+                sys_p = (
+                    f"You are a listening comprehension tutor. "
+                    f"The user just heard this sentence (it was hidden): \"{sub}\".\n"
+                    f"Ask ONE short question in {nat} about what was said, to test if they "
+                    f"understood. Ask ONLY the question now (do not reveal the answer). "
+                    f"Tell them, in {nat}, to answer in the chat and then type 'continuar' "
+                    f"to resume the film. Keep it short and supportive.")
+                body = json.dumps({"model": "deepseek-chat", "max_tokens": 500, "temperature": 0.4,
+                    "messages": [{"role": "system", "content": sys_p}]}).encode()
+                r = urlopen(Request(f"{LEXIO_API}/api/deepseek-chat", data=body,
+                                    headers={"Content-Type": "application/json"}), timeout=45)
+                d = json.loads(r.read().decode())
+                resp = (d.get("text") or "").strip()
+                QTimer.singleShot(0, lambda: self._show_listening_q(resp))
+            except Exception as e:
+                log(f"listening: {e}")
+                QTimer.singleShot(0, lambda: setattr(self, '_listening_pending', False))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _show_listening_q(self, text):
+        q = text or T("listening_fallback_q")
+        self.chat._add_msg(q, "assistant")
+        # CRÍTICO: meter a pergunta no histórico do chat. Sem isto, a resposta do aluno
+        # era enviada à IA SEM a pergunta → a IA não tinha contexto e "a avaliação não
+        # funcionava". Agora o chat avalia a resposta com a pergunta no histórico.
+        try:
+            self.chat._messages.append({"role": "assistant", "content": q})
+        except Exception:
+            pass
+        # Mantém _listening_pending=True (vídeo pausado) até o aluno escrever "continuar"
+        # no chat — assim não se empilham perguntas enquanto ele responde.
+
+    def _on_chat_user_sent(self, text):
+        """Enquanto o modo Listening tem uma pergunta no ar (vídeo pausado), escrever
+        'continuar'/'continue' no chat retoma o filme. Qualquer outra coisa é a resposta
+        do aluno (avaliada pela IA do chat, que agora tem a pergunta no histórico)."""
+        if not self._listening_mode or not self._listening_pending:
+            return
+        norm = (text or "").strip().lower().strip(".!? ")
+        if norm in ("continuar", "continua", "continue", "próxima", "proxima", "next",
+                    "seguir", "segue", "avançar", "avancar"):
+            self._listening_pending = False
+            self._listening_sub_count = 0
+            try: self.engine.play()
+            except Exception: pass
+            self._notify(T("listening_resumed"))
+
+    def _toggle_focus_mode(self):
+        """Scene Agent removido — esta ação (e a tecla M) já não faz nada. Mantida só
+        para não partir ligações antigas (keybinding). Os exercícios passaram a ser
+        todos manuais (botões da barra de prática)."""
+        return
+
+    def _generate_auto_captions(self):
+        """Generate speech-to-text captions from the video's audio track using
+        faster-whisper. Creates SubEntry objects with timestamps and loads them
+        into the engine, where the existing overlay colours/synchronizes them."""
+        vid = self.video_path
+        if not vid:
+            self._notify(T("stt_no_video")); return
+        self.btn_stt.setEnabled(False)
+        self.btn_stt.setText(T("stt_loading"))
+        import av, tempfile, os, time as _time
+        from faster_whisper import WhisperModel
+
+        def _work():
+            try:
+                log(f"stt: starting transcription for {vid}")
+                # 1) Extract audio via PyAV → WAV temp file
+                container = av.open(vid)
+                audio_stream = next((s for s in container.streams if s.type == "audio"), None)
+                if audio_stream is None:
+                    raise RuntimeError("No audio stream in video")
+                sr = audio_stream.codec_context.sample_rate or 16000
+                tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+                tmp_path = tmp.name; tmp.close()
+                # Decode audio to WAV with PyAV
+                out_container = av.open(tmp_path, mode="w", format="wav")
+                out_stream = out_container.add_stream("pcm_s16le", rate=16000)
+                out_stream.channels = 1
+                out_stream.layout = "mono"
+                for frame in container.decode(audio=0):
+                    frame.pts = None
+                    for packet in out_stream.encode(frame):
+                        out_container.mux(packet)
+                for packet in out_stream.encode(None):
+                    out_container.mux(packet)
+                out_container.close()
+                container.close()
+                log(f"stt: audio extracted to {tmp_path}")
+
+                # 2) Transcribe with faster-whisper
+                model = WhisperModel("tiny", device="cpu", compute_type="int8")
+                segments, info = model.transcribe(tmp_path, beam_size=5,
+                    language=None, vad_filter=True)
+                log(f"stt: detected lang={info.language} (p={info.language_probability:.2f})")
+
+                # 3) Build SubEntry list from segments
+                subs = []
+                for seg in segments:
+                    text = seg.text.strip()
+                    if text:
+                        subs.append(SubEntry(seg.start, seg.end, text))
+                # Cleanup temp file
+                try: os.unlink(tmp_path)
+                except: pass
+                log(f"stt: {len(subs)} subtitles generated")
+
+                if not subs:
+                    QTimer.singleShot(0, lambda: self._stt_fail(T("stt_failed")))
+                    return
+
+                # 4) Load into engine (replaces existing subtitles)
+                self.engine._subs = subs
+                self.engine._played_ids = set()
+                self.engine._last_sub = ""
+                self.engine._last_sub_idx = -1
+                self.engine.show_subtitle_reset()
+                log(f"stt: loaded {len(subs)} subs into engine")
+
+                QTimer.singleShot(0, lambda: self._stt_done(len(subs)))
+            except Exception as e:
+                log(f"stt FALHOU: {type(e).__name__}: {e}")
+                try: os.unlink(tmp_path)
+                except: pass
+                QTimer.singleShot(0, lambda: self._stt_fail(str(e)))
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _stt_done(self, count):
+        """Called on STT success — restore button and notify."""
+        if hasattr(self, 'btn_stt'):
+            self.btn_stt.setEnabled(True)
+            self.btn_stt.setText(T("stt_btn"))
+        self._notify(T("stt_done", n=count))
+
+    def _stt_fail(self, err):
+        """Called on STT failure — restore button and notify."""
+        if hasattr(self, 'btn_stt'):
+            self.btn_stt.setEnabled(True)
+            self.btn_stt.setText(T("stt_btn"))
+        self._notify(str(err))
+
+    def _segment_subs(self):
+        """Call the AI to analyse subtitles and return thematic segments."""
+        subs = self.engine._subs
+        if not subs:
+            self._notify(T("track_no_sub")); return
+        if hasattr(self, 'btn_segment'):
+            self.btn_segment.setEnabled(False)
+            self.btn_segment.setText(T("track_loading"))
+        if hasattr(self, 'tw_empty'):
+            self.tw_empty.setText(T("track_loading"))
+        # Build subtitle text with indices for the AI
+        lines = []
+        for i, s in enumerate(subs):
+            ts = datetime.utcfromtimestamp(s.start).strftime('%H:%M:%S')
+            te = datetime.utcfromtimestamp(s.end).strftime('%H:%M:%S')
+            lines.append(f"[{i}] {ts}-{te} {s.text}")
+        full = "\n".join(lines)
+        # Truncate if too long (token limit)
+        if len(full) > 12000:
+            # Keep evenly spaced samples
+            step = max(1, len(subs) // 200)
+            sampled = "\n".join(full.split("\n")[::step])
+            full = sampled
+        def work():
+            try:
+                from urllib.request import urlopen, Request
+                from urllib.error import HTTPError
+                nat = native_language_name()
+                sys_p = (
+                    f"You are a content analyst. Given subtitle entries of a video, "
+                    f"group them into 3-8 thematic segments. Respond ONLY with JSON:\n"
+                    '{"segments":[{"title":"<segment title in ' + nat + '>",'
+                    '"start_idx":<int>,"end_idx":<int>}]}\n'
+                    "Rules:\n"
+                    "- start_idx and end_idx are the [i] index numbers shown.\n"
+                    "- Segments must cover ALL subtitle entries exactly (no gaps, no overlap).\n"
+                    "- The first segment must start at the first index, the last must end at the last.\n"
+                    "- Each title (in " + nat + ") must be 2-5 words describing that segment's topic.\n"
+                    f"- Max 8 segments.\n"
+                    f"Subtitle data ({len(subs)} entries):\n{full[:10000]}")
+                body = json.dumps({"model": "deepseek-chat", "max_tokens": 800, "temperature": 0.1,
+                    "messages": [{"role": "system", "content": sys_p},
+                                 {"role": "user", "content": "Analyse these subtitles and return segments in JSON."}]}).encode()
+                r = urlopen(Request(f"{LEXIO_API}/api/deepseek-chat", data=body,
+                                    headers={"Content-Type": "application/json"}), timeout=60)
+                d = json.loads(r.read().decode())
+                raw = (d.get("text") or "").strip().strip("`")
+                parsed = json.loads(raw[raw.find("{"):raw.rfind("}")+1])
+                segs = parsed.get("segments", [])
+                for sg in segs:
+                    sg["start_idx"] = max(0, min(sg["start_idx"], len(subs)-1))
+                    sg["end_idx"] = max(sg["start_idx"], min(sg["end_idx"], len(subs)-1))
+                self._tracks = segs
+                # Deliver to GUI thread
+                if segs:
+                    QTimer.singleShot(0, self._populate_tracks)
+                else:
+                    QTimer.singleShot(0, lambda: self._track_fail("Empty response"))
+            except Exception as e:
+                log(f"segment err: {e}")
+                QTimer.singleShot(0, lambda: self._track_fail(str(e)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _populate_tracks(self):
+        if hasattr(self, 'btn_segment'):
+            self.btn_segment.setEnabled(True)
+            self.btn_segment.setText(T("track_segment"))
+        if hasattr(self, 'tw_list') and hasattr(self, 'tw_empty'):
+            self.tw_list.clear()
+            for i, t in enumerate(self._tracks):
+                subs = self.engine._subs
+                start_s = subs[t["start_idx"]].start if subs else 0
+                end_s = subs[t["end_idx"]].end if subs and t["end_idx"] < len(subs) else subs[-1].end if subs else 0
+                st = datetime.utcfromtimestamp(start_s).strftime('%M:%S')
+                et = datetime.utcfromtimestamp(end_s).strftime('%M:%S')
+                count = t["end_idx"] - t["start_idx"] + 1
+                item = QListWidgetItem(f"{t['title']}  ({st}–{et})  [{count} lines]")
+                item.setData(Qt.UserRole, t["start_idx"])
+                self.tw_list.addItem(item)
+            self.tw_empty.setText("")
+            # Switch to Tracks tab
+            for i in range(self.tabs.count()):
+                if self.tabs.tabText(i) == T("tab_tracks"):
+                    self.tabs.setCurrentIndex(i)
+                    break
+            self._notify(f'{len(self._tracks)} {T("tab_tracks")}')
+
+    def _track_fail(self, err):
+        if hasattr(self, 'btn_segment'):
+            self.btn_segment.setEnabled(True)
+            self.btn_segment.setText(T("track_segment"))
+        if hasattr(self, 'tw_empty'):
+            self.tw_empty.setText(T("track_failed"))
+        self._notify(T("track_failed"))
+
+    def _track_clicked(self, row):
+        if row < 0 or row >= len(self._tracks):
+            return
+        idx = self._tracks[row].get("start_idx", 0)
+        subs = self.engine._subs
+        if idx < len(subs):
+            self.engine.seek(subs[idx].start)
+            if not self.engine._player or not self.engine._player.is_playing():
+                try: self.engine._player.play()
+                except: pass
 
     def _notify(self, msg):
         """Feedback the user can actually SEE: a flash on the video (works in
@@ -3945,6 +6422,122 @@ class MainWindow(QMainWindow):
         if self._seeking: return
         self.tlbl.setText(FMT(p))
         self.seek.blockSignals(True); self.seek.setValue(int(p)); self.seek.blockSignals(False)
+        self._scene_check(p)
+
+    # ── Scene Agent: a IA pausa o filme em cenas-chave e pede uma ação ──
+    def _scene_intensity(self):
+        return {"light": "light", "balanced": "balanced", "god": "god"}.get(self._scene_mode)
+
+    def _scene_build_if_needed(self):
+        if not scene_agent or self._scene_mode == "off":
+            return
+        subs = getattr(self.engine, "_subs", [])
+        if not subs:
+            return
+        key = (len(subs), self._scene_mode, round(subs[0].start, 1) if subs else 0)
+        if key == self._scene_subs_key:
+            return
+        try:
+            self._scene_missions = scene_agent.build_scene_missions(subs, self._scene_intensity())
+            self._scene_subs_key = key
+            log(f"scene agent: {len(self._scene_missions)} missões ({self._scene_mode})")
+        except Exception as e:
+            log(f"scene build: {e}")
+            self._scene_missions = []
+
+    def _scene_check(self, p):
+        if (not scene_agent or self._scene_mode == "off" or self._in_mission
+                or not self.engine.is_playing()):
+            return
+        self._scene_build_if_needed()
+        if not self._scene_missions:
+            return
+        for m in self._scene_missions:
+            if m.id in self._scene_done:
+                continue
+            if m.timestamp <= p <= m.timestamp + 1.4:
+                self._scene_done.add(m.id)
+                self._start_mission(m)
+                break
+
+    def _start_mission(self, m):
+        self._in_mission = True
+        # Os exercícios próprios do player (Fluência, Paráfrase, Descrever cena/take)
+        # têm UI e avaliação dedicadas — a IA tece-os no filme, mas abrem o seu
+        # próprio painel (que trata sozinho do loop/pause/visão).
+        if getattr(m, "kind", "") in _PLAYER_EXERCISE_KINDS:
+            self._run_exercise_mission(m)   # gere o _in_mission no fecho do painel
+            return
+        try:
+            if self.engine.is_playing():
+                self.engine.toggle()   # pausa
+        except Exception:
+            pass
+        try:
+            native = native_language_name() or "pt"
+        except Exception:
+            native = "pt"
+        try:
+            target = self._content_lang() or "en"
+        except Exception:
+            target = "en"
+        ctx = {"native": native, "target": target, "level": "B1"}
+        auth = None
+        try:
+            auth = self.chat._get_token_header()
+        except Exception:
+            pass
+
+        def _resume():
+            self._in_mission = False
+            try:
+                if not self.engine.is_playing():
+                    self.engine.toggle()   # retoma
+            except Exception:
+                pass
+        # Encaixa na sidebar (não tapa as legendas); retoma o filme quando fechar.
+        try:
+            dlg = SceneMissionDialog(self, m, ctx, auth)
+            self._dock_exercise(dlg, on_close=_resume)
+        except Exception as e:
+            log(f"mission dialog: {e}")
+            _resume()
+
+    def _run_exercise_mission(self, m):
+        """Abre o exercício próprio do player correspondente ao tipo de missão, encaixado
+        na sidebar (já não é popup). O painel lê a cena a partir da posição atual (o filme
+        está na cena da missão) e trata sozinho do loop/pause/visão. Retomamos a
+        reprodução quando o painel fecha, se estava a tocar."""
+        was_playing = self.engine.is_playing()
+        try:
+            self.engine.pause()   # assenta na cena; os painéis gerem o resto
+        except Exception:
+            pass
+        kind = getattr(m, "kind", "")
+
+        def _resume():
+            self._in_mission = False
+            try:
+                if was_playing and not self.engine.is_playing():
+                    self.engine.play()
+            except Exception:
+                pass
+        try:
+            if kind == "fluency_translate":
+                w = FluencyDialog(self, self.engine)
+            elif kind == "paraphrase_line":
+                w = ParaphraseDialog(self, self.engine)
+            elif kind == "describe_take":
+                w = DescribeDialog(self, self.engine, mode="take")
+            elif kind == "dialogue_roleplay":
+                w = DialogueDialog(self, self.engine)
+            else:   # describe_scene
+                w = DescribeDialog(self, self.engine, mode="scene")
+            self._dock_exercise(w, on_close=_resume)
+        except Exception as e:
+            log(f"exercise mission ({kind}): {e}")
+            _resume()
+
     def _on_dur(self, d):
         self.dlbl.setText(FMT(d)); self.seek.setRange(0, max(1, int(d)))
     def _on_end(self):
@@ -3964,6 +6557,10 @@ class MainWindow(QMainWindow):
     def _open_file(self, path):
         if not path or not Path(path).exists(): return
         self.engine.stop(); self.video_path = path
+        # Limpa já a legenda/cartões do filme anterior, antes de o novo vídeo arrancar,
+        # para não ficarem "colados" sobre o novo (bug das legendas congeladas).
+        self.overlay.reset_for_new_video()
+        self.engine.show_subtitle_reset()
         self._roll_session(Path(path).name)   # envia a sessão anterior, começa nova
         self.seek.clear_marks()
         self._add_recent(path)
@@ -4215,6 +6812,7 @@ class MainWindow(QMainWindow):
         Qt.Key_Space, Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down,
         Qt.Key_B, Qt.Key_N, Qt.Key_P, Qt.Key_R, Qt.Key_Comma, Qt.Key_Period,
         Qt.Key_Z, Qt.Key_L, Qt.Key_X, Qt.Key_H, Qt.Key_F, Qt.Key_C, Qt.Key_Escape,
+        Qt.Key_M, Qt.Key_K, Qt.Key_J, Qt.Key_G,
     })
 
     def eventFilter(self, obj, event):
@@ -4254,6 +6852,15 @@ class MainWindow(QMainWindow):
         elif k == Qt.Key_L: self._toggle_loop()                  # L  loop A-B da frase
         elif k == Qt.Key_X: self._toggle_autopause()             # X  auto-pausa (shadowing)
         elif k == Qt.Key_H: self._toggle_hide_subs()             # H  esconder legenda (recall)
+        elif k == Qt.Key_M: self._toggle_focus_mode()            # M  modo Focado/Leve
+        elif k == Qt.Key_K: self._toggle_ai_loop()               # K  AI Loop (cada frase repete N vezes)
+        elif k == Qt.Key_J: self._open_exercise()                # J  Exercício sobre a legenda atual
+        elif k == Qt.Key_U: self._open_fluency()                 # U  Fluência (traduzir grupo de legendas)
+        elif k == Qt.Key_Y: self._open_paraphrase()              # Y  Paráfrase (reescrever a linha atual)
+        elif k == Qt.Key_D: self._open_describe_scene()          # D  Descrever cena (loop)
+        elif k == Qt.Key_T: self._open_describe_take()           # T  Descrever take (pause)
+        elif k == Qt.Key_I: self._open_dialogue()                # I  Diálogo (role-play falado)
+        elif k == Qt.Key_G: self._toggle_listening()             # G  Modo Listening
         elif k == Qt.Key_O and (e.modifiers() & Qt.ControlModifier): self._open()
         elif k == Qt.Key_F: self._toggle_fs()
         elif k == Qt.Key_Escape:
@@ -4345,7 +6952,7 @@ def main():
         # default renders nearly invisible on the black theme.
         app.setStyleSheet(
             "QToolTip{background:#1c1c1c;color:#fafafa;border:1px solid #3a3a3a;"
-            "padding:5px 9px;border-radius:6px;font-size:11px;font-family:'Inter';}")
+            "padding:5px 9px;border-radius:6px;font-size:11px;font-family:'Inter','Segoe UI',sans-serif;}")
         # Load the bundled Inter font (same as the web app) and use it everywhere
         try:
             from PyQt5.QtGui import QFontDatabase
@@ -4377,6 +6984,16 @@ def main():
             log(f"dark titlebar failed: {_e}")
         w.show()
         log("window.show() OK")
+        # Garante que a língua atual da UI — mesmo as não-embutidas (ex.: Farsi) —
+        # tem TODAS as strings: preenche em background, na cache, só as chaves que
+        # faltarem (ex.: exercícios novos) e avisa para reiniciar se preencheu algo.
+        def _ui_topup():
+            try:
+                if topup_ui_via_ai(i18n.current_lang()):
+                    QTimer.singleShot(0, lambda: showToast(T("lang_topup_ready"), "accent", 5000))
+            except Exception as _e:
+                log(f"ui topup startup: {_e}")
+        threading.Thread(target=_ui_topup, daemon=True).start()
         sys.exit(app.exec_())
     except Exception as e:
         err = f"FATAL: {e}\n{traceback.format_exc()}"
