@@ -72,15 +72,16 @@ if not _VLC_PATH:
 
 # ── Imports with early error display ──
 try:
-    from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QPropertyAnimation, QEasingCurve, QRect, QRectF, QPoint, QSize, QUrl, QEvent, QFileInfo
+    from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QPropertyAnimation, QEasingCurve, QRect, QRectF, QPoint, QSize, QUrl, QEvent, QFileInfo
     from PyQt5.QtGui import QPixmap, QPainter, QColor, QPen, QFont, QIcon, QCursor, QRadialGradient, QLinearGradient, QFontMetrics, QFontInfo
     from PyQt5.QtWidgets import (
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
         QLabel, QPushButton, QSlider, QFileDialog, QListWidget, QListWidgetItem,
         QMenu, QMessageBox, QTextEdit, QLineEdit,
-        QTabWidget, QStatusBar, QScrollArea, QSizePolicy, QDialog,
-        QGraphicsOpacityEffect, QStyle, QStyleOptionSlider, QFileIconProvider, QComboBox,
-        QLayout, QWidgetItem, QSplitter
+        QTabWidget, QTabBar, QStatusBar, QScrollArea, QSizePolicy, QDialog,
+        QGraphicsOpacityEffect, QStyle, QStyleOptionSlider, QStyleOptionTab,
+        QProxyStyle, QFileIconProvider, QComboBox,
+        QLayout, QWidgetItem, QSplitter, QSystemTrayIcon, QCheckBox, QSpinBox
     )
     from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEngineProfile, QWebEnginePage
     from PyQt5.QtWebChannel import QWebChannel
@@ -117,12 +118,13 @@ ACC_HOVER = "#cfcfcf"  # dimmer white on hover
 ON_ACC = "#000000"   # text/icon ON white accent
 
 APP_NAME = "Lexio Study Player"
-APP_VERSION = "3.9.5"
+APP_VERSION = "3.16.0"
 log(f"=== LEXIO PLAYER v{APP_VERSION} ===")  # versão REAL (o banner de cima já não tem versão hardcoded)
 DATA_DIR = Path.home() / '.lexio-player'; DATA_DIR.mkdir(exist_ok=True)
 RECENT_FILE = DATA_DIR / 'recent.json'
 STUDY_FILE = DATA_DIR / 'study-data.json'
 TOKEN_FILE = DATA_DIR / 'auth-token.json'
+REMINDER_FILE = DATA_DIR / 'reminder.json'
 
 SUPPORTED_VID = {'.mp4','.avi','.mkv','.mov','.wmv','.flv','.webm','.m4v','.mpg','.mpeg','.3gp','.ogv','.ts','.mts'}
 SUPPORTED_AUD = {'.mp3','.wav','.flac','.ogg','.m4a','.aac','.wma'}
@@ -142,12 +144,47 @@ EDGE_VOICES = {
 }
 
 
-def speak_edge_tts(text, lang="en", rate=0):
-    """Gera um mp3 com voz NEURAL Microsoft (edge-tts, Python) e devolve o caminho.
-    rate: percentagem de velocidade -50..+50 (negativo = mais devagar) p/ a aba
-    de pronúncia. 0/None = velocidade normal. Devolve None se falhar (offline)."""
+def _backend_tts(text, lang="en", rate=0):
+    """Pede a voz NEURAL ao backend (/api/tts, edge-tts do lado do servidor) e
+    grava o mp3. É a fonte PRIMÁRIA: o edge-tts LOCAL apanhava 403 da Microsoft
+    em muitas redes (daí a 'voz robótica' do fallback SAPI). O servidor não apanha
+    esse 403, por isso a voz natural passa a sair sempre que há internet."""
     if not text or not text.strip():
         return None
+    try:
+        import tempfile, urllib.request
+        mult = 1.0 + (max(-50, min(50, int(rate))) / 100.0) if rate else 1.0
+        body = json.dumps({"text": text.strip(), "languageCode": (lang or "en")[:2],
+                           "rate": mult}).encode()
+        req = urllib.request.Request(f"{LEXIO_API}/api/tts", data=body,
+                                     headers={"Content-Type": "application/json",
+                                              "User-Agent": APP_NAME})
+        r = urllib.request.urlopen(req, timeout=20)
+        d = json.loads(r.read().decode())
+        b64 = d.get("audioBase64")
+        if not b64:
+            log(f"backend tts: sem áudio ({d.get('error')})")
+            return None
+        import base64
+        out = os.path.join(tempfile.gettempdir(), f"lexio_tts_be_{int(time.time()*1000)}.mp3")
+        with open(out, "wb") as f:
+            f.write(base64.b64decode(b64))
+        if os.path.exists(out) and os.path.getsize(out) > 0:
+            return out
+    except Exception as e:
+        log(f"backend tts: {e}")
+    return None
+
+
+def speak_edge_tts(text, lang="en", rate=0):
+    """Gera um mp3 com voz NEURAL Microsoft e devolve o caminho. Tenta PRIMEIRO o
+    backend (servidor, sem 403) e só depois o edge-tts local. rate: percentagem de
+    velocidade -50..+50 (negativo = mais devagar). 0/None = normal. None se falhar."""
+    if not text or not text.strip():
+        return None
+    be = _backend_tts(text, lang, rate)   # voz natural fiável (servidor)
+    if be:
+        return be
     import asyncio, tempfile
     try:
         import edge_tts
@@ -383,55 +420,113 @@ def _openrouter_key():
         pass
     return ""
 
-def call_vision(prompt, system="", images=None, model="google/gemini-2.0-flash-001",
-                max_tokens=700, temperature=0.3, json_mode=True, timeout=75):
-    """Chama um modelo de visão. Tenta o backend partilhado /api/vision (chave no
-    servidor); se falhar e houver chave OpenRouter local, chama o OpenRouter
-    diretamente. Devolve o texto da resposta (string) ou levanta exceção."""
-    images = images or []
-    # 1) Backend partilhado (preferido — chave fica no servidor).
-    try:
-        body = json.dumps({
-            "prompt": prompt, "system": system, "json": json_mode,
-            "model": model, "maxTokens": max_tokens, "temperature": temperature,
-            "images": images,
-        }).encode()
-        r = urlopen(Request(f"{LEXIO_API}/api/vision", data=body,
-                            headers={"Content-Type": "application/json"}), timeout=timeout)
-        d = json.loads(r.read().decode())
-        txt = (d.get("text") or "").strip()
-        if txt:
-            return txt
-        raise RuntimeError("empty /api/vision response")
-    except Exception as e:
-        log(f"vision via backend falhou: {e}")
-    # 2) Fallback: OpenRouter direto (chave local).
-    key = _openrouter_key()
-    if not key:
-        raise RuntimeError("no OpenRouter key for direct vision")
+# Modelos de VISÃO GRATUITOS no OpenRouter (custo $0). Tenta-se vários por ordem
+# porque a disponibilidade dos ":free" varia ao longo do tempo — o 1º que responder
+# ganha. Assim as avaliações com imagem funcionam sem custos.
+FREE_VISION_MODELS = [
+    # IDs verificados em 2026-06 (os antigos llama-3.2-vision/qwen2.5-vl/gemini-2.0
+    # foram removidos do OpenRouter → davam 404). O nemotron-vl responde de imediato;
+    # os gemma-4 servem de reforço quando o 1º estiver rate-limited (429).
+    "nvidia/nemotron-nano-12b-v2-vl:free",
+    "google/gemma-4-31b-it:free",
+    "google/gemma-4-26b-a4b-it:free",
+]
+
+def _vision_image_content(prompt, images):
+    """Monta o array `content` (texto + imagens) no formato OpenAI/multimodal."""
     content = [{"type": "text", "text": prompt}]
-    for img in images:
+    for img in (images or []):
         data = img.get("data") if isinstance(img, dict) else None
         if data:
             mime = (img.get("mimeType") or "image/jpeg")
             url = data if str(data).startswith("data:") else f"data:{mime};base64,{data}"
             content.append({"type": "image_url", "image_url": {"url": url}})
+    return content
+
+
+def _pollinations_vision(prompt, system, images, max_tokens, temperature, timeout):
+    """Visão GRÁTIS e SEM CHAVE via Pollinations (endpoint OpenAI-compatible, modelo
+    multimodal). É a via que faz a análise da imagem funcionar sem o utilizador
+    configurar absolutamente nada."""
     messages = []
     if system:
         messages.append({"role": "system", "content": system})
-    messages.append({"role": "user", "content": content})
-    payload = {"model": model, "messages": messages, "max_tokens": max_tokens,
-               "temperature": temperature}
-    if json_mode:
-        payload["response_format"] = {"type": "json_object"}
-    r = urlopen(Request("https://openrouter.ai/api/v1/chat/completions",
+    messages.append({"role": "user", "content": _vision_image_content(prompt, images)})
+    payload = {"model": "openai", "messages": messages, "max_tokens": max_tokens,
+               "temperature": temperature, "referrer": "lexio-player"}
+    r = urlopen(Request("https://text.pollinations.ai/openai",
                         data=json.dumps(payload).encode(),
-                        headers={"Content-Type": "application/json",
-                                 "Authorization": f"Bearer {key}",
-                                 "HTTP-Referer": "https://lexio.app",
-                                 "X-Title": "Lexio Player"}), timeout=timeout)
-    d = json.loads(r.read().decode())
-    return (((d.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
+                        headers={"Content-Type": "application/json"}), timeout=timeout)
+    raw = r.read().decode()
+    try:
+        d = json.loads(raw)
+        txt = (((d.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
+        return txt or raw.strip()
+    except Exception:
+        # Alguns endpoints devolvem texto puro em vez de JSON OpenAI.
+        return raw.strip()
+
+
+def call_vision(prompt, system="", images=None, model=None,
+                max_tokens=700, temperature=0.3, json_mode=True, timeout=75):
+    """Análise de imagem GRATUITA e sem configuração. Ordem:
+      1) Pollinations (grátis, SEM chave) — funciona logo, zero setup;
+      2) backend partilhado /api/vision (chave no servidor);
+      3) OpenRouter direto, SE o utilizador tiver posto uma chave local (modelos :free).
+    Devolve o texto da resposta ou levanta exceção com o resumo dos erros."""
+    images = images or []
+    models = ([model] if model else []) + [m for m in FREE_VISION_MODELS if m != model]
+    errors = []
+    # 1) Pollinations — keyless, a via principal (o utilizador não configura nada).
+    try:
+        txt = _pollinations_vision(prompt, system, images, max_tokens, temperature, min(timeout, 60))
+        if txt:
+            return txt
+        errors.append("pollinations: empty")
+    except Exception as e:
+        errors.append(f"pollinations: {e}"); log(f"vision pollinations falhou: {e}")
+    # 2) Backend partilhado (chave no servidor; envia a lista p/ fallbacks gratuitos).
+    try:
+        body = json.dumps({
+            "prompt": prompt, "system": system, "json": json_mode,
+            "model": models[0], "models": models,
+            "maxTokens": max_tokens, "temperature": temperature,
+            "images": images,
+        }).encode()
+        r = urlopen(Request(f"{LEXIO_API}/api/vision", data=body,
+                            headers={"Content-Type": "application/json"}), timeout=min(timeout, 60))
+        d = json.loads(r.read().decode())
+        txt = (d.get("text") or "").strip()
+        if txt:
+            return txt
+        errors.append("backend: empty")
+    except Exception as e:
+        errors.append(f"backend: {e}"); log(f"vision via backend falhou: {e}")
+    # 3) OpenRouter direto (só se houver chave local) — modelos :free, sem
+    #    response_format (alguns :free rejeitam-no; o prompt já pede JSON).
+    key = _openrouter_key()
+    if key:
+        content = _vision_image_content(prompt, images)
+        messages = ([{"role": "system", "content": system}] if system else []) + \
+                   [{"role": "user", "content": content}]
+        for m in models:
+            try:
+                payload = {"model": m, "messages": messages, "max_tokens": max_tokens,
+                           "temperature": temperature}
+                r = urlopen(Request("https://openrouter.ai/api/v1/chat/completions",
+                                    data=json.dumps(payload).encode(),
+                                    headers={"Content-Type": "application/json",
+                                             "Authorization": f"Bearer {key}",
+                                             "HTTP-Referer": "https://lexio.app",
+                                             "X-Title": "Lexio Player"}), timeout=timeout)
+                d = json.loads(r.read().decode())
+                txt = (((d.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
+                if txt:
+                    return txt
+                errors.append(f"{m}: empty")
+            except Exception as e:
+                errors.append(f"{m}: {e}"); log(f"vision {m} falhou: {e}")
+    raise RuntimeError("vision failed — " + "; ".join(errors[:4]))
 
 set_lang(load_ui_lang())   # aplica antes de construir a UI
 set_native(load_ui_lang())  # conteúdo (dicionário/chat) na língua escolhida; conta pode sobrepor no login
@@ -439,6 +534,41 @@ set_native(load_ui_lang())  # conteúdo (dicionário/chat) na língua escolhida;
 def FMT(sec):
     s = max(0, int(sec)); h,s = divmod(s,3600); m,s = divmod(s,60)
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+class _GuiInvoker(QObject):
+    """Corre um callable na thread da GUI. NECESSÁRIO porque gui_call(fn)
+    NÃO dispara a partir de threads worker (sem event loop) — bug que fazia os
+    resultados dos exercícios/segmentação/STT nunca aparecerem. A conexão é Queued,
+    por isso adia sempre para o event loop (igual ao singleShot(0)), venha de onde vier."""
+    _run = pyqtSignal(object)
+
+    def __init__(self):
+        super().__init__()
+        self._run.connect(self._on_run, Qt.QueuedConnection)
+
+    def _on_run(self, fn):
+        try:
+            fn()
+        except Exception as e:
+            log(f"gui_call: {e}")
+
+    def call(self, fn):
+        self._run.emit(fn)
+
+
+_GUI_INVOKER = None
+
+def ensure_gui_invoker():
+    """Cria o invocador NA THREAD ATUAL (deve ser a main/GUI). Chamado cedo no arranque."""
+    global _GUI_INVOKER
+    if _GUI_INVOKER is None:
+        _GUI_INVOKER = _GuiInvoker()
+    return _GUI_INVOKER
+
+def gui_call(fn):
+    """Agenda `fn` para correr na thread da GUI. Substitui gui_call(fn)."""
+    ensure_gui_invoker().call(fn)
 
 def yt_btn(text="", icon="", tip="", accent=False, small=False):
     b = QPushButton(icon + (" " + text if icon else text))
@@ -484,11 +614,12 @@ def showToast(msg, style="", duration=2000):
 # ═══════════════════════════════════════════════════════════════════════════
 
 class FlowLayout(QLayout):
-    def __init__(self, parent=None, margin=0, hspacing=6, vspacing=6):
+    def __init__(self, parent=None, margin=0, hspacing=6, vspacing=6, center=False):
         super().__init__(parent)
         self._items = []
         self._hsp = hspacing
         self._vsp = vspacing
+        self._center = center   # centrar cada linha horizontalmente (estilo media player)
         if parent is not None:
             self.setContentsMargins(margin, margin, margin, margin)
 
@@ -530,22 +661,37 @@ class FlowLayout(QLayout):
 
     def _do(self, rect, test):
         m = self.contentsMargins()
-        x = rect.x() + m.left()
-        y = rect.y() + m.top()
+        left = rect.x() + m.left()
         right = rect.right() - m.right()
-        line_h = 0
+        avail = right - left
+        y = rect.y() + m.top()
+        # 1ª passagem: agrupar os itens em linhas (respeitando a quebra) para,
+        # quando _center, sabermos a largura de cada linha e a podermos centrar.
+        rows = []        # [[(item, w, h), ...], ...]
+        cur = []; cur_w = 0
         for it in self._items:
-            w = it.sizeHint().width()
-            h = it.sizeHint().height()
-            if x + w > right and line_h > 0:
-                x = rect.x() + m.left()
-                y += line_h + self._vsp
-                line_h = 0
-            if not test:
-                it.setGeometry(QRect(QPoint(x, y), it.sizeHint()))
-            x += w + self._hsp
-            line_h = max(line_h, h)
-        return y + line_h - rect.y() + m.bottom()
+            w = it.sizeHint().width(); h = it.sizeHint().height()
+            need = w if not cur else cur_w + self._hsp + w
+            if cur and need > avail:
+                rows.append(cur); cur = []; cur_w = 0
+                need = w
+            cur.append((it, w, h)); cur_w = need
+        if cur:
+            rows.append(cur)
+        # 2ª passagem: posicionar.
+        for row in rows:
+            row_w = sum(w for _it, w, _h in row) + self._hsp * (len(row) - 1)
+            x = left + max(0, (avail - row_w) // 2) if self._center else left
+            line_h = 0
+            for it, w, h in row:
+                if not test:
+                    it.setGeometry(QRect(QPoint(x, y), it.sizeHint()))
+                x += w + self._hsp
+                line_h = max(line_h, h)
+            y += line_h + self._vsp
+        if rows:
+            y -= self._vsp
+        return y - rect.y() + m.bottom()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -563,6 +709,13 @@ class SeekSlider(QSlider):
     def __init__(self, *a, **k):
         super().__init__(*a, **k)
         self._marks = {}   # label -> value (in slider units, i.e. seconds)
+        self._track_segs = []  # [(start_frac, end_frac, done_bool)] — aulas/tracks
+
+    def set_track_segs(self, segs):
+        """Marca as fronteiras dos tracks (aulas) no groove; segmentos concluídos
+        ganham um sublinhado verde."""
+        self._track_segs = segs or []
+        self.update()
 
     def set_mark(self, key, value):
         if value is None:
@@ -589,12 +742,26 @@ class SeekSlider(QSlider):
 
     def paintEvent(self, e):
         super().paintEvent(e)
-        if not self._marks or self.maximum() <= self.minimum():
+        if self.maximum() <= self.minimum():
             return
         from PyQt5.QtGui import QPainter, QColor, QFont
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         h = self.height()
+        # ── Fronteiras dos tracks/aulas: tracinho em cada início; segmento concluído
+        # ganha uma barra verde por baixo do groove. ──
+        if self._track_segs:
+            mx = self.maximum()
+            for sf, ef, done in self._track_segs:
+                xs = int(self._x_for(sf * mx))
+                xe = int(self._x_for(ef * mx))
+                p.fillRect(QRect(xs, 2, 1, h - 4), QColor(255, 255, 255, 60))
+                if done:
+                    p.fillRect(QRect(xs, h // 2 + 3, max(2, xe - xs), 3),
+                               QColor(94, 230, 160, 210))
+        if not self._marks:
+            p.end()
+            return
         a = self._marks.get('A'); b = self._marks.get('B')
         # Shade the looped region between A and B.
         if a is not None and b is not None and b > a:
@@ -761,6 +928,7 @@ class PlayerEngine(QWidget):
     vocab_triggered = pyqtSignal(str)
     subtitle_changed = pyqtSignal(str)  # current subtitle text
     subtitle_exited = pyqtSignal(int)   # index of subtitle that just finished
+    subtitle_entered = pyqtSignal(int)  # index of subtitle we JUST entered (lesson narration)
     ai_loop_changed = pyqtSignal(int)   # remaining loops for current sub, 0 = off
 
     def __init__(self, parent=None):
@@ -786,6 +954,7 @@ class PlayerEngine(QWidget):
         self._ap_last = -1      # last subtitle index we were inside
         self._last_sub = ""     # last non-empty subtitle text (stays on pause)
         self._last_sub_idx = -1 # index of last subtitle
+        self._last_entered_idx = -1  # last index emitted via subtitle_entered (lesson)
         # ── AI Auto-Loop: each sentence repeats n times ──
         self._ai_loop = False       # toggle
         self._ai_loop_count = 2     # default repetitions per subtitle
@@ -800,7 +969,8 @@ class PlayerEngine(QWidget):
         # Poll often so subtitles flip the instant the cue starts (≈1 video
         # frame), not up to 200ms late — that lag read as "out of sync".
         self._poll_ms = 40
-        self._timer = QTimer(); self._timer.timeout.connect(self._poll)
+        self._timer = QTimer(); self._timer.setTimerType(Qt.PreciseTimer)
+        self._timer.timeout.connect(self._poll)
         self._init_vlc()
 
     def _show_ph(self):
@@ -809,6 +979,17 @@ class PlayerEngine(QWidget):
     def resizeEvent(self, e):
         super().resizeEvent(e)
         self.ph.setGeometry((self.width()-250)//2, (self.height()-60)//2, 250, 60)
+        # Re-snap the subtitle/Twitch overlay to the video the INSTANT the video
+        # widget changes size for ANY reason — window resize, bottom-bar collapse,
+        # chat panel toggle. MainWindow.resizeEvent only fires for the WINDOW, so
+        # internal layout changes used to leave the legendas lagging behind the
+        # video by up to 300ms (the poll timer). This closes that gap.
+        win = self.window()
+        if win is not None and hasattr(win, "_reposition_overlay"):
+            try:
+                win._reposition_overlay()
+            except Exception:
+                pass
 
     def _init_vlc(self):
         try:
@@ -862,6 +1043,10 @@ class PlayerEngine(QWidget):
             elif not is_playing and self._last_sub:
                 current_sub = self._last_sub
             self.subtitle_changed.emit(current_sub)
+            # Entrámos numa NOVA legenda? (usado pela narração ao vivo das aulas)
+            if is_playing and current_idx >= 0 and current_idx != self._last_entered_idx:
+                self._last_entered_idx = current_idx
+                self.subtitle_entered.emit(current_idx)
             # Detect subtitle exit for listening mode
             if is_playing and self._last_sub_idx >= 0:
                 inside = False
@@ -1375,6 +1560,15 @@ class PlayerEngine(QWidget):
     def set_rate(self, r):
         if self._player: self._player.set_rate(max(0.25,min(4.0,r)))
 
+    def set_audio_muted(self, m):
+        """Muta/desmuta o áudio do VLC sem mexer no volume (restaura limpo). Usado
+        no modo lento, em que a voz neural (edge-tts) toca por cima e o áudio
+        original esticado do VLC só faria 'cacos'."""
+        try:
+            if self._player: self._player.audio_set_mute(bool(m))
+        except Exception as e:
+            log(f"set_audio_muted: {e}")
+
     def duck_volume(self, level=22):
         """Baixa o volume (sem mutar) guardando o anterior. Usado no exercício de
         diálogo/shadowing: o filme continua a ouvir-se baixinho enquanto o aluno fala
@@ -1431,24 +1625,12 @@ TWITCH_COLORS = [
 ]
 
 # "Utilizadores" do chat Twitch — nomes gerados e cores associadas
-TWITCH_USERS = [
-    ("StreamLover",     "#ff0000"),
-    ("PolyglotPro",     "#1e90ff"),
-    ("WordHunter",      "#00ff00"),
-    ("LinguaLeo",       "#ff00ff"),
-    ("FluentFox",       "#ffd700"),
-    ("ChatVibe",        "#ff69b4"),
-    ("EchoSpeaker",     "#00ffff"),
-    ("LingoNinja",      "#ff4500"),
-    ("TalkMaster",      "#7b68ee"),
-    ("PhraseKing",      "#32cd32"),
-    ("AccentAce",       "#ff1493"),
-    ("DialogueDiver",   "#00bfff"),
-    ("LexiLearner",     "#ffd700"),
-    ("SentenceSmith",   "#00fa9a"),
-    ("VocalVoyager",    "#ff6347"),
-]
-_TWITCH_USER_IDX = 0  # cycling counter — each new card gets the NEXT user
+# Rotating accent colors for the left bar of each Twitch-style vocab card
+# (no fake usernames — just a visual pop to distinguish adjacent cards)
+CARD_COLORS = ["#ff0000", "#1e90ff", "#00ff00", "#ff00ff", "#ffd700",
+               "#ff69b4", "#00ffff", "#ff4500", "#7b68ee", "#32cd32",
+               "#ff1493", "#00bfff", "#00fa9a", "#ff6347"]
+_CARD_COLOR_IDX = 0
 
 # Soft, high-contrast palette to tint only the KEY words inside a subtitle line
 # (content words) — the rest of the line stays white, so it's legible, not a
@@ -1497,6 +1679,14 @@ no matter what|in order to|as long as|even though|as if|rather than
 EXPRESSIONS = set(e.strip() for e in EXPRESSIONS if e.strip())
 _EXPR_MAXLEN = 4
 
+# Grupos multi-palavra que a IA deteta a partir do guião REAL das legendas (em
+# runtime, via ExpressionMiner, à medida que o filme avança). O mark_tokens
+# consulta este conjunto ALÉM da lista offline EXPRESSIONS — assim sublinha como
+# UMA UNIDADE expressões que perdem o sentido se separadas, mesmo que não estejam
+# na lista fixa. Lê-se por membership (thread-safe sob o GIL); só cresce.
+_AI_EXPRESSIONS = set()
+_GROUP_MAXLEN = 6   # nº máx. de palavras de um grupo a tentar casar (cobre AI+offline)
+
 # Frequent words that look hard (long) but the learner likely knows → keep them
 # at "your level" green instead of flagging them as advanced.
 _EASY_LONG = set("""
@@ -1526,13 +1716,16 @@ def mark_tokens(words):
             out[i] = {"color": None, "underline": False, "key": False, "click": ""}
             i += 1
             continue
-        # Longest-first expression match starting at i.
+        # Longest-first expression match starting at i. Consulta a lista offline
+        # E os grupos detetados pela IA no guião atual (_AI_EXPRESSIONS).
         matched = 0
-        for L in range(min(_EXPR_MAXLEN, n - i), 1, -1):
+        for L in range(min(_GROUP_MAXLEN, n - i), 1, -1):
             seg = cores[i:i + L]
-            if all(seg) and " ".join(seg) in EXPRESSIONS:
-                matched = L
-                break
+            if all(seg):
+                phrase = " ".join(seg)
+                if phrase in EXPRESSIONS or phrase in _AI_EXPRESSIONS:
+                    matched = L
+                    break
         if matched:
             phrase = " ".join(cores[i:i + matched])
             for j in range(i, i + matched):
@@ -1550,13 +1743,114 @@ def mark_tokens(words):
         i += 1
     return out
 
+
+class ExpressionMiner(QObject):
+    """Lê o GUIÃO REAL das legendas (não palavras soltas) e pede à IA os GRUPOS de
+    palavras que perdem o sentido se separados — phrasal verbs, idioms, colocações,
+    expressões fixas. Corre em background, em blocos, PROGRESSIVAMENTE à medida que
+    o filme avança (relê o que vem a seguir), e alimenta o conjunto global
+    _AI_EXPRESSIONS que o mark_tokens consulta. Uma chamada por bloco, com cache.
+
+    Assim o sublinhador deixa de ser "burro": além das palavras isoladas (heurística
+    offline), passa a sublinhar como UMA unidade as expressões que a IA reconhece na
+    legenda em contexto."""
+    updated = pyqtSignal()
+    CHUNK = 35   # nº de legendas enviadas à IA por bloco
+
+    _SYS = (
+        "You help a language learner study film subtitles. From the subtitle lines "
+        "given, extract ONLY multi-word expressions that must be understood as a single "
+        "unit — phrasal verbs, idioms, fixed collocations and set phrases — where the "
+        "meaning is lost if the words are read separately. Use the surrounding context. "
+        "Return STRICTLY a JSON array of lowercase strings, each the exact contiguous "
+        "words as they appear in the text (2 to 6 words). NO single words, NO duplicates, "
+        "NO explanations, NO extra keys. Example: [\"give up\",\"out of the blue\"]."
+    )
+
+    def __init__(self, api_base, auth_cb=None, parent=None):
+        super().__init__(parent)
+        self._api = api_base
+        self._auth_cb = auth_cb      # callable → header de auth (ou None)
+        self._cues = []
+        self._key = None             # impressão digital da lista de legendas atual
+        self._scheduled = set()      # índices de bloco já agendados
+        self._lock = threading.Lock()
+
+    def set_cues(self, cues):
+        """(Re)inicia para um novo conjunto de legendas; processa logo a abertura."""
+        cues = [c or "" for c in cues]
+        key = (len(cues), cues[0][:40] if cues else "")
+        if key == self._key:
+            return
+        self._key = key
+        self._cues = cues
+        with self._lock:
+            self._scheduled = set()
+        _AI_EXPRESSIONS.clear()
+        self.updated.emit()
+        if cues:
+            self.ensure_for_index(0)
+
+    def ensure_for_index(self, idx):
+        """Garante que o bloco da legenda atual e o SEGUINTE estão a ser processados —
+        é o que faz a IA 'reler à medida que o filme avança'."""
+        if not self._cues or idx < 0:
+            return
+        base = idx // self.CHUNK
+        for ci in (base, base + 1):
+            start = ci * self.CHUNK
+            if start >= len(self._cues):
+                continue
+            with self._lock:
+                if ci in self._scheduled:
+                    continue
+                self._scheduled.add(ci)
+            seg = self._cues[start:start + self.CHUNK]
+            threading.Thread(target=self._work, args=(seg,), daemon=True).start()
+
+    def _work(self, seg):
+        try:
+            phrases = self._ask_ai(seg)
+            added = False
+            for ph in phrases:
+                ph = " ".join(''.join(c for c in w if c.isalpha() or c == "'")
+                              for w in ph.lower().split()).strip()
+                if ph and " " in ph and len(ph.split()) <= _GROUP_MAXLEN and ph not in _AI_EXPRESSIONS:
+                    _AI_EXPRESSIONS.add(ph); added = True
+            if added:
+                self.updated.emit()
+        except Exception as e:
+            log(f"expr miner: {e}")
+
+    def _ask_ai(self, seg):
+        text = "\n".join(s for s in seg if s.strip())
+        if not text.strip():
+            return []
+        hdrs = {"Content-Type": "application/json", "User-Agent": APP_NAME}
+        h = self._auth_cb() if self._auth_cb else None
+        if h:
+            hdrs["Authorization"] = h
+        body = json.dumps({
+            "model": "deepseek-chat", "max_tokens": 500, "temperature": 0.1,
+            "messages": [{"role": "system", "content": self._SYS},
+                         {"role": "user", "content": text}],
+        }).encode()
+        r = urlopen(Request(f"{self._api}/api/deepseek-chat", data=body, headers=hdrs), timeout=45)
+        data = json.loads(r.read().decode())
+        content = data["choices"][0]["message"]["content"]
+        m = re.search(r"\[.*\]", content, re.S)
+        if not m:
+            return []
+        arr = json.loads(m.group(0))
+        return [x for x in arr if isinstance(x, str)]
+
+
 class VocabCard:
-    __slots__ = ('text', 'time', 'color', 'slide_start', 'saved', 'word_rects', 'username')
-    def __init__(self, text, time, color, slide_start, username=''):
+    __slots__ = ('text', 'time', 'color', 'slide_start', 'saved', 'word_rects')
+    def __init__(self, text, time, color, slide_start):
         self.text = text; self.time = time; self.color = color
         self.slide_start = slide_start; self.saved = False
         self.word_rects = []   # [(x, y, w, h, word)] of clickable key words (set in paint)
-        self.username = username or "Anon"
 
 class VideoOverlay(QWidget):
     """Top-level frameless window — sits ABOVE VLC's DirectX output.
@@ -1599,10 +1893,14 @@ class VideoOverlay(QWidget):
         self._is_playing = True    # while paused we FREEZE card aging (the user may be
                                    # chatting with the AI / reading details — subs stay)
 
-        # Animation timer: ~120fps for fluid Twitch-style card motion
+        # Animation timer: alta cadência e ESTÁVEL para o movimento dos cartões.
+        # Qt.PreciseTimer é essencial no Windows — o timer "coarse" por omissão só
+        # tem resolução de ~15ms, por isso os 4ms pedidos caíam para ~64fps e
+        # tremiam ("a baixar"). Com PreciseTimer o ritmo mantém-se fixo e fluido.
         self._anim_timer = QTimer()
+        self._anim_timer.setTimerType(Qt.PreciseTimer)
         self._anim_timer.timeout.connect(self._tick)
-        self._anim_timer.start(8)
+        self._anim_timer.start(8)   # ~120fps reais e constantes
 
         # Reposition timer: every 300ms ensure we cover the engine
         self._pos_timer = QTimer()
@@ -1747,13 +2045,12 @@ class VideoOverlay(QWidget):
         not by time: we keep the newest MAX_CARDS and never expire them on a clock.
         New cards only arrive WHILE PLAYING, so during a pause nothing is removed —
         the cards (and subtitle) stay put for as long as the user studies.
-        Each card gets a ROTATING "user" identity (name+color) — like a chat room
-        where different people are reacting in real time."""
-        global _TWITCH_USER_IDX
+        Each card gets a rotating accent color (no fake usernames)."""
+        global _CARD_COLOR_IDX
         now = time.time()
-        uname, color = TWITCH_USERS[_TWITCH_USER_IDX % len(TWITCH_USERS)]
-        _TWITCH_USER_IDX += 1
-        self._cards.append(VocabCard(text, now, color, now, username=uname))
+        color = CARD_COLORS[_CARD_COLOR_IDX % len(CARD_COLORS)]
+        _CARD_COLOR_IDX += 1
+        self._cards.append(VocabCard(text, now, color, now))
         if len(self._cards) > self.MAX_CARDS:
             self._cards = self._cards[-self.MAX_CARDS:]
 
@@ -1794,11 +2091,10 @@ class VideoOverlay(QWidget):
         if idx >= 0 and idx < len(self._cards):
             card = self._cards[idx]
             mx, my = e.pos().x(), e.pos().y()
-            # 1) Clicked an underlined key word → open details panel + send to Chat IA
+            # 1) Clicked an underlined key word → open details panel (NOT chat IA)
             for (wx, wy, ww, wh, word) in card.word_rects:
                 if wx <= mx <= wx + ww and wy <= my <= wy + wh:
                     self.word_clicked.emit(word)
-                    self.ask_ai.emit(word)
                     return
             # 2) Otherwise the +/AI buttons
             self._handle_vocab_click(mx, card, idx)
@@ -1808,7 +2104,6 @@ class VideoOverlay(QWidget):
         for (wx, wy, ww, wh, word) in self._sub_word_rects:
             if wx <= mx <= wx + ww and wy <= my <= wy + wh:
                 self.word_clicked.emit(word)
-                self.ask_ai.emit(word)
                 return
         self.video_clicked.emit()
 
@@ -1837,7 +2132,7 @@ class VideoOverlay(QWidget):
         now = time.time()
         for i, card in enumerate(self._cards):
             nlines = max(len(card.text.split('\n')), 1)
-            h = nlines * 18 + 20 + 18  # +18 for username header
+            h = nlines * 18 + 20  # card height (text + padding, no username header)
             y -= h + 4
             if y < ay0:
                 break
@@ -1990,8 +2285,9 @@ class VideoOverlay(QWidget):
                 p.setPen(Qt.NoPen); p.setBrush(QColor(0, 0, 0, 200))
                 p.drawRoundedRect(sx, sy, sw, box_h, 8, 8)
 
-                # Draw each line centred; tint + underline KEY words (clickable).
-                sub_rects = []
+                # Draw each line centred; tint KEY words (colored but NOT underlined).
+                # Only the Twitch vocab cards get underlined words for details clicks.
+                self._sub_word_rects = []
                 for li, ln in enumerate(lines):
                     lx = acx - line_width(ln) // 2
                     ly = sy + 7 + li * line_h
@@ -1999,14 +2295,11 @@ class VideoOverlay(QWidget):
                         ww = fm.horizontalAdvance(word)
                         if mk and mk["color"]:
                             p.setPen(QColor(mk["color"]))
-                            p.setFont(ul_sub if mk["underline"] else sub_font)
-                            if mk.get("click") or mk.get("underline"):
-                                sub_rects.append((lx, ly, ww + 4, line_h, mk.get("click") or word))
+                            p.setFont(sub_font)  # no underline
                         else:
                             p.setPen(QColor(255, 255, 255)); p.setFont(sub_font)
                         p.drawText(QRect(lx, ly, ww + 4, line_h), Qt.AlignLeft | Qt.AlignVCenter, word)
                         lx += ww + space_w
-                self._sub_word_rects = sub_rects
                 p.setFont(sub_font)
             else:
                 # Active-recall: subtitle hidden — discreet placeholder, peek by
@@ -2069,13 +2362,6 @@ class VideoOverlay(QWidget):
             p.setBrush(col)
             p.drawRoundedRect(cur_x, y, 4, h - 2, 2, 2)
 
-            # Username header — colorized, like a Twitch user name
-            uf = QFont("Inter", 9, QFont.Bold)
-            p.setFont(uf)
-            col2 = QColor(card.color); col2.setAlpha(alpha)
-            p.setPen(col2)
-            p.drawText(QRect(cur_x + 12, y + 3, col_w - 24, 16), Qt.AlignLeft | Qt.AlignVCenter, card.username)
-
             # Text — word by word: tint + underline KEY words (clickable for details)
             base_font = QFont("Inter", 11)
             ul_font = QFont("Inter", 11); ul_font.setUnderline(True)
@@ -2086,8 +2372,8 @@ class VideoOverlay(QWidget):
             # Reserva uma faixa à direita para os botões (♪ / + / AI / ✓) — sem isto o
             # texto comprido passava POR BAIXO dos botões ("botões em cima das letras").
             text_right = cur_x + col_w - 82
-            # Text starts below the username header
-            text_y_offset = 20
+            # Text starts close to the top of the card (no username header)
+            text_y_offset = 6
             for li, line in enumerate(lines[:2]):
                 wx = cur_x + 14
                 wy = y + text_y_offset + li * 18
@@ -2767,6 +3053,7 @@ class ChatPanel(QWidget):
     speak_requested = pyqtSignal(str)                  # ♪ ouvir a legenda devagar (texto do input ou legenda atual)
     user_sent = pyqtSignal(str)                        # o utilizador enviou uma mensagem (texto) — usado pelo modo Listening
     eval_result = pyqtSignal(object, object)           # (response_text | None, error | None) — usado pelos diálogos de avaliação
+    lesson_result = pyqtSignal(object, object, object) # (text | None, loader, done_cb) — narração ao vivo das aulas
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -2779,6 +3066,7 @@ class ChatPanel(QWidget):
         self._ai_thread = None
         self.login_result.connect(self._on_login_done)
         self.chat_result.connect(self._on_chat_result)
+        self.lesson_result.connect(self._on_lesson_result)
         self.promote_result.connect(self._on_promote_result)
         self.user_ctx_ready.connect(self._on_user_ctx)
         # Se já há sessão guardada, conhece o utilizador logo ao arrancar.
@@ -2884,9 +3172,15 @@ class ChatPanel(QWidget):
         hl.addStretch()
         self.login_btn = QPushButton(T("login") if not self._token else T("account"))
         # Altura fixa mas largura ajusta-se ao texto (Login/Conta/Account não cortam).
-        self.login_btn.setFixedHeight(24); self.login_btn.setMinimumWidth(56)
+        # Chip preenchido (não um contorno solto) — assenta melhor no cabeçalho do chat.
+        self.login_btn.setFixedHeight(26); self.login_btn.setMinimumWidth(60)
+        self.login_btn.setCursor(Qt.PointingHandCursor)
         self.login_btn.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
-        self.login_btn.setStyleSheet(f"QPushButton{{background:transparent;border:1px solid {BRD};border-radius:12px;color:{TS2};font-size:11px;padding:0 12px;}}QPushButton:hover{{background:{HVR};color:{TXT};}}")
+        self.login_btn.setStyleSheet(
+            f"QPushButton{{background:{ELV};border:1px solid {BRD};border-radius:13px;"
+            f"color:{TXT};font-size:11px;font-weight:600;padding:0 14px;"
+            f"font-family:'Inter','Segoe UI',sans-serif;}}"
+            f"QPushButton:hover{{background:{HVR};border-color:{ACC};color:{TXT};}}")
         self.login_btn.clicked.connect(self._handle_login)
         hl.addWidget(self.login_btn)
         lo.addWidget(hdr)
@@ -2900,8 +3194,22 @@ class ChatPanel(QWidget):
         scroll.setWidget(self.mw)
         lo.addWidget(scroll, 1)
 
-        self.welcome = QLabel(T("chat_welcome"))
-        self.welcome.setStyleSheet(f"color:{TMT};font-size:12.5px;font-family:'Inter','Segoe UI',sans-serif;line-height:1.6;background:transparent;padding:24px;")
+        # Boas-vindas com tipografia cuidada: 1ª linha vira título, o resto fica
+        # como exemplos discretos (chips), em vez de um bloco de texto achatado.
+        self.welcome = QLabel()
+        self.welcome.setTextFormat(Qt.RichText)
+        _wl = [l.strip() for l in T("chat_welcome").split("\n") if l.strip()]
+        _wtitle = _wl[0] if _wl else T("chat_welcome")
+        _wex = "".join(
+            f"<div style='margin-top:9px;padding:7px 12px;background:{ELV};"
+            f"border:1px solid {BRD};border-radius:12px;color:{TMT};font-size:12px;'>{l}</div>"
+            for l in _wl[1:] if not l.lower().startswith(("e.g", "ex.", "ex:", "por exemplo", "p. ex")))
+        self.welcome.setText(
+            f"<div style='font-size:15px;font-weight:700;color:{TXT};margin-bottom:4px;'>{_wtitle}</div>"
+            f"{_wex}")
+        self.welcome.setStyleSheet(
+            f"color:{TMT};font-family:'Inter','Segoe UI',sans-serif;"
+            f"background:transparent;padding:30px 22px;")
         self.welcome.setWordWrap(True); self.welcome.setAlignment(Qt.AlignCenter)
         self.ml.insertWidget(0, self.welcome)
 
@@ -3079,11 +3387,18 @@ class ChatPanel(QWidget):
 
         msg = QLabel(); msg.setWordWrap(True)
         msg.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.LinksAccessibleByMouse)
-        msg.setOpenExternalLinks(True)
-        # AI replies render as real Markdown (bold, lists, code, headings, links);
-        # user/system stay plain.
-        msg.setTextFormat(Qt.MarkdownText if role == "assistant" else Qt.PlainText)
-        msg.setText(text)
+        # Resposta da IA: sublinha o vocabulário-chave (MESMO sistema das legendas),
+        # clicável → abre a aba Detalhes. user/system ficam em texto simples.
+        if role == "assistant":
+            msg.setOpenExternalLinks(False)
+            msg.setTextFormat(Qt.RichText)
+            msg.setText(mark_html(text, subtle=True))
+            try: msg.linkActivated.connect(self._on_marked_word)
+            except Exception: pass
+        else:
+            msg.setOpenExternalLinks(True)
+            msg.setTextFormat(Qt.PlainText)
+            msg.setText(text)
         msg.setStyleSheet(f"QLabel{{background:transparent;color:{fg};font-size:12.5px;}}"
                           f"QLabel a{{color:{ACC};}}")
         msg.setMaximumWidth(252)
@@ -3093,6 +3408,31 @@ class ChatPanel(QWidget):
         cl = QVBoxLayout(c); cl.setContentsMargins(0, 0, 0, 0)
         cl.addWidget(bubble, 0, align)
         self.ml.insertWidget(self.ml.count() - 1, c)
+
+    def _on_marked_word(self, href):
+        """Clique numa palavra/expressão sublinhada numa mensagem da IA → abre a aba
+        Detalhes (mesmo destino que clicar numa palavra das legendas). Links http
+        normais abrem no navegador."""
+        if not href:
+            return
+        if href.startswith("lexioword:"):
+            from urllib.parse import unquote
+            word = unquote(href.split(":", 1)[1])
+            mw = self.parent()
+            try:
+                if mw and hasattr(mw, "word_details"):
+                    mw.word_details.show_for(word)
+                    if hasattr(mw, "_balance_left_dock"):
+                        mw._balance_left_dock()
+            except Exception as e:
+                log(f"marked word: {e}")
+        else:
+            try:
+                from PyQt5.QtGui import QDesktopServices
+                from PyQt5.QtCore import QUrl
+                QDesktopServices.openUrl(QUrl(href))
+            except Exception:
+                pass
 
     def _call_ai(self, text):
         load = QLabel(T("thinking")); load.setStyleSheet(f"color:{ACC};font-size:11px;padding:4px;background:transparent;font-weight:bold;")
@@ -3110,8 +3450,14 @@ class ChatPanel(QWidget):
             try:
                 # Contexto que faz a IA CONHECER o utilizador a partir do uso do
                 # player: língua nativa, vídeo atual, e as palavras que ele guardou.
-                parts = ["You are Lexio's in-player AI tutor for a language learner watching a video.",
-                         f"Always reply in the user's native language ({native_language_name()}), warm and concise."]
+                parts = ["You are Lexio's in-player AI language TUTOR for a learner watching a video — act like a real, thorough teacher, not a chatbot.",
+                         f"Always reply in the user's native language ({native_language_name()}), warm and encouraging.",
+                         "Teach in depth: when a word, phrase or expression comes up, give (1) a clear meaning, "
+                         "(2) 1–2 natural EXAMPLE sentences, (3) common COLLOCATIONS / how it's really used, "
+                         "(4) close SYNONYMS and any useful antonyms, and (5) register or nuance (formal/informal, "
+                         "tone) when relevant. Point out related expressions and frequent mistakes.",
+                         "Keep it well organised and skimmable: short paragraphs or simple bullet lines, never a wall of text. "
+                         "Don't over-explain trivial words; go deep only where it helps. Always end by inviting a follow-up question."]
                 if self._user_name:
                     parts.append(f"The user's name is {self._user_name}.")
                 if self._activity_summary:
@@ -3243,8 +3589,78 @@ class ChatPanel(QWidget):
         if scroll:
             QTimer.singleShot(50, lambda: scroll.verticalScrollBar().setValue(scroll.verticalScrollBar().maximum()))
 
+    # ── Narração ao vivo das aulas (tracks) ──
+    def post_lesson_note(self, system_extra, user_text, done_cb=None):
+        """Pede à IA uma explicação curta da cena/legenda atual e larga-a no chat
+        como mensagem do tutor. Uma chamada por legenda (modo 'ao vivo'). Reaproveita
+        o caminho de entrega na GUI via lesson_result. done_cb corre na GUI no fim."""
+        self.welcome.hide()
+        load = QLabel(T("lesson_narrating"))
+        load.setStyleSheet(f"color:{ACC};font-size:11px;padding:4px;background:transparent;font-weight:bold;")
+        lc = QWidget(); lc.setStyleSheet("background:transparent;")
+        lcl = QVBoxLayout(lc); lcl.setContentsMargins(0,0,0,0); lcl.addWidget(load, 0, Qt.AlignLeft)
+        self.ml.insertWidget(self.ml.count()-1, lc)
+        scroll = self.findChild(QScrollArea)
+        if scroll:
+            QTimer.singleShot(50, lambda: scroll.verticalScrollBar().setValue(scroll.verticalScrollBar().maximum()))
+        def work():
+            try:
+                target = (getattr(self, "_user_target", "") or "").strip()
+                tgt_clause = (f"the language the learner is studying ({target})" if target
+                              else "the language being learned (the language of the film's subtitles)")
+                parts = [
+                    "You are Lexio's in-player AI tutor giving a LIVE, guided lesson over a video "
+                    "for a language learner. Explain what is happening in the scene, the context, "
+                    "tone, cultural references and any tricky vocabulary or expressions.",
+                    f"Give the lesson IN {tgt_clause}: write your explanation in that target language so "
+                    "the learner stays immersed — this is a real lesson, not a translation into their "
+                    "own language. Keep it natural but GRADED to their level: short, clear sentences, "
+                    "and briefly gloss any hard word/expression. Only when something is genuinely "
+                    f"confusing, add a tiny clarification in {native_language_name()} in parentheses. "
+                    "Be warm and SHORT (2-4 sentences). Plain prose, no headings, no lists."]
+                if self._user_name:
+                    parts.append(f"The user's name is {self._user_name}.")
+                if self.parent() and hasattr(self.parent(), 'engine') and self.parent().engine.path():
+                    parts.append("They are watching: " + Path(self.parent().engine.path()).name)
+                parts.append(system_extra)
+                ctx = "\n".join(parts)
+                hdrs = {"Content-Type": "application/json"}
+                auth = self._get_token_header()
+                if auth: hdrs["Authorization"] = auth
+                msgs = [{"role": "system", "content": ctx},
+                        {"role": "user", "content": user_text}]
+                payload = {"model": "deepseek-chat", "max_tokens": 320, "temperature": 0.4,
+                           "feature": "chat", "messages": msgs}
+                r = urlopen(Request(f"{LEXIO_API}/api/deepseek-chat",
+                                    data=json.dumps(payload).encode(), headers=hdrs), timeout=30)
+                d = json.loads(r.read().decode())
+                c = d.get("text") or d.get("content") or ""
+                if not c and "choices" in d: c = d["choices"][0]["message"]["content"]
+                self.lesson_result.emit((c or "").strip() or None, lc, done_cb)
+            except Exception as e:
+                log(f"lesson note err: {e}")
+                self.lesson_result.emit(None, lc, done_cb)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_lesson_result(self, text, lc, done_cb):
+        """GUI thread: remove o loader, mostra a nota (se houver) e chama o callback.
+        As notas de aula NÃO entram no histórico do chat (_messages) para não roubar
+        a memória da conversa normal."""
+        try: lc.deleteLater()
+        except Exception: pass
+        if text:
+            self._add_msg(text, "assistant")
+            scroll = self.findChild(QScrollArea)
+            if scroll:
+                QTimer.singleShot(50, lambda: scroll.verticalScrollBar().setValue(scroll.verticalScrollBar().maximum()))
+        if done_cb:
+            try: done_cb()
+            except Exception as e: log(f"lesson done_cb err: {e}")
+
     # ── Promote a video-vocab word to the user's MAIN account vocabulary ──
-    def promote_word(self, text):
+    def promote_word(self, text, note="", translation=""):
+        """Adiciona a palavra ao vocabulário PRINCIPAL na conta web (tabela words).
+        note/translation = personalização opcional do utilizador (cai na conta web)."""
         if not text:
             return
         header = self._get_token_header()
@@ -3252,9 +3668,10 @@ class ChatPanel(QWidget):
             self._add_msg(T("need_login_vocab"), "system")
             return
         self._add_msg(f"A adicionar “{text[:40]}” ao teu vocabulário…", "system")
-        threading.Thread(target=self._promote_worker, args=(text, header), daemon=True).start()
+        threading.Thread(target=self._promote_worker,
+                         args=(text, header, note, translation), daemon=True).start()
 
-    def _promote_worker(self, text, header):
+    def _promote_worker(self, text, header, note="", translation=""):
         import base64
         try:
             sys_p = ("You build one vocabulary study card. Reply ONLY with compact JSON, no prose: "
@@ -3279,11 +3696,19 @@ class ChatPanel(QWidget):
             if not uid:
                 raise RuntimeError("sem user id no token")
 
+            # Personalização do utilizador (vai junto p/ a conta web):
+            # tradução manual sobrepõe-se à da IA; a nota fica visível na definição.
+            definition = pack.get("definition", "")
+            tags = ["video"]
+            if note and note.strip():
+                definition = (definition + ("\n" if definition else "") + f"Nota: {note.strip()}").strip()
+                tags = ["video", "nota"]
             row = {
                 "user_id": uid, "word": pack.get("word") or text,
-                "lang": (pack.get("lang") or "en")[:5], "translation": pack.get("translation", ""),
-                "type": "word", "definition": pack.get("definition", ""),
-                "examples": pack.get("examples") or [], "tags": ["video"],
+                "lang": (pack.get("lang") or "en")[:5],
+                "translation": (translation.strip() if translation and translation.strip() else pack.get("translation", "")),
+                "type": "word", "definition": definition,
+                "examples": pack.get("examples") or [], "tags": tags,
                 "interval": 0, "ease_factor": 2.5, "repetitions": 0,
                 "due_date": datetime.now().isoformat(), "status": "new",
             }
@@ -3365,6 +3790,104 @@ class StudyMgr:
         if 0<=i<len(a): del a[i]; self.save(); return True
     def export(self, v):
         return json.dumps({"video":Path(v).name,"path":str(v),"exported":datetime.now().isoformat(),"bookmarks":self.get_bm(v),"annotations":self.get_an(v)}, indent=2, ensure_ascii=False)
+
+
+class ReminderManager(QObject):
+    """Lembrete de revisão espaçada: a cada N minutos mostra uma notificação do
+    sistema com uma palavra GUARDADA que está 'a vencer' (tabela `words` da
+    conta), com a tradução e uma frase de exemplo. As palavras vêm da conta, por
+    isso precisa de login; sem sessão fica em silêncio. Liga/desliga e intervalo
+    são configuráveis na aba Ferramentas e ficam guardados em reminder.json."""
+    show_note = pyqtSignal(str, str)   # (título, corpo) — emitido p/ a GUI
+
+    def __init__(self, get_header, parent=None):
+        super().__init__(parent)
+        self._get_header = get_header          # callable → "Bearer ..." (ou None)
+        self._recent = []                      # palavras já mostradas (evita repetir)
+        cfg = self._load()
+        self.enabled = bool(cfg.get("enabled", False))
+        self.interval_min = max(5, int(cfg.get("interval_min", 30)))
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        if self.enabled:
+            self._timer.start(self.interval_min * 60_000)
+
+    def _load(self):
+        try:
+            if REMINDER_FILE.exists():
+                return json.loads(REMINDER_FILE.read_text(encoding='utf-8'))
+        except Exception:
+            pass
+        return {}
+
+    def _save(self):
+        try:
+            REMINDER_FILE.write_text(json.dumps(
+                {"enabled": self.enabled, "interval_min": self.interval_min},
+                indent=2), encoding='utf-8')
+        except Exception:
+            pass
+
+    def set_enabled(self, on):
+        self.enabled = bool(on)
+        self._save()
+        self._timer.stop()
+        if self.enabled:
+            self._timer.start(self.interval_min * 60_000)
+
+    def set_interval(self, minutes):
+        self.interval_min = max(5, int(minutes))
+        self._save()
+        if self.enabled:
+            self._timer.stop()
+            self._timer.start(self.interval_min * 60_000)
+
+    def _tick(self):
+        if not self.enabled:
+            return
+        header = self._get_header() if self._get_header else None
+        if not header:
+            return   # sem login → sem lembrete (silencioso)
+        threading.Thread(target=self._fetch_and_emit, args=(header,), daemon=True).start()
+
+    def _fetch_and_emit(self, header):
+        import base64
+        try:
+            tok = header.split(" ", 1)[1]
+            pl = tok.split(".")[1]; pl += "=" * (-len(pl) % 4)
+            uid = json.loads(base64.urlsafe_b64decode(pl).decode()).get("sub")
+            if not uid:
+                return
+            now_iso = datetime.now().isoformat()
+            q = (f"{SUPABASE_URL}/rest/v1/words?user_id=eq.{uid}"
+                 f"&select=word,translation,definition,examples,due_date"
+                 f"&order=due_date.asc&limit=40")
+            hdrs = {"apikey": SUPABASE_ANON, "Authorization": header}
+            r = urlopen(Request(q, headers=hdrs), timeout=20)
+            rows = json.loads(r.read().decode())
+            if not rows:
+                return
+            # Prefere as vencidas (due_date <= agora); se nenhuma, usa as mais próximas.
+            due = [w for w in rows if (w.get("due_date") or "") <= now_iso] or rows
+            pick = next((w for w in due if w.get("word") not in self._recent), None)
+            if pick is None:
+                self._recent.clear()
+                pick = due[0]
+            self._recent.append(pick.get("word"))
+            if len(self._recent) > 20:
+                self._recent.pop(0)
+            word = (pick.get("word") or "").strip()
+            tr = (pick.get("translation") or "").strip()
+            exs = pick.get("examples") or []
+            ex = (exs[0] if exs else "").strip()
+            body = tr
+            if ex:
+                body = (body + "\n" + ex).strip() if body else ex
+            if not body:
+                body = (pick.get("definition") or "").strip()[:140]
+            self.show_note.emit(word or T("reminder_title"), body or word)
+        except Exception as e:
+            log(f"reminder fetch: {e}")
 
 
 def _thumb_icon(up, color, size=16):
@@ -3639,13 +4162,22 @@ class WordDetailsPanel(QWidget):
         scroll.setWidget(inner); lo.addWidget(scroll, 1)
 
         ftr = QWidget(); ftr.setStyleSheet(f"background:{ELV};border-top:1px solid {BRD};")
-        fl = QVBoxLayout(ftr); fl.setContentsMargins(12, 10, 12, 10)
+        fl = QHBoxLayout(ftr); fl.setContentsMargins(12, 10, 12, 10); fl.setSpacing(8)
         self.add_btn = QPushButton(T("add_vocab")); self.add_btn.setCursor(Qt.PointingHandCursor)
         self.add_btn.setStyleSheet(
-            f"QPushButton{{background:{ACC};color:{ON_ACC};border:none;border-radius:14px;padding:9px;"
+            f"QPushButton{{background:{ACC};color:{ON_ACC};border:none;border-radius:14px;padding:9px 14px;"
             f"font-size:12px;font-weight:600;font-family:'Inter','Segoe UI',sans-serif;}}QPushButton:hover{{background:{ACC_HOVER};}}")
         self.add_btn.clicked.connect(self._add)
-        fl.addWidget(self.add_btn); lo.addWidget(ftr)
+        fl.addWidget(self.add_btn, 1)
+        # "Personalizar": abre o diálogo (tradução + nota tua) antes de cair na conta web.
+        self.custom_btn = QPushButton(T("add_word_personalise")); self.custom_btn.setCursor(Qt.PointingHandCursor)
+        self.custom_btn.setToolTip(T("add_word_personalise_tip"))
+        self.custom_btn.setStyleSheet(
+            f"QPushButton{{background:transparent;color:{TS2};border:1px solid {BRD};border-radius:14px;padding:9px 14px;"
+            f"font-size:12px;font-family:'Inter','Segoe UI',sans-serif;}}QPushButton:hover{{color:{TXT};border-color:{ACC};}}")
+        self.custom_btn.clicked.connect(self._personalise)
+        fl.addWidget(self.custom_btn)
+        lo.addWidget(ftr)
 
         self._ready.connect(self._on_ready)
         self._img_ready.connect(self._on_img)
@@ -3881,6 +4413,17 @@ class WordDetailsPanel(QWidget):
         if self._chat and self._word:
             self._chat.promote_word(self._word)
 
+    def _personalise(self):
+        """Abre o diálogo de personalização (tradução + nota) já com esta palavra,
+        para o utilizador ajustar antes de cair na conta web."""
+        if not (self._chat and self._word):
+            return
+        try:
+            dlg = AddWordDialog(self, self._chat, prefill=self._word)
+            dlg.exec_()
+        except Exception as e:
+            log(f"personalise: {e}")
+
     def _open_youglish(self):
         """Open the word on YouGlish for pronunciation in context."""
         if self._word:
@@ -3895,10 +4438,13 @@ class PronunciationPanel(QWidget):
     """Aba Pronúncia: ouvir a legenda ATUAL em várias velocidades, com a MESMA
     voz neural natural da web (edge-tts). Painel lateral, como o de detalhes."""
 
+    prep_changed = pyqtSignal(bool)   # True = a preparar áudio nos bastidores
+
     def __init__(self, parent):
         super().__init__(parent)
         self._line = ""; self._lang = "en"
         self._tts_player = None; self._tts_inst = None
+        self._spd_btns = []
         self.setStyleSheet(f"background:{SRF};border-right:1px solid {BRD};")
         self.setMinimumWidth(300); self.setMaximumWidth(420)
         lo = QVBoxLayout(self); lo.setContentsMargins(0, 0, 0, 0); lo.setSpacing(0)
@@ -3930,12 +4476,28 @@ class PronunciationPanel(QWidget):
             b.setStyleSheet(
                 f"QPushButton{{background:{ELV};color:{TXT};border:1px solid {BRD};border-radius:10px;"
                 f"font-size:13px;font-weight:600;font-family:'Inter','Segoe UI',sans-serif;text-align:left;padding:0 16px;}}"
-                f"QPushButton:hover{{border-color:{ACC};background:{HVR};}}")
+                f"QPushButton:hover{{border-color:{ACC};background:{HVR};}}"
+                f"QPushButton:disabled{{color:{TMT};border-color:{BRD};background:{SRF};}}")
             b.clicked.connect(lambda _checked=False, r=rate: self._play(r))
             il.addWidget(b)
+            self._spd_btns.append(b)
+        # Indicador de "a preparar" — o áudio neural é gerado nos bastidores (rede),
+        # por isso há um pequeno atraso; aqui mostra-se que está a ser preparado.
+        self.prep_lbl = QLabel(""); self.prep_lbl.setVisible(False)
+        self.prep_lbl.setStyleSheet(
+            f"color:{ACC};font-size:11px;font-weight:600;background:transparent;padding:2px 0;")
+        il.addWidget(self.prep_lbl)
         il.addStretch()
         lo.addWidget(inner, 1)
+        self.prep_changed.connect(self._set_preparing)
         self.hide()
+
+    def _set_preparing(self, busy):
+        """Estado de carregamento dos botões de velocidade (corre no GUI thread)."""
+        self.prep_lbl.setText(T("pron_preparing") if busy else "")
+        self.prep_lbl.setVisible(bool(busy))
+        for b in self._spd_btns:
+            b.setEnabled(not busy)
 
     def show_for(self, line, lang="en"):
         line = (line or "").strip()
@@ -3949,6 +4511,7 @@ class PronunciationPanel(QWidget):
     def _play(self, rate):
         if not self._line:
             return
+        self.prep_changed.emit(True)   # mostra o loading enquanto prepara
         threading.Thread(target=self._worker, args=(self._line, self._lang, rate), daemon=True).start()
 
     def _worker(self, line, lang, rate):
@@ -3974,6 +4537,92 @@ class PronunciationPanel(QWidget):
                 speak_local_sapi(line, lang)
             except Exception:
                 pass
+        finally:
+            self.prep_changed.emit(False)   # esconde o loading (preparação terminada)
+
+
+class AddWordDialog(QDialog):
+    """O sítio onde o utilizador PERSONALIZA o que quer adicionar ao vocabulário e
+    isso cai TUDO na conta web (tabela words). Pode escrever uma palavra/expressão à
+    mão, dar a sua própria tradução e uma nota pessoal. A IA preenche o resto
+    (definição, exemplos) e o cartão é sincronizado com a app web ao guardar."""
+
+    def __init__(self, parent, chat_panel, prefill=""):
+        super().__init__(parent)
+        self._chat = chat_panel
+        self.setWindowTitle(T("add_word_title"))
+        self.setMinimumWidth(340)
+        self.setStyleSheet(f"background:{BG};")
+        lo = QVBoxLayout(self); lo.setContentsMargins(20, 18, 20, 18); lo.setSpacing(10)
+
+        hdr = QLabel(T("add_word_title"))
+        hdr.setStyleSheet(f"color:{TXT};font-size:15px;font-weight:700;background:transparent;")
+        lo.addWidget(hdr)
+        hint = QLabel(T("add_word_hint")); hint.setWordWrap(True)
+        hint.setStyleSheet(f"color:{TMT};font-size:11px;background:transparent;")
+        lo.addWidget(hint)
+
+        def field(label, ph, multiline=False):
+            lab = QLabel(label); lab.setStyleSheet(f"color:{TMT};font-size:10px;font-weight:600;background:transparent;margin-top:4px;")
+            lo.addWidget(lab)
+            w = QTextEdit() if multiline else QLineEdit()
+            w.setStyleSheet(
+                f"background:{ELV};color:{TXT};border:1px solid {BRD};border-radius:8px;"
+                f"padding:7px 9px;font-size:12px;")
+            w.setPlaceholderText(ph)   # QLineEdit e QTextEdit suportam ambos
+            if multiline:
+                w.setFixedHeight(56)
+            lo.addWidget(w)
+            return w
+
+        self.word_in = field(T("add_word_word"), T("add_word_word_ph"))
+        self.word_in.setText(prefill or "")
+        self.tr_in = field(T("add_word_translation"), T("add_word_translation_ph"))
+        self.note_in = field(T("add_word_note"), T("add_word_note_ph"), multiline=True)
+
+        # Estado de login — deixa claro que vai (ou não) para a conta web.
+        self.status_lbl = QLabel(""); self.status_lbl.setWordWrap(True)
+        self.status_lbl.setStyleSheet(f"color:{TMT};font-size:11px;background:transparent;padding-top:4px;")
+        lo.addWidget(self.status_lbl)
+
+        bb = QHBoxLayout(); bb.setSpacing(8)
+        self.save_btn = QPushButton(T("add_word_save")); self.save_btn.setCursor(Qt.PointingHandCursor)
+        self.save_btn.setStyleSheet(
+            f"QPushButton{{background:{ACC};color:{ON_ACC};border:none;border-radius:14px;"
+            f"padding:9px 20px;font-size:12px;font-weight:600;font-family:'Inter','Segoe UI',sans-serif;}}"
+            f"QPushButton:hover{{background:{ACC_HOVER};}}")
+        self.save_btn.clicked.connect(self._save)
+        bb.addWidget(self.save_btn); bb.addStretch()
+        cl = QPushButton(T("exercise_close")); cl.setCursor(Qt.PointingHandCursor)
+        cl.setStyleSheet(f"QPushButton{{background:transparent;color:{TS2};border:1px solid {BRD};"
+                         f"border-radius:14px;padding:9px 16px;font-size:11px;}}"
+                         f"QPushButton:hover{{color:{TXT};border-color:{ACC};}}")
+        cl.clicked.connect(self.reject)
+        bb.addWidget(cl)
+        lo.addLayout(bb)
+        self._refresh_login()
+
+    def _refresh_login(self):
+        logged = bool(self._chat and self._chat._get_token_header())
+        self.status_lbl.setText(T("add_word_synced") if logged else T("add_word_local_only"))
+        self.status_lbl.setStyleSheet(
+            f"color:{'#9EE6A0' if logged else '#FFB27A'};font-size:11px;background:transparent;padding-top:4px;")
+
+    def _save(self):
+        word = self.word_in.text().strip()
+        if not word:
+            self.word_in.setFocus(); return
+        if not (self._chat and self._chat._get_token_header()):
+            # Sem login → não há conta web onde cair. Avisa e tenta abrir o login.
+            self.status_lbl.setText(T("need_login_vocab"))
+            self.status_lbl.setStyleSheet("color:#FFB27A;font-size:11px;background:transparent;padding-top:4px;")
+            try: self._chat._handle_login()
+            except Exception: pass
+            return
+        note = self.note_in.toPlainText().strip()
+        tr = self.tr_in.text().strip()
+        self._chat.promote_word(word, note=note, translation=tr)
+        self.accept()
 
 
 class ExerciseDialog(QDialog):
@@ -4083,10 +4732,10 @@ class ExerciseDialog(QDialog):
             raw = (d.get("text") or "").strip().strip("`")
             parsed = json.loads(raw[raw.find("{"):raw.rfind("}")+1])
             log("exercise: gerado OK")
-            QTimer.singleShot(0, lambda: self._show(parsed))
+            gui_call(lambda: self._show(parsed))
         except Exception as e:
             log(f"exercise FALHOU: {type(e).__name__}: {e}")
-            QTimer.singleShot(0, lambda: self.q_lbl.setText(T("exercise_failed")))
+            gui_call(lambda: self.q_lbl.setText(T("exercise_failed")))
 
     def _show(self, data):
         self.q_lbl.setText(data.get("question", "?"))
@@ -4121,6 +4770,68 @@ class ExerciseDialog(QDialog):
 def _esc_html(s):
     """Escape text going into a rich-text QLabel so user/AI content can't break markup."""
     return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+def mark_html(text, subtle=False):
+    """Texto simples → HTML (RichText) com as palavras e expressões-chave SUBLINHADAS
+    e CLICÁVEIS (href 'lexioword:<frase>'), usando a MESMA classificação do
+    sublinhador das legendas (mark_tokens): expressões em violeta, nível em verde,
+    avançadas em âmbar. Escapa o texto e preserva quebras de linha. O clique abre a
+    aba Detalhes (quem usa liga `linkActivated` a um handler que faz word_details.show_for).
+
+    subtle=True (usado no CHAT): NÃO pinta tudo de cores — só as expressões multi-palavra
+    ficam coloridas (quando faz mesmo falta); as restantes ficam apenas SUBLINHADAS na
+    cor do texto, para a resposta da IA não parecer um arco-íris."""
+    from urllib.parse import quote
+    import re
+    # Limpa marcadores Markdown (a IA por vezes usa-os) p/ não saírem literais no RichText.
+    txt = str(text or "")
+    txt = re.sub(r'\*\*(.+?)\*\*', r'\1', txt)
+    txt = re.sub(r'__(.+?)__', r'\1', txt)
+    txt = re.sub(r'`(.+?)`', r'\1', txt)
+    txt = re.sub(r'(?m)^\s{0,3}#{1,6}\s*', '', txt)
+    txt = re.sub(r'(?m)^\s*[-*]\s+', '• ', txt)
+    out_lines = []
+    for line in txt.split("\n"):
+        words = line.split(" ")
+        marks = mark_tokens(words)
+        parts = []; i = 0; n = len(words)
+        while i < n:
+            w = words[i]
+            m = marks[i] if i < len(marks) else None
+            if m and m.get("key") and m.get("color"):
+                color = m["color"]; click = (m.get("click") or _clean_core(w))
+                # No chat: só as expressões (grupos violeta) mantêm cor; o resto
+                # fica sublinhado na cor normal do texto (sem "todas coloridas").
+                if subtle and color != MARK_GROUP:
+                    color = TXT
+                # Junta as palavras seguidas que formam a MESMA expressão (grupo violeta).
+                j = i
+                if color == MARK_GROUP:
+                    while (j + 1 < n and marks[j + 1] and marks[j + 1].get("color") == MARK_GROUP
+                           and marks[j + 1].get("click") == click):
+                        j += 1
+                phrase_disp = " ".join(words[i:j + 1])
+                href = "lexioword:" + quote(click)
+                parts.append(f'<a href="{href}" style="color:{color};text-decoration:underline;">'
+                             f'{_esc_html(phrase_disp)}</a>')
+                i = j + 1
+            else:
+                parts.append(_esc_html(w)); i += 1
+        out_lines.append(" ".join(parts))
+    return "<br>".join(out_lines)
+
+
+def _list_show_full(lst):
+    """Faz uma QListWidget mostrar o texto dos itens POR INTEIRO: quebra de linha em
+    vez de reticências, e barra horizontal quando precisa. (Queixa do user: nas abas
+    Vídeos/Tracks/Playlist os dizeres não cabiam / não dava p/ ver tudo.)"""
+    try:
+        lst.setWordWrap(True)
+        lst.setTextElideMode(Qt.ElideNone)
+        lst.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+    except Exception:
+        pass
 
 
 class FluencyDialog(QDialog):
@@ -4251,7 +4962,7 @@ class FluencyDialog(QDialog):
                 raise Exception("ChatPanel nao disponivel")
         except Exception as e:
             log(f"fluency FALHOU: {type(e).__name__}: {e}")
-            QTimer.singleShot(0, self._fail)
+            gui_call(self._fail)
 
     def _on_eval(self, resp, err):
         # Desliga o sinal para nao acumular chamadas
@@ -4261,15 +4972,15 @@ class FluencyDialog(QDialog):
             except: pass
         if err or not resp:
             log(f"fluency eval error: {err or 'resposta vazia'}")
-            QTimer.singleShot(0, self._fail)
+            gui_call(self._fail)
             return
         try:
             raw = resp.strip().strip("`")
             parsed = json.loads(raw[raw.find("{"):raw.rfind("}") + 1])
-            QTimer.singleShot(0, lambda: self._show(parsed))
+            gui_call(lambda: self._show(parsed))
         except Exception as e:
             log(f"fluency parse FALHOU: {type(e).__name__}: {e}")
-            QTimer.singleShot(0, self._fail)
+            gui_call(self._fail)
 
     def _fail(self):
         self._checking = False
@@ -4431,7 +5142,7 @@ class ParaphraseDialog(QDialog):
                 raise Exception("ChatPanel nao disponivel")
         except Exception as e:
             log(f"paraphrase FALHOU: {type(e).__name__}: {e}")
-            QTimer.singleShot(0, self._fail)
+            gui_call(self._fail)
 
     def _on_eval(self, resp, err):
         cp = self._chat_panel
@@ -4440,15 +5151,15 @@ class ParaphraseDialog(QDialog):
             except: pass
         if err or not resp:
             log(f"paraphrase eval error: {err or 'resposta vazia'}")
-            QTimer.singleShot(0, self._fail)
+            gui_call(self._fail)
             return
         try:
             raw = resp.strip().strip("`")
             parsed = json.loads(raw[raw.find("{"):raw.rfind("}") + 1])
-            QTimer.singleShot(0, lambda: self._show(parsed))
+            gui_call(lambda: self._show(parsed))
         except Exception as e:
             log(f"paraphrase parse FALHOU: {type(e).__name__}: {e}")
-            QTimer.singleShot(0, self._fail)
+            gui_call(self._fail)
 
     def _fail(self):
         self._checking = False
@@ -4490,10 +5201,16 @@ class DescribeDialog(QDialog):
         # Guardar estado para repor ao fechar.
         self._prev_loop = engine._loop
         self._was_playing = engine.is_playing()
+        self._prev_autopause = getattr(engine, "_autopause", False)
+        self._prev_ai_loop = getattr(engine, "_ai_loop", False)
 
         self._lines = engine.fluency_group()
         # Aplicar o comportamento pedido: cena → loop; take → pause.
         if self._mode == "scene" and self._lines:
+            # Auto-pausa/AI-loop dariam cabo do loop da cena (pausava/repetia linha a
+            # linha). Desligam-se enquanto a cena anda em loop; repostos ao fechar.
+            engine._autopause = False
+            engine._ai_loop = False
             engine.loop_range(self._lines[0].start, self._lines[-1].end)
         elif self._mode == "take":
             engine.pause()
@@ -4538,7 +5255,9 @@ class DescribeDialog(QDialog):
         lo.addWidget(self.answer)
 
         self.fb = QLabel(""); self.fb.setWordWrap(True); self.fb.setVisible(False)
-        self.fb.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.fb.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.LinksAccessibleByMouse)
+        self.fb.setOpenExternalLinks(False)
+        self.fb.linkActivated.connect(self._on_marked_word)   # palavra sublinhada → Detalhes
         self.fb.setStyleSheet(f"color:{TXT};font-size:12px;background:{ELV};"
                               f"border:1px solid {BRD};border-radius:8px;padding:10px 12px;")
         lo.addWidget(self.fb)
@@ -4591,48 +5310,74 @@ class DescribeDialog(QDialog):
         return self._engine is not None and getattr(self._engine, "_player", None) is not None
 
     def _work(self, scene, ans, frame=None):
+        # Fluxo em 2 PASSOS (robusto):
+        #   PASSO 1 — uma IA de VISÃO gratuita olha para o fotograma e descreve, em
+        #             texto simples, o que se vê. (Modelos pedem só prosa, não JSON →
+        #             muito mais fiável do que pedir scoring à IA de visão.)
+        #   PASSO 2 — a IA de TEXTO (DeepSeek, fiável) recebe essa descrição da imagem
+        #             + as legendas + a descrição do aluno e AVALIA se bate certo.
+        # Se a visão falhar (sem chave / rate-limit), o passo 2 corre só com as
+        # legendas — o exercício nunca rebenta.
+        nat = native_language_name()
+        # Nome da língua-ALVO (a que o utilizador está a aprender) p/ a IA escrever a
+        # descrição-modelo NELA (e não na nativa). Vem da conta via _content_lang().
         try:
-            nat = native_language_name()
-            unit = "single shot (a take)" if self._mode == "take" else "scene"
-            if frame:
-                # ── Visão real (OpenRouter via /api/vision): o modelo VÊ o fotograma
-                # e compara o que aparece com o que foi dito e com a descrição do aluno.
+            mw = self.parent()
+            tgt_name = i18n.language_en_name(mw._content_lang()) if mw and hasattr(mw, "_content_lang") else ""
+        except Exception:
+            tgt_name = ""
+        tgt_name = tgt_name or "the language being learned"
+        unit = "single shot (a take)" if self._mode == "take" else "scene"
+        seen_desc = ""
+        if frame:
+            try:
+                data, mime = frame
+                seen_desc = call_vision(
+                    "Describe, in 2-4 plain sentences, what is visibly happening in this "
+                    "film frame: the people, their actions and expressions, the setting and "
+                    "the mood. Describe ONLY what is actually visible — no preamble, no guesses.",
+                    system="You are a precise visual describer for a film. Describe only what is "
+                           "actually visible in the image.",
+                    images=[{"data": data, "mimeType": mime}],
+                    max_tokens=300, temperature=0.2, json_mode=False).strip().strip("`")
+            except Exception as e:
+                log(f"describe visão (passo 1) indisponível: {e}")
+                seen_desc = ""
+        try:
+            if seen_desc:
                 sys_p = (
-                    "You are a language coach with vision. You can SEE one frame from a film. "
-                    f"The user is learning a language and is describing this {unit} in the language "
-                    "they are LEARNING. You are given: the image (what actually appears on screen) and "
-                    "the subtitle lines (what is being SAID). Compare the three — image, dialogue and the "
-                    "user's description. Reward a description that matches what is genuinely visible and is "
-                    "rich, natural and grammatical in the target language; gently flag anything the user "
-                    "claims that the image does NOT support. Be specific and encouraging. "
-                    "Respond ONLY with JSON:\n"
+                    "You are a language coach. The user is learning a language and is describing "
+                    f"a {unit} from a film in the language they are LEARNING. You are given: "
+                    "(A) an objective description of what the frame actually SHOWS (from an image "
+                    "model), (B) the subtitle lines (what is being SAID), and (C) the user's "
+                    "description. Judge whether the user's description MATCHES what is genuinely "
+                    "shown and said, and how rich, natural and grammatical it is in the target "
+                    "language. Gently flag anything the user claims that the image does NOT support. "
+                    "Be specific and encouraging. Respond ONLY with JSON:\n"
                     '{"score": <integer 0-100>, '
                     f'"feedback": "<2-3 sentences in {nat}: accuracy vs the image, language quality, what to improve>", '
                     f'"seen": "<1 sentence in {nat}: what the image actually shows>", '
-                    '"model": "<a vivid, accurate model description, in the language being learned>"}')
-                user_p = (f"SUBTITLES (what is being said, language being learned):\n{scene or '(no dialogue here)'}\n\n"
-                          f"USER DESCRIPTION:\n{ans}")
-                data, mime = frame
-                raw = call_vision(user_p, system=sys_p,
-                                  images=[{"data": data, "mimeType": mime}],
-                                  model="google/gemini-2.0-flash-001",
-                                  max_tokens=700, temperature=0.3, json_mode=True).strip().strip("`")
-                parsed = json.loads(raw[raw.find("{"):raw.rfind("}") + 1])
-                QTimer.singleShot(0, lambda: self._show(parsed))
-                return
-            # ── Sem imagem (offline / captura falhou): avaliação só por texto. ──
-            sys_p = (
-                "You are a language coach. The user is learning a language by watching a film and is "
-                f"describing a {unit} in the language they are LEARNING. Below are the subtitle lines of "
-                "that part of the film, as context for what is happening. Evaluate the user's description: "
-                "is it in the target language, rich and varied in vocabulary, grammatically natural, and "
-                "coherent with what the dialogue suggests is happening? Be encouraging but specific. "
-                "Respond ONLY with JSON:\n"
-                '{"score": <integer 0-100>, '
-                f'"feedback": "<2-3 sentences in {nat}: what was good and what to improve>", '
-                '"model": "<a vivid, natural model description, in the language being learned>"}')
-            user_p = f"SCENE SUBTITLES (language being learned):\n{scene or '(no dialogue in this moment)'}\n\nUSER DESCRIPTION:\n{ans}"
-            body = json.dumps({"model": "deepseek-chat", "max_tokens": 800, "temperature": 0.3,
+                    f'"model": "<a RICH, DETAILED model description written entirely in {tgt_name} (the '
+                    'target language), 3-5 sentences covering who is present, their actions and '
+                    'expressions, the setting, the mood, and how it ties to the dialogue>"}')
+                user_p = (f"(A) WHAT THE IMAGE SHOWS:\n{seen_desc}\n\n"
+                          f"(B) SUBTITLES (language being learned):\n{scene or '(no dialogue here)'}\n\n"
+                          f"(C) USER DESCRIPTION:\n{ans}")
+            else:
+                sys_p = (
+                    "You are a language coach. The user is learning a language by watching a film and is "
+                    f"describing a {unit} in the language they are LEARNING. Below are the subtitle lines of "
+                    "that part of the film, as context for what is happening. Evaluate the user's description: "
+                    "is it in the target language, rich and varied in vocabulary, grammatically natural, and "
+                    "coherent with what the dialogue suggests is happening? Be encouraging but specific. "
+                    "Respond ONLY with JSON:\n"
+                    '{"score": <integer 0-100>, '
+                    f'"feedback": "<2-3 sentences in {nat}: what was good and what to improve>", '
+                    f'"model": "<a RICH, DETAILED model description written entirely in {tgt_name} (the '
+                    'target language), 3-5 sentences covering who is present, their actions, the setting, '
+                    'the mood, and how it ties to the dialogue>"}')
+                user_p = f"SCENE SUBTITLES (language being learned):\n{scene or '(no dialogue in this moment)'}\n\nUSER DESCRIPTION:\n{ans}"
+            body = json.dumps({"model": "deepseek-chat", "max_tokens": 1100, "temperature": 0.3,
                 "messages": [{"role": "system", "content": sys_p},
                              {"role": "user", "content": user_p}]}).encode()
             r = urlopen(Request(f"{LEXIO_API}/api/deepseek-chat", data=body,
@@ -4640,10 +5385,10 @@ class DescribeDialog(QDialog):
             d = json.loads(r.read().decode())
             raw = (d.get("text") or "").strip().strip("`")
             parsed = json.loads(raw[raw.find("{"):raw.rfind("}") + 1])
-            QTimer.singleShot(0, lambda: self._show(parsed))
+            gui_call(lambda: self._show(parsed))
         except Exception as e:
             log(f"describe: {e}")
-            QTimer.singleShot(0, self._fail)
+            gui_call(self._fail)
 
     def _fail(self):
         self._checking = False
@@ -4659,7 +5404,8 @@ class DescribeDialog(QDialog):
             score = 0
         color = "#5ae05a" if score >= 75 else ("#e0c05a" if score >= 50 else "#e07a5a")
         fb = _esc_html(data.get("feedback", "")).replace("\n", "<br>")
-        model = _esc_html(data.get("model", "")).replace("\n", "<br>")
+        # Descrição-modelo na língua-alvo → vocabulário sublinhado e clicável (→ Detalhes).
+        model = mark_html(data.get("model", ""))
         seen = _esc_html(data.get("seen", "")).replace("\n", "<br>")
         seen_html = (f"<span style='color:{TMT};font-weight:600;'>{T('describe_seen')}</span><br>"
                      f"<span style='color:{TS2};'>{seen}</span><br><br>") if seen else ""
@@ -4670,6 +5416,18 @@ class DescribeDialog(QDialog):
             f"<span style='color:{TMT};font-weight:600;'>{T('describe_model')}</span><br>"
             f"<span style='color:{TS2};'>{model}</span>")
 
+    def _on_marked_word(self, href):
+        """Clique numa palavra/expressão sublinhada na descrição-modelo → abre Detalhes."""
+        if href and href.startswith("lexioword:"):
+            from urllib.parse import unquote
+            mw = self.parent()
+            try:
+                if mw and hasattr(mw, "word_details"):
+                    mw.word_details.show_for(unquote(href.split(":", 1)[1]))
+                    if hasattr(mw, "_balance_left_dock"): mw._balance_left_dock()
+            except Exception as e:
+                log(f"describe marked word: {e}")
+
     def closeEvent(self, e):
         # Repor o estado do filme: tirar o loop da cena (a menos que já existisse) e
         # retomar a reprodução se o take a tinha pausado.
@@ -4677,6 +5435,8 @@ class DescribeDialog(QDialog):
             if self._mode == "scene":
                 self._engine._loop = self._prev_loop
                 self._engine._loop_a = None
+                self._engine._autopause = self._prev_autopause
+                self._engine._ai_loop = self._prev_ai_loop
             elif self._mode == "take" and self._was_playing:
                 self._engine.play()
         except Exception:
@@ -4694,6 +5454,19 @@ class DialogueDialog(QDialog):
     def __init__(self, parent, engine):
         super().__init__(parent)
         self._engine = engine
+        # O Loop IA / auto-pausa / loop A-B do MOTOR fazem o seu próprio seek a cada
+        # fala e lutavam contra a condução deste exercício (que também faz seek por
+        # fala) — com o "Loop IA" ligado o diálogo não avançava/parecia não abrir.
+        # Suspende-os enquanto o exercício está aberto; repõe no closeEvent.
+        self._prev_ai_loop = getattr(engine, "_ai_loop", False)
+        self._prev_autopause = getattr(engine, "_autopause", False)
+        self._prev_loop = getattr(engine, "_loop", None)
+        try:
+            engine._ai_loop = False
+            engine._autopause = False
+            engine._loop = None
+        except Exception:
+            pass
         self._lines = self._collect_lines(engine)   # corrida de legendas a partir da posição
         self._idx = -1
         self._done = False
@@ -4859,6 +5632,13 @@ class DialogueDialog(QDialog):
         except Exception: pass
         try: self._engine.restore_volume()   # nunca deixar o filme com volume baixo
         except Exception: pass
+        # Repor os modos do motor que tínhamos suspendido (Loop IA / auto-pausa / A-B).
+        try:
+            self._engine._ai_loop = self._prev_ai_loop
+            self._engine._autopause = self._prev_autopause
+            self._engine._loop = self._prev_loop
+        except Exception:
+            pass
         super().closeEvent(e)
 
 
@@ -4953,6 +5733,10 @@ class SceneMissionDialog(QDialog):
 
 
 class MainWindow(QMainWindow):
+    # Entrega segura de resultados de threads worker para a GUI (queued).
+    tracks_ready = pyqtSignal(object)   # (lista de segmentos)
+    tracks_failed = pyqtSignal(str)     # (mensagem de erro)
+
     def __init__(self):
         super().__init__()
         self._study_mode = False
@@ -4969,6 +5753,15 @@ class MainWindow(QMainWindow):
 
     def _setup(self):
         self.video_path = None; self.mgr = StudyMgr()
+        # ── Lembrete de revisão espaçada (notificação do sistema) ──
+        # Criado cedo porque a aba Ferramentas (construída mais abaixo) já liga o
+        # checkbox a ele. O token resolve-se preguiçosamente (self.chat ainda não
+        # existe aqui; já existe quando o timer dispara).
+        self._tray = None
+        self.reminder = ReminderManager(
+            lambda: self.chat._get_token_header() if getattr(self, "chat", None) else None,
+            self)
+        self.reminder.show_note.connect(self._show_reminder_note)
         self._autopause_on = False
         # ── Tipo de estudo: desligado | leve | focado. A IA (Scene Agent) está SEMPRE
         # em modo "Deus" (máxima qualidade); o que muda é QUANTO intervém:
@@ -4979,11 +5772,28 @@ class MainWindow(QMainWindow):
         self._scene_done = set()        # ids de missões já feitas/saltadas
         self._scene_subs_key = None     # rebuild só quando as legendas mudam
         self._in_mission = False        # evita re-disparar enquanto o diálogo está aberto
+        # ── Exercícios automáticos ao longo do filme (toggle do user) ──
+        # Quando ligado, a cada ~N falas (numa pausa natural) abre, encaixado no
+        # sidebar, o próximo exercício em rotação — o filme tece exercícios sozinho.
+        self._auto_ex = False
+        self._auto_ex_count = 0
+        self._auto_ex_every = 8         # uma atividade a cada ~8 falas ouvidas
+        self._auto_ex_rotation = 0
         self._tracks = []          # [{"title": str, "start_idx": int, "end_idx": int}]
+        # ── Aulas (tracks): narração ao vivo enquanto o segmento toca ──
+        self._lesson_active = False
+        self._lesson_row = None         # índice do track em curso
+        self._lesson_range = None       # (start_idx, end_idx)
+        self._lesson_seen = set()       # legendas já narradas neste track
+        self._lesson_inflight = False   # uma nota da IA de cada vez
+        self._lesson_pending = None     # legenda à espera enquanto há uma em curso
+        self._lesson_done = set()       # rows de tracks concluídos (marca no groove)
+        self._slow_voice = False        # modo lento: VLC mudo + voz neural por cima (<1x)
         self._listening_mode = False
-        self._listening_interval = 3  # ask question every N subtitles
+        self._listening_interval = 2  # reouvir+perguntar a cada N falas
         self._listening_sub_count = 0
         self._listening_pending = False
+        self._listening_replays = 2   # quantas vezes a fala se repete (loop) antes da pergunta — configurável
         self._playlist = []; self._pl_idx = -1
         self._cur_sub = ""        # última legenda visível (p/ a aba Pronúncia)
         self._rate = 1.0; self._vol = 50; self._seeking = False
@@ -4992,6 +5802,11 @@ class MainWindow(QMainWindow):
         self._fs_hide_timer = QTimer(self); self._fs_hide_timer.setSingleShot(True)
         self._fs_hide_timer.setInterval(2800)
         self._fs_hide_timer.timeout.connect(self._fs_hide_controls)
+        # Sonda a posição do cursor no modo estudo: mostra o groove quando o cursor
+        # está na zona de baixo, mesmo durante exercícios (um diálogo modal rouba os
+        # eventos de movimento do rato, por isso o mousemove sozinho não chegava).
+        self._fs_cursor_timer = QTimer(self); self._fs_cursor_timer.setInterval(250)
+        self._fs_cursor_timer.timeout.connect(self._fs_cursor_poll)
         self._setup_ui()
         self.engine.position_changed.connect(self._on_pos)
         self.engine.media_ended.connect(self._on_end)
@@ -5001,8 +5816,22 @@ class MainWindow(QMainWindow):
         self.engine.subtitle_changed.connect(self.overlay.show_subtitle)
         self.engine.subtitle_changed.connect(self._remember_last_sub)
         self.engine.subtitle_exited.connect(self._on_sub_exited)
+        self.engine.subtitle_entered.connect(self._lesson_on_sub)
+        self.engine.subtitle_entered.connect(self._slow_voice_on_sub)
+        self.engine.subtitle_entered.connect(self._auto_ex_on_sub)
+        self.tracks_ready.connect(self._on_tracks_ready)
+        self.tracks_failed.connect(self._track_fail)
         self.engine.ai_loop_changed.connect(self._on_ai_loop)
-        self.engine.vocab_triggered.connect(self.overlay.show_vocab)
+        # Cartões "twitch": uma legenda → um cartão. Antes vinham de vocab_triggered,
+        # que usa _played_ids e por isso SALTAVA para sempre qualquer fala já tocada
+        # (loops, seek p/ trás, listening) → "nem todas as legendas apareciam no feed".
+        # subtitle_entered dispara em CADA entrada de fala, em paridade exata com a
+        # legenda de baixo, por isso o feed nunca mais perde linhas.
+        self.engine.subtitle_entered.connect(self._card_on_sub)
+        # Sublinhador inteligente: lê o guião em contexto e deteta GRUPOS de palavras.
+        self._expr_miner = ExpressionMiner(LEXIO_API)
+        self._expr_miner.updated.connect(self.overlay.update)   # repinta com novos grupos
+        self.engine.vocab_triggered.connect(self._feed_expr_miner)
         self.overlay.add_word.connect(self._on_overlay_add)
         self.overlay.ask_ai.connect(self._on_overlay_ask)
         self.overlay.speak_card.connect(self._speak_slow)
@@ -5024,7 +5853,9 @@ class MainWindow(QMainWindow):
         # hanging off-screen and subtitles landed at the screen corner. Clamp the
         # clamp the default to the available work area and open centred; keep the
         # minimum large enough for all nav/exercise buttons to fit comfortably.
-        self.setMinimumSize(1000, 480)
+        # Mínimo modesto: com as barras a quebrarem (FlowLayout) e as listas/abas a
+        # mostrarem tudo, a app continua usável e SEM cortar nada em janelas pequenas.
+        self.setMinimumSize(680, 520)
         try:
             av = QApplication.primaryScreen().availableGeometry()
             w0 = min(1200, av.width() - 24); h0 = min(780, av.height() - 24)
@@ -5038,31 +5869,11 @@ class MainWindow(QMainWindow):
         c = QWidget(); self.setCentralWidget(c)
         outer = QVBoxLayout(c); outer.setContentsMargins(0,0,0,0); outer.setSpacing(0)
 
-        # ═══ TOP BAR ═══
-        top = QWidget(); top.setObjectName("top_bar"); top.setFixedHeight(44)
-        top.setStyleSheet(f"background:{SRF};border-bottom:1px solid {BRD};")
-        tl = QHBoxLayout(top); tl.setContentsMargins(16,0,12,0)
-        logo = QLabel("▐█ Lexio"); logo.setStyleSheet(f"color:{ACC};font-size:15px;font-weight:bold;background:transparent;")
-        tl.addWidget(logo)
-        sub = QLabel(T("player")); sub.setStyleSheet(f"color:{TMT};font-size:12px;background:transparent;")
-        tl.addWidget(sub); tl.addSpacing(12)
-        self.tit = QLabel(""); self.tit.setStyleSheet(f"color:{TS2};font-size:12px;background:transparent;")
-        tl.addWidget(self.tit, 1)
-
-        # Chat toggle — clearly labelled ("Chat IA") so it's easy to find; the old
-        # bare "Chat" pill was too discreet. Accent-filled when active.
-        self.chat_toggle = QPushButton("Chat IA")
-        self.chat_toggle.setFixedHeight(28); self.chat_toggle.setMinimumWidth(92)
-        self.chat_toggle.setCursor(Qt.PointingHandCursor)
-        self.chat_toggle.setToolTip(T("chat_toggle_tip"))
-        self.chat_toggle.setStyleSheet(f"QPushButton{{background:transparent;border:1px solid {ACC};border-radius:14px;color:{TS2};font-size:11px;font-weight:600;padding:0 12px;}}QPushButton:hover{{background:{HVR};color:{TXT};border-color:{ACC};}}QPushButton:checked{{background:{ACC};border-color:{ACC};color:{ON_ACC};}}")
-        self.chat_toggle.setCheckable(True); self.chat_toggle.setChecked(True)
-        self.chat_toggle.clicked.connect(self._toggle_chat)
-        tl.addWidget(self.chat_toggle)
-
-        ab = yt_btn(T("open_video"), accent=True, tip=T("open_video_tip")); ab.clicked.connect(self._open)
-        tl.addWidget(ab)
-        outer.addWidget(top)
+        # ═══ (sem barra de topo) ═══
+        # A antiga TOP BAR (logo + "Chat IA" + "Abrir") foi removida: repetia o
+        # cabeçalho "Chat IA" do painel de chat. Os seus botões vivem agora na
+        # barra de controlos do vídeo (chat = self.chat_btn; abrir = self.open_btn)
+        # e o nome do vídeo atual passa para o título da janela (mais limpo).
 
         # ═══ BODY ═══
         body = QWidget(); body.setStyleSheet(f"background:{BG};")
@@ -5113,20 +5924,31 @@ class MainWindow(QMainWindow):
             if tip: b.setToolTip(tip)
             b.setStyleSheet(f"QPushButton{{background:transparent;border:none;color:{TS2};font-family:{ICON_F};font-size:{fsize}px;border-radius:{size//2}px;}}QPushButton:hover{{background:{HVR};color:{TXT};}}")
             return b
-        cb = QWidget(); cb.setObjectName("controls_bar"); cb.setFixedHeight(56)
+        cb = QWidget(); cb.setObjectName("controls_bar")
         cb.setStyleSheet("#controls_bar{background:#1c1c1c;}")
-        cl = QHBoxLayout(cb); cl.setContentsMargins(18,6,18,9); cl.setSpacing(6)
+        cb.setMinimumHeight(56)
+        # FlowLayout: em janelas estreitas os controlos QUEBRAM p/ a linha seguinte em
+        # vez de serem cortados — garante que TODOS os botões ficam sempre visíveis,
+        # qualquer que seja o tamanho da janela (igual às barras nav/exercícios).
+        # center=True: os controlos de transporte ficam CENTRADOS (estilo Windows
+        # Media Player), tanto em janela como em ecrã inteiro — antes encostavam à
+        # esquerda porque o FlowLayout alinhava sempre a partir da margem esquerda.
+        cl = FlowLayout(cb, margin=0, hspacing=6, vspacing=4, center=True)
+        cl.setContentsMargins(14,6,14,6)
+        _spc = QSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum); _spc.setHeightForWidth(True)
+        cb.setSizePolicy(_spc)
 
         self.pb = _icn(chr(0xE892), 38, 14, T("prev_p")); self.pb.clicked.connect(self._prev)
-        self.play_btn = QPushButton(chr(0xE768)); self.play_btn.setFixedSize(46,46)
+        self.play_btn = QPushButton(chr(0xE768)); self.play_btn.setFixedSize(46,46); self.play_btn.setToolTip(T("play_tip"))
         self.play_btn.setStyleSheet(f"QPushButton{{background:{ACC};border:none;border-radius:23px;color:{ON_ACC};font-family:{ICON_F};font-size:18px;}}QPushButton:hover{{background:{ACC_HOVER};}}")
         self.play_btn.clicked.connect(self._toggle)
         self.nb = _icn(chr(0xE893), 38, 14, T("next_n")); self.nb.clicked.connect(self._next)
 
+        # 0xE7F0 = ClosedCaption (o CC tradicional). 0xE720 era o Microfone — errado.
         self.sub_btn = _icn(chr(0xE7F0), 36, 16, T("load_sub_tip"))
         self.sub_btn.clicked.connect(self._load_sub_file)
-        self.sub_icon = QPushButton(""); self.sub_icon.setFixedSize(30,24)
-        self.sub_icon.setStyleSheet(f"QPushButton{{background:transparent;border:none;color:{TMT};font-size:10px;}}QPushButton:hover{{color:{ACC};}}")
+        self.sub_icon = QPushButton(chr(0xE7F0)); self.sub_icon.setFixedSize(30,24)
+        self.sub_icon.setStyleSheet(f"QPushButton{{background:transparent;border:none;color:{TMT};font-family:{ICON_F};font-size:13px;}}QPushButton:hover{{color:{ACC};}}")
         self.sub_icon.setToolTip(T("sub_toggle_tip"))
         self.sub_icon.clicked.connect(self._cycle_subs)
 
@@ -5137,7 +5959,7 @@ class MainWindow(QMainWindow):
         self.vol.setStyleSheet(f"QSlider::groove:horizontal{{background:{HVR};height:3px;border-radius:1.5px;}}QSlider::sub-page:horizontal{{background:{TS2};border-radius:1.5px;}}QSlider::handle:horizontal{{background:{TS2};width:11px;height:11px;margin:-4px 0;border-radius:5.5px;}}")
         self.vol.valueChanged.connect(lambda v: (self.engine.set_vol(v), setattr(self,'_vol',v)))
 
-        self.spd = QPushButton("1.0x"); self.spd.setFixedSize(50,30)
+        self.spd = QPushButton("1.0x"); self.spd.setFixedSize(50,30); self.spd.setToolTip(T("spd_tip"))
         self.spd.setStyleSheet(f"QPushButton{{background:transparent;color:{TS2};border:1px solid {BRD};border-radius:15px;font-size:11px;font-weight:600;}}QPushButton:hover{{color:{TXT};border-color:{ACC};background:{HVR};}}")
         self.spd.clicked.connect(self._cycle_spd)
 
@@ -5152,18 +5974,30 @@ class MainWindow(QMainWindow):
             f"QPushButton:checked{{color:{ACC};}}")
         self.chat_btn.clicked.connect(self._toggle_chat_btn)
 
+        # Abrir vídeo — antes vivia na barra de topo (removida); agora é um ícone
+        # discreto na barra de controlos, ao lado dos restantes.
+        self.open_btn = QPushButton(chr(0xE8E5)); self.open_btn.setFixedSize(38, 38)   # OpenFile
+        self.open_btn.setCursor(Qt.PointingHandCursor)
+        self.open_btn.setToolTip(T("open_video_tip"))
+        self.open_btn.setStyleSheet(
+            f"QPushButton{{background:transparent;border:none;color:{TS2};font-family:{ICON_F};font-size:15px;border-radius:19px;}}"
+            f"QPushButton:hover{{background:{HVR};color:{TXT};}}")
+        self.open_btn.clicked.connect(self._open)
+
         self.fs_btn = _icn(chr(0xE740), 38, 15, T("fullscreen_f")); self.fs_btn.clicked.connect(self._toggle_study_mode)
 
-        # [speed] -- [prev . play . next] -- [CC . vol . chat . fullscreen]
-        cl.addWidget(self.spd)
-        cl.addStretch(1)
-        cl.addWidget(self.pb); cl.addSpacing(6); cl.addWidget(self.play_btn); cl.addSpacing(6); cl.addWidget(self.nb)
-        cl.addStretch(1)
-        cl.addWidget(self.sub_btn); cl.addWidget(self.sub_icon); cl.addWidget(self.vol_icon); cl.addWidget(self.vol); cl.addWidget(self.chat_btn); cl.addWidget(self.fs_btn)
+        # Ordem: abrir · velocidade · anterior · play · seguinte · CC · alternar CC ·
+        # volume · chat · ecrã inteiro. (Sem stretches: o FlowLayout quebra sozinho.)
+        for w in (self.open_btn, self.spd, self.pb, self.play_btn, self.nb,
+                  self.sub_btn, self.sub_icon, self.vol_icon, self.vol, self.chat_btn, self.fs_btn):
+            cl.addWidget(w)
         left_lo.addWidget(cb)
 
-        # ── Barra de navegação de legendas (perto dos controlos) ──
-        def nav_btn(label, tip, checkable=False):
+        # ── Barra de navegação de legendas (rótulos de texto legíveis + tooltips) ──
+        # Texto em vez de glyphs de ícone: nunca renderiza como quadradinho e é
+        # inequívoco — estes não são controlos universais (segmentar, auto-legenda,
+        # esconder legenda…), por isso a palavra é mais intuitiva que um símbolo.
+        def nav_icn(label, tip, checkable=False):
             b = QPushButton(label); b.setToolTip(tip); b.setCheckable(checkable)
             b.setCursor(Qt.PointingHandCursor)
             b.setStyleSheet(
@@ -5172,11 +6006,30 @@ class MainWindow(QMainWindow):
                 f"QPushButton:hover{{background:{HVR};color:{TXT};border-color:{ACC};}}"
                 f"QPushButton:checked{{background:{HVR};color:{TXT};border-color:{ACC};}}")
             return b
+        # Controlos de reprodução/prática (Repetir/Anterior/Seguinte/Loop/Auto-pausa):
+        # ícones COMPACTOS — são ações convencionais de vídeo, por isso o símbolo
+        # poupa espaço e lê-se logo. Fonte Segoe MDL2 Assets (presente em todo o
+        # Windows 10), codepoints DISTINTOS (nada de duplicados); o tooltip mantém
+        # a palavra para quem tiver dúvida.
+        def nav_sym(glyph, tip, checkable=False):
+            b = QPushButton(glyph); b.setToolTip(tip); b.setCheckable(checkable)
+            b.setCursor(Qt.PointingHandCursor); b.setFixedSize(30, 26)
+            b.setStyleSheet(
+                f"QPushButton{{background:transparent;color:{TS2};border:1px solid {BRD};"
+                f"border-radius:13px;font-size:13px;padding:0;font-family:'Segoe MDL2 Assets','Segoe Fluent Icons';}}"
+                f"QPushButton:hover{{background:{HVR};color:{TXT};border-color:{ACC};}}"
+                f"QPushButton:checked{{background:rgba(80,150,255,0.15);color:{TXT};border-color:{ACC};}}")
+            return b
         self.nav_bar = QWidget(); self.nav_bar.setObjectName("nav_bar")
         self.nav_bar.setStyleSheet("#nav_bar{background:#181818;}")
-        nav_lo = QHBoxLayout(self.nav_bar); nav_lo.setContentsMargins(16,2,16,2); nav_lo.setSpacing(6)
-        nav_lo.setAlignment(Qt.AlignLeft)
-        self.btn_sub = nav_btn(T("sub_add"), T("sub_add_tip"), True)
+        # FlowLayout: quando a janela estreita, os botões QUEBRAM para a linha
+        # seguinte em vez de serem cortados (os ícones deixavam de aparecer). A
+        # política de tamanho com heightForWidth deixa a barra crescer em altura.
+        nav_lo = FlowLayout(self.nav_bar, margin=0, hspacing=6, vspacing=6)
+        nav_lo.setContentsMargins(12,3,12,3)
+        _sp = QSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum); _sp.setHeightForWidth(True)
+        self.nav_bar.setSizePolicy(_sp)
+        self.btn_sub = nav_icn(T("sub_add"), T("sub_add_tip"), True)
         self.btn_sub.setStyleSheet(
             f"QPushButton{{background:transparent;color:{TS2};border:1px solid {ACC};"
             f"border-radius:13px;font-size:11px;padding:4px 13px;font-family:'Inter','Segoe UI',sans-serif;font-weight:600;}}"
@@ -5184,38 +6037,44 @@ class MainWindow(QMainWindow):
             f"QPushButton:checked{{background:rgba(60,180,90,0.18);color:#9EE6A0;border-color:#3CB45A;}}")
         self.btn_sub.clicked.connect(self._load_sub_file)
         nav_lo.addWidget(self.btn_sub)
-        self.btn_sub_online = nav_btn(T("sub_online"), T("sub_online_tip"))
+        self.btn_sub_online = nav_icn(T("sub_online"), T("sub_online_tip"))
         self.btn_sub_online.clicked.connect(self._search_subs_online)
         nav_lo.addWidget(self.btn_sub_online)
-        self.btn_segment = nav_btn(T("track_segment"), T("track_segment_tip"))
+        self.btn_segment = nav_icn(T("track_segment"), T("track_segment_tip"))
         self.btn_segment.clicked.connect(self._segment_subs)
         nav_lo.addWidget(self.btn_segment)
-        self.btn_stt = nav_btn(T("stt_btn"), T("stt_tip"))
-        self.btn_stt.clicked.connect(self._generate_auto_captions)
-        nav_lo.addWidget(self.btn_stt)
+        # (Auto-legenda removida por agora: o DeepSeek não transcreve áudio e o
+        # Whisper local não vinha no build — o botão só dava erro. Volta quando
+        # houver um STT na nuvem decidido. _generate_auto_captions fica inerte.)
         sep1 = QLabel("|"); sep1.setStyleSheet(f"color:{BRD};font-size:11px;padding:0 2px;background:transparent;")
         nav_lo.addWidget(sep1)
-        b_rep = nav_btn(T("repeat"), T("prac_repeat_tip")); b_rep.clicked.connect(self.engine.replay_sub)
-        b_prev = nav_btn(T("previous"), T("prac_prev_tip")); b_prev.clicked.connect(self.engine.prev_sub)
-        b_next = nav_btn(T("next"), T("prac_next_tip")); b_next.clicked.connect(self.engine.next_sub)
+        b_rep = nav_sym(chr(0xE8ED), T("prac_repeat_tip")); b_rep.clicked.connect(self.engine.replay_sub); b_rep.clicked.connect(lambda: self._flash_btn(b_rep))   # RepeatOne
+        b_prev = nav_sym(chr(0xE892), T("prac_prev_tip")); b_prev.clicked.connect(self.engine.prev_sub); b_prev.clicked.connect(lambda: self._flash_btn(b_prev))    # Previous
+        b_next = nav_sym(chr(0xE893), T("prac_next_tip")); b_next.clicked.connect(self.engine.next_sub); b_next.clicked.connect(lambda: self._flash_btn(b_next))     # Next
         for b in (b_rep, b_prev, b_next): nav_lo.addWidget(b)
         sep2 = QLabel("|"); sep2.setStyleSheet(f"color:{BRD};font-size:11px;padding:0 2px;background:transparent;")
         nav_lo.addWidget(sep2)
-        b_a = nav_btn("A", T("prac_loop_a_tip")); b_a.clicked.connect(self._set_loop_a)
-        b_b = nav_btn("B", T("prac_loop_b_tip")); b_b.clicked.connect(self._set_loop_b)
+        b_a = QPushButton("A"); b_a.setFixedSize(22,22); b_a.setToolTip(T("prac_loop_a_tip"))
+        b_a.setCursor(Qt.PointingHandCursor)
+        b_a.setStyleSheet(f"QPushButton{{background:transparent;color:{TS2};border:1px solid {BRD};border-radius:11px;font-size:10px;font-weight:bold;padding:0;}}QPushButton:hover{{background:{HVR};color:{TXT};border-color:{ACC};}}")
+        b_a.clicked.connect(self._set_loop_a)
+        b_b = QPushButton("B"); b_b.setFixedSize(22,22); b_b.setToolTip(T("prac_loop_b_tip"))
+        b_b.setCursor(Qt.PointingHandCursor)
+        b_b.setStyleSheet(f"QPushButton{{background:transparent;color:{TS2};border:1px solid {BRD};border-radius:11px;font-size:10px;font-weight:bold;padding:0;}}QPushButton:hover{{background:{HVR};color:{TXT};border-color:{ACC};}}")
+        b_b.clicked.connect(self._set_loop_b)
         nav_lo.addWidget(b_a); nav_lo.addWidget(b_b)
-        self.btn_loop = nav_btn(T("loop"), T("prac_loop_tip"), True); self.btn_loop.clicked.connect(self._toggle_loop)
-        self.btn_ap = nav_btn(T("autopause"), T("prac_autopause_tip"), True); self.btn_ap.clicked.connect(self._toggle_autopause)
-        self.btn_ai_loop = nav_btn(T("ai_loop_label"), T("ai_loop_tip"), True); self.btn_ai_loop.clicked.connect(self._toggle_ai_loop)
-        self.btn_hide = nav_btn(T("hide_sub"), T("prac_hide_tip"), True); self.btn_hide.clicked.connect(self._toggle_hide_subs)
+        self.btn_loop = nav_sym(chr(0xE8EE), T("prac_loop_tip"), True); self.btn_loop.clicked.connect(self._toggle_loop)   # RepeatAll (loop A-B)
+        self.btn_ap = nav_sym(chr(0xE769), T("prac_autopause_tip"), True); self.btn_ap.clicked.connect(self._toggle_autopause)   # Pause (auto-pausa)
+        self.btn_ai_loop = nav_icn(T("ai_loop_label"), T("ai_loop_tip"), True); self.btn_ai_loop.clicked.connect(self._toggle_ai_loop)
+        self.btn_hide = nav_icn(T("hide_sub"), T("prac_hide_tip"), True); self.btn_hide.clicked.connect(self._toggle_hide_subs)
         for b in (self.btn_loop, self.btn_ap, self.btn_hide, self.btn_ai_loop): nav_lo.addWidget(b)
-        nav_lo.addStretch()
-        b_pron = nav_btn(T("pron_title"), T("pron_open_tip")); b_pron.clicked.connect(self._open_pronunciation)
+        b_pron = nav_icn(T("pron_title"), T("pron_open_tip")); b_pron.clicked.connect(self._open_pronunciation)
         nav_lo.addWidget(b_pron)
         left_lo.addWidget(self.nav_bar)
 
-        # ── Barra de exercícios (separada dos controlos) ──
-        def ex_btn(label, tip, checkable=False):
+        # ── Barra de exercícios (rótulos de texto — ações não-convencionais que
+        # ganham muito em clareza com a palavra em vez de um ícone ambíguo) ──
+        def ex_icn(label, tip, checkable=False):
             b = QPushButton(label); b.setToolTip(tip); b.setCheckable(checkable)
             b.setCursor(Qt.PointingHandCursor)
             b.setStyleSheet(
@@ -5226,21 +6085,37 @@ class MainWindow(QMainWindow):
             return b
         self.ex_bar = QWidget(); self.ex_bar.setObjectName("ex_bar")
         self.ex_bar.setStyleSheet("#ex_bar{background:#141414;border-top:1px solid #222;}")
-        ex_lo = QHBoxLayout(self.ex_bar); ex_lo.setContentsMargins(16,2,16,2); ex_lo.setSpacing(6)
-        ex_lo.setAlignment(Qt.AlignLeft)
+        ex_lo = FlowLayout(self.ex_bar, margin=0, hspacing=6, vspacing=6)
+        ex_lo.setContentsMargins(12,3,12,3)
+        _spx = QSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum); _spx.setHeightForWidth(True)
+        self.ex_bar.setSizePolicy(_spx)
         ex_lab = QLabel(T("practice")); ex_lab.setStyleSheet(f"color:{TMT};font-size:10px;font-weight:600;background:transparent;")
         ex_lo.addWidget(ex_lab)
-        self.btn_listening = ex_btn(T("listening_btn"), T("listening_tip"), True)
+        # Toggle: exercícios automáticos ao longo do filme (o user liga/desliga).
+        # Vem ANTES do Listening e tem uma cor de "ligado" BEM distinta (verde
+        # preenchido) — antes o estado ativo era subtil e não se percebia que
+        # estava ligado.
+        self.btn_auto_ex = ex_icn(T("auto_ex_label"), T("auto_ex_tip"), True)
+        self.btn_auto_ex.setStyleSheet(
+            f"QPushButton{{background:transparent;color:{TS2};"
+            f"border:1px solid {BRD};border-radius:13px;font-size:11px;padding:4px 11px;font-family:'Inter','Segoe UI',sans-serif;}}"
+            f"QPushButton:hover{{background:{HVR};color:{TXT};border-color:{ACC};}}"
+            f"QPushButton:checked{{background:rgba(60,180,90,0.22);color:#9EE6A0;border-color:#3CB45A;font-weight:700;}}")
+        self.btn_auto_ex.clicked.connect(self._toggle_auto_ex)
+        ex_lo.addWidget(self.btn_auto_ex)
+        self.btn_listening = ex_icn(T("listening_btn"), T("listening_tip"), True)
         self.btn_listening.clicked.connect(self._toggle_listening)
+        # Clique-direito no Listening → escolher quantas vezes cada fala se repete.
+        self.btn_listening.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.btn_listening.customContextMenuRequested.connect(self._listening_reps_menu)
         ex_lo.addWidget(self.btn_listening)
-        b_ex = ex_btn(T("exercise_btn"), T("exercise_tip")); b_ex.clicked.connect(self._open_exercise)
-        b_flu = ex_btn(T("fluency_btn"), T("fluency_tip")); b_flu.clicked.connect(self._open_fluency)
-        b_par = ex_btn(T("paraphrase_btn"), T("paraphrase_tip")); b_par.clicked.connect(self._open_paraphrase)
-        b_dsc = ex_btn(T("describe_scene_btn"), T("describe_scene_tip")); b_dsc.clicked.connect(self._open_describe_scene)
-        b_dtk = ex_btn(T("describe_take_btn"), T("describe_take_tip")); b_dtk.clicked.connect(self._open_describe_take)
-        b_dlg = ex_btn(T("dialogue_btn"), T("dialogue_tip")); b_dlg.clicked.connect(self._open_dialogue)
+        b_ex = ex_icn(T("exercise_btn"), T("exercise_tip")); b_ex.clicked.connect(self._open_exercise)
+        b_flu = ex_icn(T("fluency_btn"), T("fluency_tip")); b_flu.clicked.connect(self._open_fluency)
+        b_par = ex_icn(T("paraphrase_btn"), T("paraphrase_tip")); b_par.clicked.connect(self._open_paraphrase)
+        b_dsc = ex_icn(T("describe_scene_btn"), T("describe_scene_tip")); b_dsc.clicked.connect(self._open_describe_scene)
+        b_dtk = ex_icn(T("describe_take_btn"), T("describe_take_tip")); b_dtk.clicked.connect(self._open_describe_take)
+        b_dlg = ex_icn(T("dialogue_btn"), T("dialogue_tip")); b_dlg.clicked.connect(self._open_dialogue)
         for b in (b_ex, b_flu, b_par, b_dsc, b_dtk, b_dlg): ex_lo.addWidget(b)
-        ex_lo.addStretch()
         left_lo.addWidget(self.ex_bar)
 
         # ── Collapsible tools section ──
@@ -5248,50 +6123,60 @@ class MainWindow(QMainWindow):
         self.tools_wrap.setStyleSheet(f"background:{SRF};border-top:1px solid {BRD};")
         twl = QVBoxLayout(self.tools_wrap); twl.setContentsMargins(0,0,0,0); twl.setSpacing(0)
 
-        # Header bar with collapse toggle
-        tools_hdr = QWidget(); tools_hdr.setFixedHeight(28)
-        tools_hdr.setStyleSheet(f"background:{ELV};border-bottom:1px solid {BRD};")
+        # Header bar with collapse toggle — entire bar is clickable
+        tools_hdr = QWidget(); tools_hdr.setFixedHeight(32)
+        tools_hdr.setStyleSheet(f"background:{ELV};border-bottom:1px solid {BRD};"
+                                f"QWidget:hover{{background:{HVR};}}")
+        tools_hdr.setCursor(Qt.PointingHandCursor)
         thl = QHBoxLayout(tools_hdr); thl.setContentsMargins(10,0,8,0)
         self._tools_collapsed = False
+        self._tools_hdr_lbl = QLabel(T("tools_collapse"))  # will be toggled
+        self._tools_hdr_lbl.setStyleSheet(f"color:{TMT};font-size:10px;font-weight:600;background:transparent;")
         self.tools_toggle = QPushButton("\u25be")
-        self.tools_toggle.setFixedSize(24,24)
-        self.tools_toggle.setToolTip("Recolher/expandir painel inferior")
-        self.tools_toggle.setStyleSheet(f"QPushButton{{background:transparent;border:none;color:{TS2};font-size:11px;border-radius:12px;}}QPushButton:hover{{background:{HVR};color:{TXT};}}")
+        self.tools_toggle.setFixedSize(28,26)
+        self.tools_toggle.setToolTip("Recolher ou expandir a barra inferior (navegacao, controles, ferramentas)")
+        self.tools_toggle.setStyleSheet(
+            f"QPushButton{{background:transparent;border:none;color:{TS2};font-size:13px;"
+            f"border-radius:13px;font-weight:bold;}}"
+            f"QPushButton:hover{{background:{HVR};color:{TXT};}}")
         self.tools_toggle.clicked.connect(self._toggle_bottom)
+        # Make clicking the header text also toggle
+        self._tools_hdr_lbl.mousePressEvent = lambda e: self._toggle_bottom()
         thl.addWidget(self.tools_toggle)
-        thl.addWidget(QLabel("Ferramentas")); thl.itemAt(1).widget().setStyleSheet(f"color:{TMT};font-size:10px;font-weight:600;background:transparent;")
+        thl.addWidget(self._tools_hdr_lbl)
         thl.addStretch()
         twl.addWidget(tools_hdr)
 
         self._tools_content = QWidget()
         self._tools_content.setStyleSheet(f"background:transparent;")
         tcl = QVBoxLayout(self._tools_content); tcl.setContentsMargins(0,0,0,0); tcl.setSpacing(0)
-        self._tools_content.setMinimumHeight(80)
-        self._tools_content.setMaximumHeight(200)
+        # Mais altura útil para caber mais informação numa só janela (listas de
+        # vocábulo/tracks/playlist mostram mais linhas sem rolar).
+        self._tools_content.setMinimumHeight(120)
+        self._tools_content.setMaximumHeight(300)
 
         tabs = QTabWidget()
         self.tabs = tabs   # referenced so saving a word can jump to the Vídeos tab
+        # Abas HORIZONTAIS (a pedido do user). Mais visíveis: separador com fundo
+        # próprio, aba selecionada com chip + sublinhado, pílula de hover.
         tabs.setStyleSheet(
-            f"QTabWidget::pane{{background:{SRF};border:none;}}"
-            f"QTabBar{{background:{SRF};qproperty-drawBase:0;}}"
-            f"QTabBar::tab{{background:transparent;color:{TMT};padding:8px 16px;border:none;"
-            f"font-size:11px;font-weight:600;font-family:'Inter','Segoe UI',sans-serif;margin-right:2px;}}"
-            f"QTabBar::tab:hover{{color:{TXT};}}"
-            f"QTabBar::tab:selected{{color:{TXT};border-bottom:2px solid {ACC};}}")
+            f"QTabWidget::pane{{background:{SRF};border:none;border-top:1px solid {BRD};}}"
+            f"QTabBar{{background:{ELV};qproperty-drawBase:0;}}"
+            f"QTabBar::tab{{background:transparent;color:{TMT};padding:7px 14px;border:none;"
+            f"font-size:11px;font-weight:600;font-family:'Inter','Segoe UI',sans-serif;margin-right:1px;}}"
+            f"QTabBar::tab:hover{{color:{TXT};background:{HVR};}}"
+            f"QTabBar::tab:selected{{color:{TXT};background:{SRF};border-bottom:2px solid {ACC};}}")
+        # Os rótulos das abas (Vídeos/Tracks/Playlist/Ferramentas) mostram-se SEMPRE por
+        # inteiro — NUNCA cortados/com reticências (queixa do user: "não dá p/ ver tudo").
+        # Não esticam (largura natural ao texto) e, se faltar largura, surgem setas de
+        # scroll em vez de truncar.
+        tb = tabs.tabBar()
+        tb.setExpanding(False)
+        tb.setElideMode(Qt.ElideNone)
+        tabs.setUsesScrollButtons(True)
 
-        # Bookmarks
-        bwt = QWidget(); bwl = QVBoxLayout(bwt); bwl.setContentsMargins(6,6,6,6)
-        bhl = QHBoxLayout()
-        bhl.addWidget(QLabel("Marcos")); bhl.itemAt(0).widget().setStyleSheet(f"color:{TXT};font-size:11px;font-weight:bold;background:transparent;")
-        bhl.addStretch()
-        bb = yt_btn("+", small=True, accent=True, tip="[B]"); bb.clicked.connect(self._add_bm); bhl.addWidget(bb)
-        bwl.addLayout(bhl)
-        self.bw = QListWidget()
-        self.bw.setStyleSheet(f"QListWidget{{background:transparent;border:none;color:{TXT};font-size:11px;}}QListWidget::item{{padding:4px 6px;border-radius:3px;border-bottom:1px solid {BRD};}}QListWidget::item:hover{{background:{HVR};}}")
-        self.bw.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.bw.customContextMenuRequested.connect(self._bm_menu)
-        bwl.addWidget(self.bw)
-        tabs.addTab(bwt, T("tab_bookmarks"))
+        # (Aba "Marcos"/Bookmarks removida — marcadores manuais saíram do fluxo;
+        # o foco do painel é vocabulário e cenas geridos pela IA.)
 
         # ── Vídeos: vocabulary captured from subtitles, SEPARATE from the main
         # study vocabulary. The user opts in (right-click → add) to promote a word
@@ -5301,17 +6186,37 @@ class MainWindow(QMainWindow):
         self.vv_title = QLabel(T("videos_vocab_title"))
         self.vv_title.setStyleSheet(f"color:{TXT};font-size:11px;font-weight:bold;background:transparent;")
         vhl.addWidget(self.vv_title); vhl.addStretch()
+        # "+ Adicionar palavra": abre o sítio de personalização (AddWordDialog) que
+        # cai na conta web. É o ponto de entrada manual pedido pelo user.
+        vv_add = yt_btn(T("add_word_manual"), small=True, accent=True)
+        vv_add.clicked.connect(self._open_add_word)
+        vhl.addWidget(vv_add)
         vvl.addLayout(vhl)
         vhint = QLabel(T("videos_hint"))
         vhint.setWordWrap(True); vhint.setStyleSheet(f"color:{TMT};font-size:10px;background:transparent;")
         vvl.addWidget(vhint)
+        # Caixa de pesquisa — filtra a lista por palavra ou nome do filme (a lista
+        # crescia muito e não dava p/ encontrar nada).
+        self._vv_filter = ""
+        self.vv_search = QLineEdit(); self.vv_search.setPlaceholderText(T("videos_search_ph"))
+        self.vv_search.setClearButtonEnabled(True)
+        self.vv_search.setStyleSheet(
+            f"QLineEdit{{background:{ELV};color:{TXT};border:1px solid {BRD};border-radius:8px;"
+            f"padding:5px 9px;font-size:11px;}}QLineEdit:focus{{border-color:{ACC};}}")
+        self.vv_search.textChanged.connect(self._vv_search_changed)
+        vvl.addWidget(self.vv_search)
         self.vv_list = QListWidget()
         self.vv_list.setStyleSheet(f"QListWidget{{background:transparent;border:none;color:{TXT};font-size:11px;}}QListWidget::item{{padding:5px 6px;border-radius:3px;border-bottom:1px solid {BRD};}}QListWidget::item:hover{{background:{HVR};}}")
         self.vv_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.vv_list.customContextMenuRequested.connect(self._vv_menu)
+        # Clique numa palavra → ABRE o filme de onde veio e repete a fala. O botão de
+        # balão em cada linha "coloca no chat". (Detalhes/personalizar/remover ficam no
+        # menu de clique-direito.)
+        self.vv_list.itemClicked.connect(self._vv_clicked)
+        _list_show_full(self.vv_list)   # texto completo (quebra de linha, sem cortar)
         vvl.addWidget(self.vv_list)
         tabs.addTab(vvt, T("tab_videos"))
-        QTimer.singleShot(0, self._load_video_vocab)   # populate once UI is ready
+        gui_call(self._load_video_vocab)   # populate once UI is ready
 
         # ── Smart Tracks: segmentação IA ──
         twt = QWidget(); twl2 = QVBoxLayout(twt); twl2.setContentsMargins(6,6,6,6)
@@ -5328,6 +6233,7 @@ class MainWindow(QMainWindow):
             f"QListWidget::item:hover{{background:{HVR};}}"
             f"QListWidget::item:selected{{background:rgba(139,92,246,0.3);}}")
         self.tw_list.currentRowChanged.connect(self._track_clicked)
+        _list_show_full(self.tw_list)   # título+tempos+nº falas inteiros (sem cortar)
         twl2.addWidget(self.tw_list)
         self.tw_empty = QLabel(T("track_no_sub"))
         self.tw_empty.setAlignment(Qt.AlignCenter)
@@ -5336,34 +6242,20 @@ class MainWindow(QMainWindow):
         twl2.addStretch()
         tabs.addTab(twt, T("tab_tracks"))
 
-        # Notes
-        awt = QWidget(); awl = QVBoxLayout(awt); awl.setContentsMargins(6,6,6,6)
-        ahl = QHBoxLayout()
-        ahl.addWidget(QLabel("Notas")); ahl.itemAt(0).widget().setStyleSheet(f"color:{TXT};font-size:11px;font-weight:bold;background:transparent;")
-        ahl.addStretch()
-        ab = yt_btn("+", small=True, accent=True); ab.clicked.connect(self._add_an); ahl.addWidget(ab)
-        awl.addLayout(ahl)
-        self.te = QTextEdit(); self.te.setPlaceholderText(T("note_placeholder")); self.te.setFixedHeight(32)
-        self.te.setStyleSheet(f"QTextEdit{{background:{ELV};color:{TXT};border:1px solid {BRD};border-radius:4px;padding:4px;font-size:11px;}}")
-        awl.addWidget(self.te)
-        self.aw = QListWidget()
-        self.aw.setStyleSheet(f"QListWidget{{background:transparent;border:none;color:{TXT};font-size:11px;}}QListWidget::item{{padding:4px 6px;border-radius:3px;border-bottom:1px solid {BRD};}}QListWidget::item:hover{{background:{HVR};}}")
-        self.aw.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.aw.customContextMenuRequested.connect(self._an_menu)
-        awl.addWidget(self.aw)
-        tabs.addTab(awt, T("tab_notes"))
+        # (Aba "Notas" removida — bloco de notas manual fora do espírito "a IA trata".)
 
         # Playlist
         pwt = QWidget(); pwl = QVBoxLayout(pwt); pwl.setContentsMargins(6,6,6,6)
         phl2 = QHBoxLayout()
-        phl2.addWidget(QLabel("Playlist")); phl2.itemAt(0).widget().setStyleSheet(f"color:{TXT};font-size:11px;font-weight:bold;background:transparent;")
+        phl2.addWidget(QLabel(T("tab_playlist"))); phl2.itemAt(0).widget().setStyleSheet(f"color:{TXT};font-size:11px;font-weight:bold;background:transparent;")
         phl2.addStretch()
-        pcl = yt_btn("Limpar", small=True); pcl.clicked.connect(self._clr_pl); phl2.addWidget(pcl)
+        pcl = yt_btn(T("pl_clear"), small=True); pcl.clicked.connect(self._clr_pl); phl2.addWidget(pcl)
         pwl.addLayout(phl2)
         self.plw = QListWidget()
         self.plw.setDragDropMode(QListWidget.InternalMove)
         self.plw.setStyleSheet(f"QListWidget{{background:transparent;border:none;color:{TXT};font-size:11px;}}QListWidget::item{{padding:4px 6px;border-radius:3px;border-bottom:1px solid {BRD};}}QListWidget::item:hover{{background:{HVR};}}QListWidget::item:selected{{background:rgba(139,92,246,0.3);}}")
         self.plw.currentRowChanged.connect(self._pl_row)
+        _list_show_full(self.plw)   # nome do ficheiro inteiro (sem cortar)
         pwl.addWidget(self.plw)
         tabs.addTab(pwt, T("tab_playlist"))
 
@@ -5385,7 +6277,37 @@ class MainWindow(QMainWindow):
                 self.lang_combo.setCurrentIndex(self.lang_combo.count() - 1)
         self.lang_combo.activated.connect(lambda _i: self._change_ui_language(self.lang_combo.currentData()))
         tl.addWidget(self.lang_combo)
-        for txt, cb in [(T("tools_export"), self._export), (T("tools_updates"), self._check_upd), (T("tools_data_folder"), lambda: subprocess.Popen(f'explorer "{DATA_DIR}"')), (T("tools_about"), self._about)]:
+        # ── Lembretes de revisão ──
+        rem_lbl = QLabel(T("reminders_label")); rem_lbl.setStyleSheet(f"color:{TMT};font-size:10px;font-weight:600;background:transparent;margin-top:8px;")
+        tl.addWidget(rem_lbl)
+        self.rem_check = QCheckBox(T("reminders_label"))
+        self.rem_check.setChecked(self.reminder.enabled)
+        self.rem_check.setCursor(Qt.PointingHandCursor)
+        self.rem_check.setStyleSheet(
+            f"QCheckBox{{color:{TXT};font-size:11px;background:transparent;spacing:6px;}}"
+            f"QCheckBox::indicator{{width:15px;height:15px;border:1px solid {BRD};border-radius:4px;background:{ELV};}}"
+            f"QCheckBox::indicator:checked{{background:{ACC};border-color:{ACC};}}")
+        self.rem_check.toggled.connect(self._toggle_reminders)
+        tl.addWidget(self.rem_check)
+        rem_row = QHBoxLayout(); rem_row.setContentsMargins(0,0,0,0); rem_row.setSpacing(6)
+        rem_every = QLabel(T("reminder_every")); rem_every.setStyleSheet(f"color:{TMT};font-size:11px;background:transparent;")
+        rem_row.addWidget(rem_every)
+        self.rem_spin = QSpinBox(); self.rem_spin.setRange(5, 240); self.rem_spin.setSingleStep(5)
+        self.rem_spin.setValue(self.reminder.interval_min)
+        self.rem_spin.setSuffix(" " + T("reminder_min"))
+        self.rem_spin.setStyleSheet(
+            f"QSpinBox{{background:{ELV};color:{TXT};border:1px solid {BRD};border-radius:6px;padding:3px 6px;font-size:11px;}}"
+            f"QSpinBox:hover{{border-color:{ACC};}}")
+        self.rem_spin.valueChanged.connect(self.reminder.set_interval)
+        rem_row.addWidget(self.rem_spin); rem_row.addStretch()
+        tl.addLayout(rem_row)
+        rem_hint = QLabel(T("reminder_hint")); rem_hint.setWordWrap(True)
+        rem_hint.setStyleSheet(f"color:{TMT};font-size:9px;background:transparent;margin-bottom:4px;")
+        tl.addWidget(rem_hint)
+        # Só o essencial para um utilizador normal: exportar o que estudou, procurar
+        # atualizações e "Sobre". (A chave de visão e a pasta de dados eram opções
+        # técnicas/de programador que confundiam — saíram daqui.)
+        for txt, cb in [(T("tools_export"), self._export), (T("tools_updates"), self._check_upd), (T("tools_about"), self._about)]:
             b = yt_btn(txt, small=True); b.clicked.connect(cb); tl.addWidget(b)
         tl.addStretch()
         tabs.addTab(tw, T("tab_tools"))
@@ -5470,38 +6392,45 @@ class MainWindow(QMainWindow):
         The seek bar is a normal (alien) widget with reliable geometry and sits
         immediately under the video — so its top edge is the video's true bottom.
         When they disagree we also FORCE the engine back into its real slot, so
-        VLC renders the picture at the right size too."""
+        VLC renders the picture at the right size too.
+
+        When the transport is floating (fullscreen), the seek_bar is reparented
+        to the overlay (it floats OVER the video, not below it), so we skip
+        the seek-bar correction and rely on the engine widget's own rect."""
         ex, ey, ew, eh = self._tree_global_rect(self.engine)
-        sb = getattr(self, "_seek_bar_w", None)
-        if sb is not None and sb.isVisible() and sb.window() is self:
-            sx, sy, sw, sh = self._tree_global_rect(sb)
-            true_h = sy - ey
-            true_w = sw                       # same column as the video
-            if true_h >= 60:
-                # Heal the stale native HWND if the OS-level rect disagrees with
-                # the layout slot. Qt's resize() does not reach the VLC-owned
-                # window (its cached geometry stays stale too), so compare with
-                # GetWindowRect and apply via MoveWindow in the native parent's
-                # client coordinates.
-                try:
-                    import ctypes
-                    from ctypes import wintypes
-                    hwnd = int(self.engine.winId())
-                    cur = wintypes.RECT()
-                    ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(cur))
-                    cw_, ch_ = cur.right - cur.left, cur.bottom - cur.top
-                    if (abs(cur.left - ex) > 2 or abs(cur.top - ey) > 2
-                            or abs(cw_ - true_w) > 2 or abs(ch_ - true_h) > 2):
-                        parent = ctypes.windll.user32.GetParent(hwnd)
-                        pt = wintypes.POINT(ex, ey)
-                        if parent:
-                            ctypes.windll.user32.ScreenToClient(parent, ctypes.byref(pt))
-                        ctypes.windll.user32.MoveWindow(hwnd, pt.x, pt.y,
-                                                        true_w, true_h, True)
-                        log(f"ENGINE HEAL: ({cur.left},{cur.top}) {cw_}x{ch_} -> ({ex},{ey}) {true_w}x{true_h}")
-                except Exception as e:
-                    log(f"engine heal: {e}")
-                eh, ew = true_h, true_w
+        # Skip seek-bar correction when floating — the bar is no longer under
+        # the video, so sy - ey would be meaningless or negative.
+        if not getattr(self, '_transport_floating', False):
+            sb = getattr(self, "_seek_bar_w", None)
+            if sb is not None and sb.isVisible() and sb.window() is self:
+                sx, sy, sw, sh = self._tree_global_rect(sb)
+                true_h = sy - ey
+                true_w = sw                       # same column as the video
+                if true_h >= 60:
+                    # Heal the stale native HWND if the OS-level rect disagrees with
+                    # the layout slot. Qt's resize() does not reach the VLC-owned
+                    # window (its cached geometry stays stale too), so compare with
+                    # GetWindowRect and apply via MoveWindow in the native parent's
+                    # client coordinates.
+                    try:
+                        import ctypes
+                        from ctypes import wintypes
+                        hwnd = int(self.engine.winId())
+                        cur = wintypes.RECT()
+                        ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(cur))
+                        cw_, ch_ = cur.right - cur.left, cur.bottom - cur.top
+                        if (abs(cur.left - ex) > 2 or abs(cur.top - ey) > 2
+                                or abs(cw_ - true_w) > 2 or abs(ch_ - true_h) > 2):
+                            parent = ctypes.windll.user32.GetParent(hwnd)
+                            pt = wintypes.POINT(ex, ey)
+                            if parent:
+                                ctypes.windll.user32.ScreenToClient(parent, ctypes.byref(pt))
+                            ctypes.windll.user32.MoveWindow(hwnd, pt.x, pt.y,
+                                                    true_w, true_h, True)
+                            log(f"ENGINE HEAL: ({cur.left},{cur.top}) {cw_}x{ch_} -> ({ex},{ey}) {true_w}x{true_h}")
+                    except Exception as e:
+                        log(f"engine heal: {e}")
+                    eh, ew = true_h, true_w
         return (ex, ey, ew, eh)
 
     def _reposition_overlay(self):
@@ -5538,20 +6467,19 @@ class MainWindow(QMainWindow):
                 self.overlay.hide()
             else:
                 self.overlay.show()
-                QTimer.singleShot(0, self._reposition_overlay)
+                gui_call(self._reposition_overlay)
 
     # ── Toggles ──
     def _toggle_chat(self, visible):
         self.chat.setVisible(visible)
         if visible:
             fade_in(self.chat, 200)
-        # Keep both toggles (top bar + controls bar) in sync.
-        if hasattr(self, 'chat_toggle'): self.chat_toggle.setChecked(visible)
+        # Keep the controls-bar chat toggle in sync (top-bar toggle foi removido).
         if hasattr(self, 'chat_btn'): self.chat_btn.setChecked(visible)
 
     def _toggle_bottom(self):
-        """Collapse/expand the bottom section: nav_bar, ex_bar, and tools content.
-        The tools header (with toggle button) stays visible as a handle."""
+        """Collapse/expand the bottom section: nav_bar, ex_bar, tools, seek and controls.
+        The tools header (with toggle button and label) stays visible as a handle."""
         self._tools_collapsed = not self._tools_collapsed
         for name in ('nav_bar', 'ex_bar'):
             w = self.findChild(QWidget, name)
@@ -5560,6 +6488,8 @@ class MainWindow(QMainWindow):
             self._tools_content.setVisible(not self._tools_collapsed)
         if hasattr(self, 'tools_toggle'):
             self.tools_toggle.setText("\u25b8" if self._tools_collapsed else "\u25be")
+        if hasattr(self, '_tools_hdr_lbl'):
+            self._tools_hdr_lbl.setText(T("tools_expand") if self._tools_collapsed else T("tools_collapse"))
         # Also collapse seek bar and controls bar — the "groove de controle"
         # should appear/disappear together with the buttons.
         for name in ('seek_bar', 'controls_bar'):
@@ -5581,8 +6511,12 @@ class MainWindow(QMainWindow):
         transport (seek + controls) auto-hiding after inactivity."""
         self._study_mode = not self._study_mode
         if self._study_mode:
-            # Hide the chrome that has no place in fullscreen.
-            for name in ["top_bar", "practice_bar"]:
+            # Hide the chrome that has no place in fullscreen. As barras de
+            # navegação/exercícios também SAEM aqui: ficavam encaixadas na coluna
+            # do vídeo, por isso mostrá-las/escondê-las ao mexer o cursor encolhia
+            # e voltava a esticar o vídeo (o "salto" de que o user se queixava). Em
+            # ecrã inteiro o transporte flutuante chega; o vídeo fica ESTÁTICO.
+            for name in ["top_bar", "practice_bar", "nav_bar", "ex_bar"]:
                 w = self.findChild(QWidget, name)
                 if w: w.hide()
             self.tools_wrap.hide()
@@ -5596,6 +6530,7 @@ class MainWindow(QMainWindow):
             self.fs_btn.setToolTip(T("exit_fullscreen"))
             self.sbl.setText(T("study_mode_esc"))
             self._fs_activity()   # show transport, then start the hide countdown
+            self._fs_cursor_timer.start()   # passa a seguir a posição do cursor
             # Re-anchor once fullscreen geometry settles (it applies asynchronously).
             QTimer.singleShot(80, self._reposition_transport)
         else:
@@ -5605,12 +6540,18 @@ class MainWindow(QMainWindow):
         """Restore normal UI"""
         self._study_mode = False
         self._fs_hide_timer.stop()
+        self._fs_cursor_timer.stop()
         self.setWindowState(Qt.WindowNoState)
         self._float_transport(False)   # dock seek + controls back into the layout
         for name in ["top_bar", "practice_bar"]:
             w = self.findChild(QWidget, name)
             if w: w.show()
         self.tools_wrap.show()
+        # Restore nav_bar and ex_bar respecting the collapse state
+        collapsed = getattr(self, '_tools_collapsed', False)
+        for name in ('nav_bar', 'ex_bar'):
+            w = self.findChild(QWidget, name)
+            if w: w.setVisible(not collapsed)
         self.statusBar().show()
         self.fs_btn.setText("\u26F6")
         self.fs_btn.setToolTip(T("fullscreen_f"))
@@ -5619,7 +6560,9 @@ class MainWindow(QMainWindow):
     # \u2500\u2500 Floating transport (fullscreen) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
     def _ensure_transport_overlay(self):
         """Lazily build the frameless window that hosts the seek + controls bars
-        over the bottom of the video in study mode."""
+        over the bottom of the video in study mode. The groove is draggable:
+        double-click and drag anywhere on the background to reposition it.
+        The position persists until the user moves it again or closes the app."""
         if getattr(self, "_transport_overlay", None) is None:
             ov = QWidget(self)
             ov.setObjectName("transport_overlay")
@@ -5627,6 +6570,32 @@ class MainWindow(QMainWindow):
             ov.setAttribute(Qt.WA_ShowWithoutActivating)
             ov.setStyleSheet("#transport_overlay{background:#0c0c0c;border-radius:14px;}")
             ov.setWindowOpacity(self._transport_opacity)
+            ov.setMouseTracking(True)
+            self._transport_custom_pos = None  # persists across fullscreen toggles
+            # Drag support: double-click to grab, drag to move, release to drop
+            ov._drag_pos = None
+            def _mdc(e):
+                """Double-click starts drag mode — cursor changes to grabbing hand."""
+                if e.button() == Qt.LeftButton:
+                    ov._drag_pos = e.globalPos() - ov.frameGeometry().topLeft()
+                    ov.setCursor(Qt.ClosedHandCursor)
+                    e.accept()
+            def _mm(e):
+                # Any mouse movement over the groove keeps it alive (restarts hide timer)
+                self._fs_activity()
+                if ov._drag_pos is not None:
+                    ov.move(e.globalPos() - ov._drag_pos)
+                    e.accept()
+            def _mr(e):
+                if ov._drag_pos is not None:
+                    ov._drag_pos = None
+                    ov.setCursor(Qt.ArrowCursor)
+                    # Save the position so it persists across fullscreen toggles
+                    self._transport_custom_pos = (ov.x(), ov.y())
+                    e.accept()
+            ov.mouseDoubleClickEvent = _mdc
+            ov.mouseMoveEvent = _mm
+            ov.mouseReleaseEvent = _mr
             # Clique-direito no transport → mudar opacidade.
             ov.setContextMenuPolicy(Qt.CustomContextMenu)
             ov.customContextMenuRequested.connect(self._transport_menu)
@@ -5682,9 +6651,16 @@ class MainWindow(QMainWindow):
             if cb: self._left_lo.insertWidget(2, cb); cb.show()
 
     def _reposition_transport(self):
-        """Anchor the floating transport to the bottom edge of the video."""
+        """Anchor the floating transport. If the user has dragged it to a custom
+        position (via double-click + drag), use that instead of the auto-anchor.
+        The custom position persists across fullscreen toggles."""
         ov = getattr(self, "_transport_overlay", None)
         if not ov or not ov.isVisible() or not hasattr(self, "engine"):
+            return
+        # If user placed the groove manually, keep it there
+        cp = getattr(self, '_transport_custom_pos', None)
+        if cp is not None:
+            ov.move(cp[0], cp[1])
             return
         h = 90  # seek (34) + controls (56)
         gx, gy, gw, gh = self._engine_global_rect()   # never engine.mapToGlobal (native child)
@@ -5697,17 +6673,57 @@ class MainWindow(QMainWindow):
         ov.setWindowOpacity(self._transport_opacity)
         ov.raise_()
 
-    def _fs_activity(self):
-        """Mouse/keyboard activity in fullscreen: reveal the transport and
-        restart the inactivity countdown."""
+    def _fs_cursor_poll(self):
+        """Poll do cursor (250ms) em modo estudo. SÓ se comporta como atividade
+        (revela o transport + reinicia o contador) quando o cursor está na zona de
+        baixo do vídeo. Se o cursor estiver longe, NÃO faz nada — deixa o contador
+        de auto-ocultar expirar. Antes, este poll chamava _fs_activity sempre que o
+        transport estava visível e reiniciava o contador a cada 250ms, por isso o
+        groove NUNCA desaparecia."""
         if not self._study_mode:
             return
         ov = getattr(self, "_transport_overlay", None)
-        if ov and not ov.isVisible():
+        if not ov:
+            return
+        overlay = getattr(self, 'overlay', None)
+        if overlay and overlay.isVisible():
+            orect = overlay.geometry()
+            orect_g = QRect(overlay.mapToGlobal(orect.topLeft()), orect.size())
+            if QCursor.pos().y() >= orect_g.bottom() - 160:
+                self._fs_activity()   # cursor na zona de baixo → revela/mantém o groove
+
+    def _fs_activity(self):
+        """Mouse/keyboard activity in fullscreen: reveal the transport when
+        the cursor approaches the bottom ~80px of the video, and restart
+        the inactivity countdown. If the transport is already visible it
+        stays up regardless of cursor position."""
+        if not self._study_mode:
+            return
+        ov = getattr(self, "_transport_overlay", None)
+        if not ov:
+            return
+        # If the transport is not visible yet, only show when cursor is
+        # near the bottom of the video (the groove zone). Use global
+        # cursor position so it works even when the mouse is over the
+        # letterbox area outside the video overlay.
+        if not ov.isVisible():
+            overlay = getattr(self, 'overlay', None)
+            if overlay and overlay.isVisible():
+                orect = overlay.geometry()
+                orect_g = QRect(overlay.mapToGlobal(orect.topLeft()), orect.size())
+                cursor_y = QCursor.pos().y()
+                # Zona de revelação generosa (~160px) para o groove aparecer logo que
+                # o cursor desce para onde os botões estão — antes (80px) era preciso
+                # ir mesmo ao fundo e "não aparecia claro".
+                if cursor_y < orect_g.bottom() - 160:
+                    return  # cursor too high — keep the groove hidden
             ov.show()
             self._reposition_transport()
-        elif ov:
+        else:
             ov.raise_()
+        # NÃO tocar em nav_bar/ex_bar aqui: estão escondidas em ecrã inteiro e
+        # mostrá-las reflui a coluna do vídeo (fazia o vídeo saltar). O transporte
+        # flutuante (seek + controlos) é o único que aparece, POR CIMA do vídeo.
         self._fs_hide_timer.start()
 
     def _fs_hide_controls(self):
@@ -5715,11 +6731,24 @@ class MainWindow(QMainWindow):
             return
         ov = getattr(self, "_transport_overlay", None)
         # Keep it up while the pointer is over the controls themselves.
-        if ov and ov.underMouse():
-            self._fs_hide_timer.start()
-            return
         if ov:
+            if ov.underMouse():
+                self._fs_hide_timer.start()
+                return
+            # Also check by geometry: if cursor is within or near the groove
+            # bounds, keep it visible (underMouse can be unreliable for
+            # Qt.Tool windows).
+            og = ov.geometry()
+            og_g = QRect(ov.mapToGlobal(og.topLeft()), og.size())
+            cp = QCursor.pos()
+            margin = 20  # px tolerance around the groove
+            if (og_g.left() - margin <= cp.x() <= og_g.right() + margin and
+                    og_g.top() - margin <= cp.y() <= og_g.bottom() + margin):
+                self._fs_hide_timer.start()
+                return
             ov.hide()
+        # nav_bar/ex_bar ficam escondidas em ecrã inteiro — não há nada a esconder
+        # aqui (e mexer-lhes faria o vídeo saltar).
 
     # ── Idioma da UI (escolhido pelo utilizador; qualquer língua via IA) ──
     def _change_ui_language(self, code):
@@ -5733,7 +6762,7 @@ class MainWindow(QMainWindow):
         showToast(T("lang_translating", lang=name), "accent")
         def work():
             ok = translate_ui_via_ai(code)
-            QTimer.singleShot(0, lambda: self._on_lang_translated(code, ok))
+            gui_call(lambda: self._on_lang_translated(code, ok))
         threading.Thread(target=work, daemon=True).start()
 
     def _on_lang_translated(self, code, ok):
@@ -5774,11 +6803,35 @@ class MainWindow(QMainWindow):
                 self.lang_combo.setCurrentIndex(i)
                 break
 
+    def _feed_expr_miner(self, text):
+        """Mantém o minerador de expressões alinhado com o filme: garante que o guião
+        atual está carregado e processa o bloco da legenda atual + o seguinte (a IA
+        'relê à medida que o filme avança')."""
+        try:
+            subs = getattr(self.engine, "_subs", None)
+            if not subs:
+                return
+            self._expr_miner.set_cues([s.text for s in subs])
+            self._expr_miner.ensure_for_index(getattr(self.engine, "_last_sub_idx", 0))
+        except Exception as e:
+            log(f"feed expr miner: {e}")
+
     # ── Vocab overlay ──
     def _on_overlay_add(self, text):
         """+ on a subtitle card → save to the SEPARATE video-vocab list (Vídeos tab)
         AND push to the cloud as PENDING (saved_words) so it shows on the web, where
-        the user opts in (Add to vocabulary) or discards. NOT the main vocabulary."""
+        the user opts in (Add to vocabulary) or discards. NOT the main vocabulary.
+
+        UX estilo web: feedback OTIMISTA imediato — uma pílula animada "A adicionar
+        “palavra”…" aparece já, e o trabalho real corre deferido (60ms) para a pílula
+        pintar primeiro; depois a pílula vira "Adicionado · <onde>"."""
+        text = (text or "").strip()
+        if not text:
+            return
+        pill = self._show_pill(T("adding_word", text=text[:24]), "accent")
+        QTimer.singleShot(60, lambda: self._do_save_vocab(text, pill))
+
+    def _do_save_vocab(self, text, pill=None):
         vocab_file = DATA_DIR / 'saved-vocab.json'
         try:
             video = Path(self.video_path).name if self.video_path else ""
@@ -5793,18 +6846,76 @@ class MainWindow(QMainWindow):
                 self._session_words.append(text)   # entra na atividade da sessão
             # Push to the web as a pending word (silent if logged out → stays local).
             synced = self.chat.sync_saved_word(text, video) if hasattr(self, "chat") else False
-            # Make it obvious WHERE the word went. The status-bar toast is hidden
-            # in fullscreen, so also flash a banner over the video, and (when the
-            # panel is visible) jump to the Vídeos tab so the user sees it land.
             where = T("saved_videos_web") if synced else T("saved_videos")
-            self.overlay.flash(T("saved_flash", where=where))
-            showToast(T("saved_toast", where=where, text=text[:24]), "accent")
+            # Pílula → estado final "Adicionado"; em fullscreen a status-bar está
+            # escondida, por isso também faz flash do banner sobre o vídeo.
+            self._update_pill(pill, T("added_word", where=where), "ok")
+            if self._study_mode:
+                self.overlay.flash(T("saved_flash", where=where))
             if not self._study_mode and self.tools_wrap.isVisible():
                 idx = self._vv_tab_index()
                 if idx is not None:
                     self.tabs.setCurrentIndex(idx)
         except Exception as e:
             log(f"save vocab: {e}")
+            self._update_pill(pill, T("saved_videos"), "ok")
+
+    # ── Pílula de feedback animada (estilo web: aparece, sobe e desvanece) ──
+    def _show_pill(self, text, kind="accent"):
+        """Cria uma pílula flutuante no topo-centro da janela, com fade+subida."""
+        try:
+            color = "#3CB45A" if kind == "ok" else ACC
+            pill = QLabel(text, self)
+            pill.setStyleSheet(
+                f"background:{ELV};color:{TXT};border:1px solid {color};border-radius:16px;"
+                f"padding:8px 16px;font-size:12px;font-weight:600;"
+                f"font-family:'Inter','Segoe UI',sans-serif;")
+            pill.adjustSize()
+            self._position_pill(pill)
+            pill.show(); pill.raise_()
+            eff = QGraphicsOpacityEffect(pill); pill.setGraphicsEffect(eff)
+            a = QPropertyAnimation(eff, b"opacity", pill)
+            a.setDuration(180); a.setStartValue(0.0); a.setEndValue(1.0)
+            a.setEasingCurve(QEasingCurve.OutCubic); a.start()
+            pill._anim = a            # manter referência viva
+            return pill
+        except Exception as e:
+            log(f"pill: {e}"); return None
+
+    def _position_pill(self, pill):
+        try:
+            pill.adjustSize()
+            x = max(8, (self.width() - pill.width()) // 2)
+            pill.move(x, 18)
+        except RuntimeError:
+            pass
+
+    def _update_pill(self, pill, text, kind="ok", hold=1700):
+        """Atualiza a pílula para o estado final e agenda o desvanecimento."""
+        if pill is None:
+            self._show_pill(text, kind); return
+        try:
+            color = "#3CB45A" if kind == "ok" else ACC
+            pill.setText(text)
+            pill.setStyleSheet(
+                f"background:{ELV};color:{TXT};border:1px solid {color};border-radius:16px;"
+                f"padding:8px 16px;font-size:12px;font-weight:600;"
+                f"font-family:'Inter','Segoe UI',sans-serif;")
+            self._position_pill(pill)
+            QTimer.singleShot(hold, lambda: self._fade_out_pill(pill))
+        except RuntimeError:
+            pass
+
+    def _fade_out_pill(self, pill):
+        try:
+            eff = QGraphicsOpacityEffect(pill); pill.setGraphicsEffect(eff)
+            a = QPropertyAnimation(eff, b"opacity", pill)
+            a.setDuration(300); a.setStartValue(1.0); a.setEndValue(0.0)
+            a.setEasingCurve(QEasingCurve.InCubic)
+            a.finished.connect(pill.deleteLater); a.start()
+            pill._anim = a
+        except RuntimeError:
+            pass
 
     def _vv_tab_index(self):
         """Index of the Vídeos tab in the tools panel (or None)."""
@@ -5827,24 +6938,122 @@ class MainWindow(QMainWindow):
         if not hasattr(self, 'vv_list'):
             return
         self.vv_list.clear()
-        if not self._vv_entries:
-            empty = QListWidgetItem(T("videos_empty"))
+        flt = (getattr(self, "_vv_filter", "") or "").strip().lower()
+        # Pares (índice_original, entrada), do mais recente para o mais antigo, já
+        # filtrados pela pesquisa (palavra OU nome do filme).
+        shown = []
+        for i in range(len(self._vv_entries) - 1, -1, -1):
+            e = self._vv_entries[i]
+            if flt:
+                hay = (str(e.get("text", "")) + " " + str(e.get("video", ""))).lower()
+                if flt not in hay:
+                    continue
+            shown.append((i, e))
+        if not shown:
+            empty = QListWidgetItem(T("videos_no_match") if flt else T("videos_empty"))
             empty.setFlags(Qt.NoItemFlags)   # not selectable — it's a hint
             empty.setForeground(QColor(TMT))
             self.vv_list.addItem(empty)
-        for e in reversed(self._vv_entries):   # newest first
+        for orig_idx, e in shown:
             vid = e.get("video", ""); txt = e.get("text", "")
             it = QListWidgetItem()
+            it.setData(Qt.UserRole, orig_idx)   # mapeia a linha → entrada real (robusto com filtro)
             self.vv_list.addItem(it)
+            # Linha = texto (clicar na linha abre o filme de origem) + botão Chat.
+            row = QWidget(); row.setStyleSheet("background:transparent;")
+            rl = QHBoxLayout(row); rl.setContentsMargins(2, 1, 2, 1); rl.setSpacing(6)
             lbl = QLabel(self._vocab_html(txt, vid))
             lbl.setTextFormat(Qt.RichText)
             lbl.setWordWrap(True)
-            lbl.setAttribute(Qt.WA_TransparentForMouseEvents)  # let the list handle hover/right-click
+            lbl.setAttribute(Qt.WA_TransparentForMouseEvents)  # deixa a LISTA tratar clique/right-click
             lbl.setStyleSheet("background:transparent;font-size:11px;padding:1px 2px;")
-            self.vv_list.setItemWidget(it, lbl)
-            it.setSizeHint(lbl.sizeHint())
+            rl.addWidget(lbl, 1)
+            # Botão "colocar no chat" (ícone de balão Segoe MDL2, sem emojis).
+            chat_b = QPushButton(chr(0xE8BD)); chat_b.setFixedSize(26, 26)
+            chat_b.setCursor(Qt.PointingHandCursor); chat_b.setToolTip(T("videos_to_chat"))
+            chat_b.setStyleSheet(
+                f"QPushButton{{background:transparent;color:{TS2};border:1px solid {BRD};border-radius:13px;"
+                f"font-family:'Segoe Fluent Icons','Segoe MDL2 Assets';font-size:12px;}}"
+                f"QPushButton:hover{{border-color:{ACC};color:{TXT};background:{HVR};}}")
+            chat_b.clicked.connect(lambda _=False, t=txt: self._on_overlay_ask(t))
+            rl.addWidget(chat_b, 0, Qt.AlignTop)
+            self.vv_list.setItemWidget(it, row)
+            it.setSizeHint(row.sizeHint())
         n = len(self._vv_entries)
         self.vv_title.setText(f"{T('videos_vocab_title')} ({n})" if n else T("videos_vocab_title"))
+
+    def _vv_search_changed(self, txt):
+        self._vv_filter = txt or ""
+        self._load_video_vocab()
+
+    def _open_add_word(self, prefill=""):
+        """Abre o diálogo de personalização (palavra + tradução + nota) que cai na
+        conta web. Ponto de entrada manual a partir da aba Vídeos e dos Detalhes."""
+        if not hasattr(self, "chat"):
+            return
+        dlg = AddWordDialog(self, self.chat, prefill=prefill if isinstance(prefill, str) else "")
+        dlg.exec_()
+
+    def _vv_entry_at(self, it):
+        """Entrada (dict) por trás de um item da lista Vídeos, via UserRole."""
+        if not it:
+            return None
+        idx = it.data(Qt.UserRole)
+        if idx is None or not (0 <= int(idx) < len(self._vv_entries)):
+            return None
+        return self._vv_entries[int(idx)]
+
+    def _vv_clicked(self, it):
+        """Clique simples numa palavra guardada → abre o FILME de onde veio e repete
+        a fala (pedido do user). Se não houver filme guardado, mostra os Detalhes."""
+        entry = self._vv_entry_at(it)
+        if not entry:
+            return
+        if entry.get("video"):
+            self._vv_open_source(entry)
+        else:
+            word = (entry.get("text", "") or "").strip()
+            if word and hasattr(self, "word_details"):
+                self.word_details.show_for(word)
+                self._balance_left_dock()
+
+    def _vv_open_source(self, entry):
+        """Abre o filme de onde a palavra foi tirada (se o ficheiro for encontrado)
+        e procura a primeira fala que a contém para repetir aí."""
+        name = (entry or {}).get("video", "")
+        if not name:
+            self._notify(T("videos_no_source")); return
+        # Já está aberto? então é só procurar a fala.
+        cur = Path(self.video_path).name if self.video_path else ""
+        path = None
+        if cur == name:
+            path = self.video_path
+        else:
+            # Procura o ficheiro: na playlist e na pasta do vídeo atual.
+            cands = list(self._playlist)
+            if self.video_path:
+                cands += [str(p) for p in Path(self.video_path).parent.glob(name)]
+            for c in cands:
+                if Path(c).name == name and Path(c).exists():
+                    path = c; break
+        if not path:
+            self._notify(T("videos_source_missing", name=name)); return
+        word = (entry.get("text", "") or "").strip()
+        def _seek_to_word():
+            try:
+                subs = self.engine._subs or []
+                wl = word.lower()
+                for s in subs:
+                    if wl and wl in s.text.lower():
+                        self.engine.seek(max(0, s.start - 0.3)); self.engine.play()
+                        self._notify(T("videos_replaying", word=word[:24])); return
+            except Exception as e:
+                log(f"vv open source seek: {e}")
+        if path == self.video_path:
+            _seek_to_word()
+        else:
+            self._open_file(path)
+            QTimer.singleShot(1500, _seek_to_word)   # dá tempo a carregar o vídeo+legenda
 
     @staticmethod
     def _vocab_html(text, video=""):
@@ -5870,19 +7079,26 @@ class MainWindow(QMainWindow):
         it = self.vv_list.itemAt(pos)
         if not it:
             return
-        idx = len(self._vv_entries) - 1 - self.vv_list.row(it)   # list is reversed
-        if not (0 <= idx < len(self._vv_entries)):
+        idx = it.data(Qt.UserRole)   # índice real (robusto mesmo com pesquisa a filtrar)
+        if idx is None or not (0 <= int(idx) < len(self._vv_entries)):
             return
+        idx = int(idx)
         entry = self._vv_entries[idx]
         m = QMenu(self)
         m.setStyleSheet(f"QMenu{{background:{ELV};color:{TXT};border:1px solid {BRD};padding:4px;}}"
                         f"QMenu::item{{padding:6px 14px;border-radius:4px;}}QMenu::item:selected{{background:{HVR};}}")
-        a_add = m.addAction(T("menu_add_vocab"))
+        a_det = m.addAction(T("details"))
         a_ask = m.addAction(T("ask_ai"))
+        a_src = m.addAction(T("videos_open_source")) if entry.get("video") else None
+        a_add = m.addAction(T("menu_add_vocab"))
         m.addSeparator()
         a_del = m.addAction(T("menu_remove"))
         chosen = m.exec_(self.vv_list.mapToGlobal(pos))
-        if chosen == a_del:
+        if chosen == a_det:
+            word = (entry.get("text", "") or "").strip()
+            if word and hasattr(self, "word_details"):
+                self.word_details.show_for(word); self._balance_left_dock()
+        elif chosen == a_del:
             try:
                 del self._vv_entries[idx]
                 (DATA_DIR / 'saved-vocab.json').write_text(
@@ -5892,8 +7108,10 @@ class MainWindow(QMainWindow):
             self._load_video_vocab()
         elif chosen == a_ask:
             self._on_overlay_ask(entry.get("text", ""))
+        elif a_src is not None and chosen == a_src:
+            self._vv_open_source(entry)
         elif chosen == a_add and hasattr(self, 'chat'):
-            self.chat_toggle.setChecked(True); self.chat.setVisible(True)
+            self._toggle_chat(True)
             self.chat.promote_word(entry.get("text", ""))
 
     def _on_overlay_ask(self, text):
@@ -5909,8 +7127,7 @@ class MainWindow(QMainWindow):
             self.chat._call_ai(text)
             self.chat.welcome.hide()
             # Make sure chat is visible
-            self.chat_toggle.setChecked(True)
-            self.chat.setVisible(True)
+            self._toggle_chat(True)
 
     def _remember_last_sub(self, text):
         """Guarda a última legenda NÃO vazia — fonte da aba Pronúncia.
@@ -6023,16 +7240,12 @@ class MainWindow(QMainWindow):
         """Encaixa um exercício (antes era um QDialog modal) na sidebar esquerda, em vez
         de o abrir por cima das legendas. Fecha qualquer exercício anterior. on_close (se
         dado) corre quando o painel fecha — usado pelas missões da IA para retomar o filme."""
-        # Em ecrã inteiro / modo estudo não há sidebar à vista → mantém o exercício como
-        # janela modal por cima (senão o painel ficava escondido atrás do vídeo).
+        # TUDO no sidebar — nada de pop-ups por cima do vídeo (decisão do user). Se
+        # estávamos em modo estudo/ecrã inteiro (sem sidebar à vista), sai dele primeiro
+        # para o painel do exercício ficar visível na coluna esquerda.
         if getattr(self, "_study_mode", False) or self.isFullScreen():
-            try:
-                w.exec_()
-            finally:
-                if on_close:
-                    try: on_close()
-                    except Exception as e: log(f"ex on_close: {e}")
-            return
+            try: self._exit_study_mode()
+            except Exception as e: log(f"ex exit study: {e}")
         self._close_dock_exercise()
         self._ex_current = w
         self._ex_on_close = on_close
@@ -6104,6 +7317,55 @@ class MainWindow(QMainWindow):
             self._notify(T("need_sub_for_tool")); return
         self._dock_exercise(DialogueDialog(self, self.engine))
 
+    # ── Exercícios automáticos ao longo do filme (toggle) ──
+    def _toggle_auto_ex(self):
+        """Liga/desliga a inserção automática de exercícios à medida que o filme corre."""
+        if not self.engine.subs_loaded() and not self._auto_ex:
+            if hasattr(self, 'btn_auto_ex'): self.btn_auto_ex.setChecked(False)
+            self._notify(T("need_sub_for_tool")); return
+        self._auto_ex = not self._auto_ex
+        self._auto_ex_count = 0
+        if hasattr(self, 'btn_auto_ex'): self.btn_auto_ex.setChecked(self._auto_ex)
+        self._notify(T("auto_ex_on") if self._auto_ex else T("auto_ex_off"))
+
+    def _card_on_sub(self, idx):
+        """Empurra a fala recém-entrada para o feed de cartões 'twitch'. Garante
+        paridade total com a legenda de baixo (uma linha → um cartão)."""
+        try:
+            subs = self.engine._subs
+            if 0 <= idx < len(subs):
+                self.overlay.show_vocab(subs[idx].text)
+        except Exception as e:
+            log(f"card on sub: {e}")
+
+    def _auto_ex_on_sub(self, idx):
+        """A cada fala ouvida (com auto-exercícios ligado), conta; ao fim de N abre o
+        próximo exercício — mas nunca empilha sobre um exercício/aula/missão já aberto."""
+        if not self._auto_ex:
+            return
+        if getattr(self, "_ex_current", None) is not None or self._in_mission or self._lesson_active:
+            return
+        if not self.engine.subs_loaded():
+            return
+        self._auto_ex_count += 1
+        if self._auto_ex_count < self._auto_ex_every:
+            return
+        self._auto_ex_count = 0
+        self._open_auto_exercise()
+
+    def _open_auto_exercise(self):
+        """Abre o próximo exercício da rotação, encaixado no sidebar. Cada exercício
+        trata sozinho do pause/loop e repõe o filme ao fechar."""
+        openers = [self._open_fluency, self._open_paraphrase, self._open_describe_scene,
+                   self._open_dialogue, self._open_exercise, self._open_describe_take]
+        fn = openers[self._auto_ex_rotation % len(openers)]
+        self._auto_ex_rotation += 1
+        try:
+            self._notify(T("auto_ex_starting"))
+            fn()
+        except Exception as e:
+            log(f"auto ex: {e}")
+
     def _toggle_listening(self):
         """Toggle listening mode: hide subs + AI asks comprehension questions."""
         if not self.engine.subs_loaded():
@@ -6135,12 +7397,62 @@ class MainWindow(QMainWindow):
             return
         self._listening_sub_count = 0
         self._listening_pending = True
-        # Pause the video
+        # Reouvir a fala (o áudio) em LOOP N vezes antes de perguntar — em listening
+        # as legendas estão escondidas, por isso ouvir de novo ajuda a recordar o que
+        # foi dito. O nº de repetições é configurável (clique-direito no botão
+        # Listening). No fim do loop, pausa e faz a pergunta.
+        subs = self.engine._subs
+        if 0 <= idx < len(subs):
+            line_text = subs[idx].text
+            reps = max(1, int(getattr(self, "_listening_replays", 2)))
+            self._listening_replay_loop(idx, line_text, reps)
+        else:
+            self._listening_pause_and_ask(self.engine._last_sub or "")
+
+    def _listening_replay_loop(self, idx, line_text, reps_left):
+        """Repete a fala `reps_left` vezes (loop) e só então pausa e pergunta."""
+        if not self._listening_mode:
+            self._listening_pending = False; return
+        subs = self.engine._subs
+        if not (0 <= idx < len(subs)):
+            self._listening_pause_and_ask(line_text); return
+        s = subs[idx]
+        self.engine.seek(s.start)
+        try: self.engine._player.play()
+        except: pass
+        self._notify(T("listening_replay"))
+        rate = getattr(self, "_rate", 1.0) or 1.0
+        dur = max(0.4, (s.end - s.start) / rate)
+        if reps_left > 1:
+            QTimer.singleShot(int(dur * 1000) + 200,
+                              lambda: self._listening_replay_loop(idx, line_text, reps_left - 1))
+        else:
+            QTimer.singleShot(int(dur * 1000) + 250,
+                              lambda: self._listening_pause_and_ask(line_text))
+
+    def _listening_reps_menu(self, _pos):
+        """Menu (clique-direito no Listening) para escolher quantas vezes cada fala
+        se repete em loop antes da pergunta de compreensão."""
+        from PyQt5.QtWidgets import QMenu
+        m = QMenu(self)
+        m.setStyleSheet(f"QMenu{{background:{ELV};color:{TXT};border:1px solid {BRD};}}"
+                        f"QMenu::item:selected{{background:{ACC};color:{ON_ACC};}}")
+        cur = int(getattr(self, "_listening_replays", 2))
+        for n in (1, 2, 3, 5):
+            act = m.addAction(("● " if n == cur else "   ") + f"{n}×")
+            act.triggered.connect(lambda _=False, v=n: self._set_listening_reps(v))
+        m.exec_(self.btn_listening.mapToGlobal(_pos))
+
+    def _set_listening_reps(self, n):
+        self._listening_replays = max(1, int(n))
+        self._notify(T("listening_reps_set", n=self._listening_replays))
+
+    def _listening_pause_and_ask(self, sub):
+        if not self._listening_mode:
+            self._listening_pending = False; return
         try: self.engine._player.pause()
         except: pass
         self._notify(T("listening_paused"))
-        # Ask AI to generate a question about recent context
-        sub = self.engine._last_sub
         if not sub:
             self._listening_pending = False; return
         self.chat._add_msg(T("listening_question"), "system")
@@ -6165,10 +7477,10 @@ class MainWindow(QMainWindow):
                                     headers={"Content-Type": "application/json"}), timeout=45)
                 d = json.loads(r.read().decode())
                 resp = (d.get("text") or "").strip()
-                QTimer.singleShot(0, lambda: self._show_listening_q(resp))
+                gui_call(lambda: self._show_listening_q(resp))
             except Exception as e:
                 log(f"listening: {e}")
-                QTimer.singleShot(0, lambda: setattr(self, '_listening_pending', False))
+                gui_call(lambda: setattr(self, '_listening_pending', False))
         threading.Thread(target=work, daemon=True).start()
 
     def _show_listening_q(self, text):
@@ -6214,10 +7526,19 @@ class MainWindow(QMainWindow):
             self._notify(T("stt_no_video")); return
         self.btn_stt.setEnabled(False)
         self.btn_stt.setText(T("stt_loading"))
-        import av, tempfile, os, time as _time
-        from faster_whisper import WhisperModel
 
         def _work():
+            tmp_path = None
+            # Imports PESADOS (av + faster_whisper) feitos AQUI, no thread worker, e
+            # protegidos: se o build não os incluir, antes a app CRASHAVA (o import
+            # estava no GUI thread, fora do try). Agora avisa em vez de rebentar.
+            try:
+                import av, tempfile, os
+                from faster_whisper import WhisperModel
+            except Exception as e:
+                log(f"stt indisponível: {type(e).__name__}: {e}")
+                gui_call(lambda: self._stt_fail(T("stt_unavailable")))
+                return
             try:
                 log(f"stt: starting transcription for {vid}")
                 # 1) Extract audio via PyAV → WAV temp file
@@ -6261,7 +7582,7 @@ class MainWindow(QMainWindow):
                 log(f"stt: {len(subs)} subtitles generated")
 
                 if not subs:
-                    QTimer.singleShot(0, lambda: self._stt_fail(T("stt_failed")))
+                    gui_call(lambda: self._stt_fail(T("stt_failed")))
                     return
 
                 # 4) Load into engine (replaces existing subtitles)
@@ -6272,12 +7593,12 @@ class MainWindow(QMainWindow):
                 self.engine.show_subtitle_reset()
                 log(f"stt: loaded {len(subs)} subs into engine")
 
-                QTimer.singleShot(0, lambda: self._stt_done(len(subs)))
+                gui_call(lambda: self._stt_done(len(subs)))
             except Exception as e:
                 log(f"stt FALHOU: {type(e).__name__}: {e}")
                 try: os.unlink(tmp_path)
                 except: pass
-                QTimer.singleShot(0, lambda: self._stt_fail(str(e)))
+                gui_call(lambda: self._stt_fail(str(e)))
 
         threading.Thread(target=_work, daemon=True).start()
 
@@ -6318,50 +7639,92 @@ class MainWindow(QMainWindow):
             step = max(1, len(subs) // 200)
             sampled = "\n".join(full.split("\n")[::step])
             full = sampled
+        n = len(subs)
+        # Limite de segmentos proporcional ao tamanho (≈1 cada 4 falas), entre 6 e 30 —
+        # evita JSON gigante que estoura o limite de tokens e fica truncado (= parse a
+        # falhar = "não preparou nada").
+        max_segs = max(6, min(30, n // 4 or 6))
         def work():
             try:
                 from urllib.request import urlopen, Request
-                from urllib.error import HTTPError
                 nat = native_language_name()
                 sys_p = (
-                    f"You are a content analyst. Given subtitle entries of a video, "
-                    f"group them into 3-8 thematic segments. Respond ONLY with JSON:\n"
-                    '{"segments":[{"title":"<segment title in ' + nat + '>",'
-                    '"start_idx":<int>,"end_idx":<int>}]}\n'
+                    f"You are a content analyst splitting a video into LESSON-sized scenes. "
+                    f"Each segment becomes a mini-lesson, so cut wherever the scene, location, "
+                    f"topic or beat naturally changes. Make as many as the content needs "
+                    f"(typically 8-20), but NO MORE THAN {max_segs}. Respond ONLY with JSON, "
+                    f"no prose, no markdown fences:\n"
+                    '{"segments":[{"title":"<title in ' + nat + '>","start_idx":<int>,"end_idx":<int>}]}\n'
                     "Rules:\n"
                     "- start_idx and end_idx are the [i] index numbers shown.\n"
-                    "- Segments must cover ALL subtitle entries exactly (no gaps, no overlap).\n"
-                    "- The first segment must start at the first index, the last must end at the last.\n"
-                    "- Each title (in " + nat + ") must be 2-5 words describing that segment's topic.\n"
-                    f"- Max 8 segments.\n"
-                    f"Subtitle data ({len(subs)} entries):\n{full[:10000]}")
-                body = json.dumps({"model": "deepseek-chat", "max_tokens": 800, "temperature": 0.1,
+                    "- Segments cover ALL entries exactly (no gaps/overlap); first starts at 0, "
+                    f"last ends at {n-1}.\n"
+                    "- Each title (in " + nat + "): 2-5 words describing that scene.\n"
+                    f"Subtitle data ({n} entries):\n{full[:10000]}")
+                body = json.dumps({"model": "deepseek-chat", "max_tokens": 2400, "temperature": 0.1,
                     "messages": [{"role": "system", "content": sys_p},
-                                 {"role": "user", "content": "Analyse these subtitles and return segments in JSON."}]}).encode()
+                                 {"role": "user", "content": "Return the segments JSON now."}]}).encode()
                 r = urlopen(Request(f"{LEXIO_API}/api/deepseek-chat", data=body,
                                     headers={"Content-Type": "application/json"}), timeout=60)
                 d = json.loads(r.read().decode())
-                raw = (d.get("text") or "").strip().strip("`")
-                parsed = json.loads(raw[raw.find("{"):raw.rfind("}")+1])
-                segs = parsed.get("segments", [])
-                for sg in segs:
-                    sg["start_idx"] = max(0, min(sg["start_idx"], len(subs)-1))
-                    sg["end_idx"] = max(sg["start_idx"], min(sg["end_idx"], len(subs)-1))
-                self._tracks = segs
-                # Deliver to GUI thread
+                raw = (d.get("text") or d.get("content") or "").strip().strip("`")
+                segs = self._parse_segments(raw, n)
                 if segs:
-                    QTimer.singleShot(0, self._populate_tracks)
+                    self.tracks_ready.emit(segs)
                 else:
-                    QTimer.singleShot(0, lambda: self._track_fail("Empty response"))
+                    self.tracks_failed.emit("empty/parse")
             except Exception as e:
                 log(f"segment err: {e}")
-                QTimer.singleShot(0, lambda: self._track_fail(str(e)))
+                self.tracks_failed.emit(str(e))
         threading.Thread(target=work, daemon=True).start()
+
+    @staticmethod
+    def _parse_segments(raw, n):
+        """Extrai os segmentos do texto da IA de forma tolerante: tenta JSON inteiro e,
+        se vier truncado, salva os objetos {..} individuais que estiverem completos."""
+        import re
+        out = []
+        def _clamp(sg):
+            try:
+                s = max(0, min(int(sg["start_idx"]), n - 1))
+                e = max(s, min(int(sg["end_idx"]), n - 1))
+                t = str(sg.get("title", "") or "").strip() or T("scene_default")
+                return {"title": t, "start_idx": s, "end_idx": e}
+            except Exception:
+                return None
+        # 1) JSON completo.
+        try:
+            obj = json.loads(raw[raw.find("{"):raw.rfind("}") + 1])
+            for sg in obj.get("segments", []):
+                c = _clamp(sg)
+                if c: out.append(c)
+        except Exception:
+            pass
+        # 2) Fallback: apanhar cada objeto de segmento individual (resiste a truncagem).
+        if not out:
+            for m in re.finditer(r'\{[^{}]*?"start_idx"\s*:\s*\d+[^{}]*?\}', raw):
+                try:
+                    c = _clamp(json.loads(m.group(0)))
+                    if c: out.append(c)
+                except Exception:
+                    continue
+        # Ordena e garante cobertura mínima coerente.
+        out.sort(key=lambda x: x["start_idx"])
+        return out
+
+    def _on_tracks_ready(self, segs):
+        self._tracks = segs or []
+        self._populate_tracks()
 
     def _populate_tracks(self):
         if hasattr(self, 'btn_segment'):
             self.btn_segment.setEnabled(True)
             self.btn_segment.setText(T("track_segment"))
+        # Nova segmentação → esquece o progresso de aulas anterior.
+        self._lesson_active = False
+        self._lesson_range = None
+        self._lesson_row = None
+        self._lesson_done = set()
         if hasattr(self, 'tw_list') and hasattr(self, 'tw_empty'):
             self.tw_list.clear()
             for i, t in enumerate(self._tracks):
@@ -6371,15 +7734,17 @@ class MainWindow(QMainWindow):
                 st = datetime.utcfromtimestamp(start_s).strftime('%M:%S')
                 et = datetime.utcfromtimestamp(end_s).strftime('%M:%S')
                 count = t["end_idx"] - t["start_idx"] + 1
-                item = QListWidgetItem(f"{t['title']}  ({st}–{et})  [{count} lines]")
+                item = QListWidgetItem(f"{t['title']}  ({st}–{et})  · {T('track_lines', count=count)}")
                 item.setData(Qt.UserRole, t["start_idx"])
+                item.setToolTip(T("lesson_click_hint"))
                 self.tw_list.addItem(item)
-            self.tw_empty.setText("")
+            self.tw_empty.setText(T("lesson_click_hint"))
             # Switch to Tracks tab
             for i in range(self.tabs.count()):
                 if self.tabs.tabText(i) == T("tab_tracks"):
                     self.tabs.setCurrentIndex(i)
                     break
+            self._refresh_track_marks()
             self._notify(f'{len(self._tracks)} {T("tab_tracks")}')
 
     def _track_fail(self, err):
@@ -6393,13 +7758,146 @@ class MainWindow(QMainWindow):
     def _track_clicked(self, row):
         if row < 0 or row >= len(self._tracks):
             return
-        idx = self._tracks[row].get("start_idx", 0)
+        self._start_lesson(row)
+
+    # ── Aulas: cada track é uma aula guiada pela IA ──
+    def _start_lesson(self, row):
+        """Arranca a aula do track: salta para o início, garante o chat aberto, dá a
+        introdução da cena e liga a narração ao vivo legenda a legenda."""
+        t = self._tracks[row]
         subs = self.engine._subs
-        if idx < len(subs):
-            self.engine.seek(subs[idx].start)
-            if not self.engine._player or not self.engine._player.is_playing():
-                try: self.engine._player.play()
-                except: pass
+        if not subs:
+            return
+        si = t.get("start_idx", 0); ei = t.get("end_idx", si)
+        self._lesson_active = True
+        # A aula toca a cena seguida e narra linha-a-linha. O Loop IA / auto-pausa /
+        # loop A-B fariam o filme repetir/parar a meio da aula ("o filme falha muito"
+        # com o segmentar/aula ativos). Suspende-os durante a aula; repõe no fim.
+        self._lesson_prev_ai_loop = getattr(self.engine, "_ai_loop", False)
+        self._lesson_prev_autopause = getattr(self.engine, "_autopause", False)
+        self._lesson_prev_loop = getattr(self.engine, "_loop", None)
+        try:
+            self.engine._ai_loop = False
+            self.engine._autopause = False
+            self.engine._loop = None
+        except Exception:
+            pass
+        self._lesson_row = row
+        self._lesson_range = (si, ei)
+        self._lesson_seen = set()
+        self._lesson_pending = None
+        # O motor pode já estar dentro de uma legenda — não a saltes na narração.
+        self.engine._last_entered_idx = -1
+        # Garante o chat visível para ver a aula.
+        if hasattr(self, 'chat') and not self.chat.isVisible():
+            try:
+                self.chat.setVisible(True)
+                if hasattr(self, 'chat_btn'): self.chat_btn.setChecked(True)
+            except Exception: pass
+        if si < len(subs):
+            self.engine.seek(subs[si].start)
+            try:
+                if not self.engine._player or not self.engine._player.is_playing():
+                    self.engine._player.play()
+            except Exception: pass
+        self._notify(f'{T("lesson_started")}: {t.get("title","")}')
+        # Introdução da cena (1 chamada). Bloqueia a primeira narração até chegar.
+        self._lesson_inflight = True
+        lines = []
+        for i in range(si, min(ei + 1, len(subs))):
+            lines.append(subs[i].text)
+        scene = " ".join(lines)[:1500]
+        sys_extra = (f"This is the START of a lesson on one scene/segment titled "
+                     f"\"{t.get('title','')}\". Give a short, inviting introduction: what this "
+                     f"scene is about and the context the learner should keep in mind. Do NOT "
+                     f"translate line by line yet.")
+        user_text = f"Scene transcript:\n{scene}"
+        self.chat.post_lesson_note(sys_extra, user_text, done_cb=self._lesson_note_done)
+
+    def _lesson_on_sub(self, idx):
+        """Narração ao vivo: explica a legenda atual dentro do track em curso."""
+        if not self._lesson_active or not self._lesson_range:
+            return
+        s, e = self._lesson_range
+        if idx > e:
+            self._finish_lesson()
+            return
+        if idx < s or idx in self._lesson_seen:
+            return
+        if self._lesson_inflight:
+            self._lesson_pending = idx   # apanha-a assim que a anterior terminar
+            return
+        self._narrate_line(idx)
+
+    def _narrate_line(self, idx):
+        subs = self.engine._subs
+        if idx >= len(subs):
+            return
+        self._lesson_seen.add(idx)
+        self._lesson_inflight = True
+        # Algum contexto à volta para a explicação não ficar solta.
+        ctx_before = subs[idx-1].text if idx > 0 else ""
+        line = subs[idx].text
+        ts = datetime.utcfromtimestamp(subs[idx].start).strftime('%M:%S')
+        title = self._tracks[self._lesson_row].get("title", "") if self._lesson_row is not None else ""
+        sys_extra = (f"You are mid-lesson on the scene \"{title}\". Explain THIS line as it plays: "
+                     f"meaning, tone, any idiom/expression or cultural nuance worth knowing. "
+                     f"Start with the timestamp {ts} in bold.")
+        user_text = (f"Previous line: {ctx_before}\nCurrent line ({ts}): {line}")
+        self.chat.post_lesson_note(sys_extra, user_text, done_cb=self._lesson_note_done)
+
+    def _lesson_note_done(self):
+        """Uma nota da IA terminou — liberta a fila e trata a legenda pendente."""
+        self._lesson_inflight = False
+        if not self._lesson_active:
+            return
+        pend = self._lesson_pending
+        self._lesson_pending = None
+        if pend is not None and self._lesson_range:
+            s, e = self._lesson_range
+            if s <= pend <= e and pend not in self._lesson_seen:
+                self._narrate_line(pend)
+
+    def _finish_lesson(self):
+        if self._lesson_row is not None:
+            self._lesson_done.add(self._lesson_row)
+            self._mark_track_done_ui(self._lesson_row)
+        self._lesson_active = False
+        self._lesson_range = None
+        self._lesson_row = None
+        self._lesson_pending = None
+        # Repõe os modos do motor suspendidos durante a aula.
+        try:
+            self.engine._ai_loop = getattr(self, "_lesson_prev_ai_loop", self.engine._ai_loop)
+            self.engine._autopause = getattr(self, "_lesson_prev_autopause", self.engine._autopause)
+            self.engine._loop = getattr(self, "_lesson_prev_loop", self.engine._loop)
+        except Exception:
+            pass
+        self._refresh_track_marks()
+
+    def _mark_track_done_ui(self, row):
+        """Marca o track concluído na lista (cor) — o groove é tratado à parte."""
+        if hasattr(self, 'tw_list') and 0 <= row < self.tw_list.count():
+            it = self.tw_list.item(row)
+            if it:
+                from PyQt5.QtGui import QColor
+                it.setForeground(QColor("#9EE6A0"))
+
+    def _refresh_track_marks(self):
+        """Desenha as fronteiras dos tracks no groove e realça os concluídos."""
+        if not hasattr(self, 'seek'):
+            return
+        dur = self.engine._duration or 0
+        subs = self.engine._subs
+        segs = []
+        if dur > 0 and subs and self._tracks:
+            for i, t in enumerate(self._tracks):
+                si = t.get("start_idx", 0); ei = t.get("end_idx", si)
+                if si < len(subs):
+                    sf = subs[si].start / dur
+                    ef = (subs[ei].end if ei < len(subs) else subs[-1].end) / dur
+                    segs.append((max(0.0, min(1.0, sf)), max(0.0, min(1.0, ef)), i in self._lesson_done))
+        self.seek.set_track_segs(segs)
 
     def _notify(self, msg):
         """Feedback the user can actually SEE: a flash on the video (works in
@@ -6409,10 +7907,30 @@ class MainWindow(QMainWindow):
         if getattr(self, 'overlay', None) and self.video_path:
             self.overlay.flash(msg)
 
+    # ── Button press animation ──
+    def _flash_btn(self, btn):
+        """Brief opacity pulse on button press — native Qt ease-out curve."""
+        eff = QGraphicsOpacityEffect(btn)
+        btn.setGraphicsEffect(eff)
+        anim = QPropertyAnimation(eff, b"opacity", btn)
+        anim.setDuration(200)
+        anim.setStartValue(0.35)
+        anim.setEndValue(1.0)
+        anim.setEasingCurve(QEasingCurve.OutCubic)
+        def cleanup():
+            try:
+                if btn.graphicsEffect() is eff:
+                    btn.setGraphicsEffect(None)
+            except RuntimeError:
+                pass
+        anim.finished.connect(cleanup)
+        anim.start()
+
     # ── Playback ──
     def _toggle(self):
         if not self.video_path: self._open(); return
         self.engine.toggle()
+        self._flash_btn(self.play_btn)
 
     def _on_play(self, p):
         self.play_btn.setText(chr(0xE769) if p else chr(0xE768))
@@ -6548,7 +8066,7 @@ class MainWindow(QMainWindow):
         self.engine.seek(float(self.seek.value())); self._seeking = False
 
     def _open(self):
-        paths, _ = QFileDialog.getOpenFileNames(self, "Abrir", "",
+        paths, _ = QFileDialog.getOpenFileNames(self, T("dlg_open"), "",
             f"Multimédia (*{' *'.join(sorted(SUPPORTED_VID|SUPPORTED_AUD))})")
         if paths:
             for p in paths: self._pl_add(p)
@@ -6556,6 +8074,9 @@ class MainWindow(QMainWindow):
 
     def _open_file(self, path):
         if not path or not Path(path).exists(): return
+        # Mudar de filme → fecha SÓ o exercício aberto (ficava com a cena do filme
+        # antigo). O chat IA NÃO se mexe — mantém a conversa entre filmes.
+        self._close_dock_exercise()
         self.engine.stop(); self.video_path = path
         # Limpa já a legenda/cartões do filme anterior, antes de o novo vídeo arrancar,
         # para não ficarem "colados" sobre o novo (bug das legendas congeladas).
@@ -6563,14 +8084,20 @@ class MainWindow(QMainWindow):
         self.engine.show_subtitle_reset()
         self._roll_session(Path(path).name)   # envia a sessão anterior, começa nova
         self.seek.clear_marks()
+        # Filme novo → esquece tracks/aulas e limpa as marcas do groove.
+        self._tracks = []
+        self._lesson_active = False; self._lesson_range = None; self._lesson_row = None
+        self._lesson_done = set(); self._lesson_pending = None; self._lesson_inflight = False
+        self.seek.set_track_segs([])
+        if hasattr(self, 'tw_list'):
+            self.tw_list.clear()
+        if hasattr(self, 'tw_empty'):
+            self.tw_empty.setText(T("track_no_sub"))
         self._add_recent(path)
         self.setWindowTitle(f"{Path(path).name} — {APP_NAME}")
-        self.tit.setText(Path(path).name)
-        self.bw.clear(); self.aw.clear()
-        for bm in self.mgr.get_bm(path): self._add_bm_item(bm)
-        for an in self.mgr.get_an(path): self._add_an_item(an)
         self.engine.open(path)
         self._update_sub_icon()
+        self._apply_slow_voice_mode()   # re-muta o novo player se ainda estiver em <1x
         # Auto-load a subtitle the user picked for this video before (memory),
         # only if none was auto-detected next to the file.
         if self.engine.sub_count() == 0:
@@ -6618,7 +8145,7 @@ class MainWindow(QMainWindow):
         if not self.engine.path():
             showToast(T("sub_need_first"), "accent")
             self.sbl.setText(T("sub_need_first")); return
-        path, _ = QFileDialog.getOpenFileName(self, "Carregar legenda", "",
+        path, _ = QFileDialog.getOpenFileName(self, T("dlg_load_sub"), "",
             "Legendas (*.srt *.SRT *.vtt *.VTT);;Todos (*)")
         if path and self.engine.load_srt(path):
             self._remember_sub(self.engine.path(), path)   # remember for next time
@@ -6706,49 +8233,43 @@ class MainWindow(QMainWindow):
         spds = [0.5,0.75,1.0,1.25,1.5,2.0]
         i = spds.index(self._rate) if self._rate in spds else 2
         self._rate = spds[(i+1)%len(spds)]; self.engine.set_rate(self._rate); self.spd.setText(f"{self._rate}x")
+        self._apply_slow_voice_mode()
 
-    # ── Bookmarks ──
-    def _add_bm(self):
-        if not self.video_path: return
-        bm = {"pos":self.engine.get_pos(),"label":f"Marco {len(self.mgr.get_bm(self.video_path))+1}","note":"","created":datetime.now().isoformat()}
-        self.mgr.d["bookmarks"].setdefault(str(self.video_path),[]).append(bm); self.mgr.save()
-        self._add_bm_item(bm); self.sbl.setText(T("bookmark_saved", t=FMT(bm['pos'])))
-    def _add_bm_item(self, bm):
-        self.bw.addItem(QListWidgetItem(f"{FMT(bm.get('pos',0))}  {bm.get('label','')}")); self.bw.item(self.bw.count()-1).setData(Qt.UserRole,bm)
-    def _bm_menu(self, pos):
-        item = self.bw.itemAt(pos)
-        if not item: return
-        menu = QMenu(); menu.setStyleSheet(f"QMenu{{background:{ELV};color:{TXT};border:1px solid {BRD};}}QMenu::item{{padding:5px 14px;font-size:11px;}}QMenu::item:selected{{background:{HVR};}}")
-        go = menu.addAction("Ir"); rm = menu.addAction("Remover")
-        action = menu.exec_(self.bw.mapToGlobal(pos))
-        if action == go:
-            bm = item.data(Qt.UserRole)
-            if bm: self.engine.seek(bm.get('pos',0))
-        elif action == rm:
-            i = self.bw.row(item)
-            if self.mgr.del_bm(self.video_path, i): self.bw.takeItem(i)
+    # ── Modo lento com voz neural (edge-tts) por cima ──
+    def _apply_slow_voice_mode(self):
+        """Abaixo de 1x: muta o VLC (sem 'cacos') e a voz neural lê cada legenda.
+        A 1x ou mais: restaura o áudio original e pára a voz."""
+        want = self._rate < 1.0 and bool(self.video_path)
+        changed = (want != self._slow_voice)
+        self._slow_voice = want
+        self.engine.set_audio_muted(want)
+        if not want:
+            SLOW_TTS.stop()
+        if changed:
+            self._notify(T("slow_voice_on") if want else T("slow_voice_off"))
+        if want:
+            # Começa logo pela legenda atual, sem esperar pela próxima.
+            idx = self.engine._last_entered_idx
+            if idx is not None and idx >= 0:
+                self._speak_line_slow(idx)
 
-    # ── Annotations ──
-    def _add_an(self):
-        t = self.te.toPlainText().strip()
-        if not self.video_path or not t: return
-        an = {"pos":self.engine.get_pos(),"text":t,"created":datetime.now().isoformat()}
-        self.mgr.d["annotations"].setdefault(str(self.video_path),[]).append(an); self.mgr.save()
-        self._add_an_item(an); self.te.clear(); self.sbl.setText(T("note_saved"))
-    def _add_an_item(self, an):
-        t = an.get('text',''); self.aw.addItem(QListWidgetItem(f"{FMT(an.get('pos',0))} {t[:50]}")); self.aw.item(self.aw.count()-1).setData(Qt.UserRole,an)
-    def _an_menu(self, pos):
-        item = self.aw.itemAt(pos)
-        if not item: return
-        menu = QMenu(); menu.setStyleSheet(f"QMenu{{background:{ELV};color:{TXT};border:1px solid {BRD};}}QMenu::item{{padding:5px 14px;font-size:11px;}}QMenu::item:selected{{background:{HVR};}}")
-        go = menu.addAction("Ir"); rm = menu.addAction("Remover")
-        action = menu.exec_(self.aw.mapToGlobal(pos))
-        if action == go:
-            an = item.data(Qt.UserRole)
-            if an: self.engine.seek(an.get('pos',0))
-        elif action == rm:
-            i = self.aw.row(item)
-            if self.mgr.del_an(self.video_path, i): self.aw.takeItem(i)
+    def _slow_voice_on_sub(self, idx):
+        if self._slow_voice:
+            self._speak_line_slow(idx)
+
+    def _speak_line_slow(self, idx):
+        subs = self.engine._subs
+        if idx < 0 or idx >= len(subs):
+            return
+        line = subs[idx].text.strip()
+        if not line:
+            return
+        # Voz mais lenta proporcional à velocidade do filme (0.5x→-50%, 0.75x→-25%).
+        rate = max(-50, min(0, int(round((self._rate - 1.0) * 100))))
+        SLOW_TTS.speak(line, self._content_lang(), rate=rate)
+
+    # (Bookmarks/Annotations UI removida — abas "Marcos" e "Notas" saíram.
+    # A camada de dados (DataMgr.get_bm/get_an) mantém-se para o export.)
 
     # ── Playlist ──
     def _pl_add(self, path):
@@ -6772,8 +8293,10 @@ class MainWindow(QMainWindow):
     def _clr_pl(self):
         self._playlist.clear(); self.plw.clear(); self._pl_idx=-1; self.engine.stop(); self.video_path=None; self.plcnt.setText("")
     def _next(self):
+        self._flash_btn(self.nb)
         if self._pl_idx < len(self._playlist)-1: self.plw.setCurrentRow(self._pl_idx+1)
     def _prev(self):
+        self._flash_btn(self.pb)
         if self._pl_idx > 0: self.plw.setCurrentRow(self._pl_idx-1)
     def _load_recent(self):
         try:
@@ -6792,20 +8315,95 @@ class MainWindow(QMainWindow):
         except: pass
 
     # ── Tools ──
+    # ── Lembretes de revisão (notificação do sistema) ──
+    def _ensure_tray(self):
+        """Cria (uma vez) o ícone na bandeja do sistema — necessário no Windows
+        para mostrar as notificações balão."""
+        if self._tray is not None:
+            return self._tray
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return None
+        ico = QApplication.instance().windowIcon()
+        if ico is None or ico.isNull():
+            _bd = os.path.dirname(os.path.abspath(__file__))
+            for _n in ("icon.ico", "icon.png"):
+                _p = os.path.join(_bd, _n)
+                if os.path.exists(_p):
+                    ico = QIcon(_p); break
+        self._tray = QSystemTrayIcon(ico, self)
+        self._tray.setToolTip(APP_NAME)
+        self._tray.activated.connect(lambda _r: (self.showNormal(), self.raise_(), self.activateWindow()))
+        return self._tray
+
+    def _toggle_reminders(self, on):
+        self.reminder.set_enabled(on)
+        tray = self._ensure_tray()
+        if tray is not None:
+            tray.setVisible(bool(on))
+
+    def _show_reminder_note(self, title, body):
+        tray = self._ensure_tray()
+        if tray is None:
+            return
+        if not tray.isVisible():
+            tray.show()
+        tray.showMessage(title or T("reminder_title"), body or "",
+                         QSystemTrayIcon.Information, 12000)
+
     def _export(self):
         if not self.video_path: return
-        p, _ = QFileDialog.getSaveFileName(self, "Exportar", f"{Path(self.video_path).stem}_estudo.json", "JSON (*.json)")
+        p, _ = QFileDialog.getSaveFileName(self, T("dlg_export"), f"{Path(self.video_path).stem}_estudo.json", "JSON (*.json)")
         if p: Path(p).write_text(self.mgr.export(self.video_path), encoding='utf-8')
     def _check_upd(self):
         try:
             r = urlopen(Request("https://github.com/amandioestevao/lexio-player/releases/latest/download/version.txt", headers={'User-Agent':APP_NAME}), timeout=5)
             v = r.read().decode().strip()
             if v and v != APP_VERSION:
-                if QMessageBox.question(self, "Atualização", f"Nova: {v}\nDescarregar?", QMessageBox.Yes|QMessageBox.No) == QMessageBox.Yes:
+                if QMessageBox.question(self, T("dlg_update"), f"Nova: {v}\nDescarregar?", QMessageBox.Yes|QMessageBox.No) == QMessageBox.Yes:
                     webbrowser.open("https://github.com/amandioestevao/lexio-player/releases/latest")
         except: pass
     def _about(self):
         QMessageBox.about(self, APP_NAME, f"<div style='text-align:center;'><h2 style='color:{ACC};'>{APP_NAME}</h2><p style='color:{TS2};'>v{APP_VERSION}</p><p style='color:{TMT};'>VLC + Chat IA</p></div>")
+
+    def _set_vision_key(self):
+        """Ativa a análise de imagem GRATUITA: o utilizador cola uma chave do
+        OpenRouter (criar é grátis em openrouter.ai/keys); os modelos de visão
+        :free passam a avaliar 'descrever cena/take' a ver mesmo o fotograma. A
+        chave fica só LOCAL (DATA_DIR/openrouter-key.txt), nunca no código/.exe."""
+        from PyQt5.QtWidgets import QInputDialog
+        from PyQt5.QtGui import QDesktopServices
+        cur = _openrouter_key()
+        box = QMessageBox(self)
+        box.setWindowTitle(T("tools_vision_key"))
+        box.setStyleSheet(f"QMessageBox{{background:{ELV};}}QLabel{{color:{TXT};}}")
+        status = T("vision_key_set") if cur else T("vision_key_unset")
+        box.setText(status + "\n\n" + T("vision_key_help"))
+        open_btn = box.addButton(T("vision_key_open"), QMessageBox.ActionRole)
+        paste_btn = box.addButton(T("vision_key_paste"), QMessageBox.AcceptRole)
+        box.addButton(T("exercise_close"), QMessageBox.RejectRole)
+        box.exec_()
+        clicked = box.clickedButton()
+        if clicked is open_btn:
+            QDesktopServices.openUrl(QUrl("https://openrouter.ai/keys"))
+            return
+        if clicked is not paste_btn:
+            return
+        key, ok = QInputDialog.getText(self, T("tools_vision_key"),
+                                       T("vision_key_prompt"), text=cur)
+        if not ok:
+            return
+        key = (key or "").strip()
+        try:
+            f = DATA_DIR / "openrouter-key.txt"
+            if key:
+                f.write_text(key, encoding="utf-8")
+                self._notify(T("vision_key_saved"))
+            else:
+                if f.exists(): f.unlink()
+                self._notify(T("vision_key_cleared"))
+        except Exception as e:
+            log(f"vision key save: {e}")
+            self._notify(T("vision_key_failed"))
 
     # ── Keyboard ──
     _SHORTCUT_KEYS = frozenset({
@@ -6821,6 +8419,10 @@ class MainWindow(QMainWindow):
             if not isinstance(fw, (QLineEdit, QTextEdit)) and event.key() in self._SHORTCUT_KEYS:
                 self.keyPressEvent(event)
                 return True
+        elif event.type() == QEvent.MouseMove and self._study_mode:
+            # In fullscreen, any mouse movement anywhere on screen should
+            # reveal the groove if the cursor is near the bottom zone.
+            self._fs_activity()
         return super().eventFilter(obj, event)
 
     def keyPressEvent(self, e):
@@ -6841,7 +8443,6 @@ class MainWindow(QMainWindow):
         elif k == Qt.Key_Right: self.engine.seek_rel(5)
         elif k == Qt.Key_Up: self.vol.setValue(min(200, self.vol.value()+10))
         elif k == Qt.Key_Down: self.vol.setValue(max(0, self.vol.value()-10))
-        elif k == Qt.Key_B: self._add_bm()
         elif k == Qt.Key_N: self._next()
         elif k == Qt.Key_P: self._prev()
         elif k == Qt.Key_R: self._cycle_spd()
@@ -6931,6 +8532,7 @@ def main():
         QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
         app = QApplication(sys.argv)
         app.setApplicationName(APP_NAME); app.setStyle("Fusion")
+        ensure_gui_invoker()   # cria o invocador GUI na main thread (entrega de workers)
         # App / taskbar icon. On Windows the taskbar groups by AppUserModelID, so
         # set an explicit id BEFORE creating windows or the taskbar shows the
         # generic python icon instead of ours.
@@ -6990,7 +8592,7 @@ def main():
         def _ui_topup():
             try:
                 if topup_ui_via_ai(i18n.current_lang()):
-                    QTimer.singleShot(0, lambda: showToast(T("lang_topup_ready"), "accent", 5000))
+                    gui_call(lambda: showToast(T("lang_topup_ready"), "accent", 5000))
             except Exception as _e:
                 log(f"ui topup startup: {_e}")
         threading.Thread(target=_ui_topup, daemon=True).start()

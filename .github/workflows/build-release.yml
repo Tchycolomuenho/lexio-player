@@ -6,9 +6,11 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
+  # ───────────────────────── Windows (.exe installer) ─────────────────────────
+  windows:
     runs-on: windows-latest
-
+    outputs:
+      version: ${{ steps.version.outputs.VERSION }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -43,15 +45,20 @@ jobs:
         id: version
         shell: powershell
         run: |
-          # Extract single version number from "Lexio Study Player v3.1"
-          $content = Get-Content lexio_player.py -First 3 | Out-String
-          $match = [regex]::Match($content, 'v(\d+\.\d+)')
-          $ver = $match.Groups[1].Value
+          # Fonte de verdade = APP_VERSION (a regex antiga lia o docstring desatualizado
+          # e marcava tags erradas tipo v3.8). Lê o número real ex.: 3.14.0.
+          $line = Select-String -Path lexio_player.py -Pattern 'APP_VERSION\s*=\s*"([^"]+)"' | Select-Object -First 1
+          $ver = [regex]::Match($line.Line, 'APP_VERSION\s*=\s*"([^"]+)"').Groups[1].Value
           echo "VERSION=$ver" >> $env:GITHUB_OUTPUT
           echo "version=$ver"
 
-      - name: Create Release
-        id: create_release
+      - name: Stable-named copy (link permanente para o download na web)
+        shell: powershell
+        run: |
+          $src = Get-ChildItem installer/LexioStudyPlayer-*-Setup.exe | Select-Object -First 1
+          Copy-Item $src.FullName installer/LexioStudyPlayer-Setup.exe -Force
+
+      - name: Create versioned Release
         uses: softprops/action-gh-release@v2
         with:
           token: ${{ secrets.GH_PAT }}
@@ -59,7 +66,7 @@ jobs:
           name: Lexio Study Player v${{ steps.version.outputs.VERSION }}
           body: |
             Build automático do Lexio Study Player.
-            
+
             ## O que foi alterado
             - Veja o histórico de commits para detalhes.
           files: |
@@ -67,3 +74,146 @@ jobs:
           draft: false
           prerelease: false
           generate_release_notes: true
+
+      - name: Update moving 'desktop-latest' release (link estável p/ a app web)
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.GH_PAT }}
+          tag_name: desktop-latest
+          name: Lexio Study Player (latest)
+          body: |
+            Última build estável do Lexio Study Player (atualiza a cada release).
+            O download da app web aponta sempre para aqui.
+          files: |
+            installer/LexioStudyPlayer-Setup.exe
+          draft: false
+          prerelease: false
+
+  # ───────────────────────────── macOS (.dmg) ─────────────────────────────────
+  macos:
+    runs-on: macos-latest
+    needs: windows
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller PyQt5 PyQtWebEngine python-vlc edge-tts
+
+      - name: Install VLC (bundled into the .app)
+        run: |
+          brew install --cask vlc
+
+      - name: Build .app with PyInstaller
+        run: |
+          pyinstaller LexioStudyPlayer.spec --noconfirm
+
+      - name: Package .dmg
+        run: |
+          mkdir -p installer
+          hdiutil create -volname "Lexio Study Player" \
+            -srcfolder "dist/Lexio Study Player.app" \
+            -ov -format UDZO "installer/LexioStudyPlayer-macOS.dmg"
+
+      - name: Upload to versioned + desktop-latest releases
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.GH_PAT }}
+          tag_name: v${{ needs.windows.outputs.version }}
+          files: installer/LexioStudyPlayer-macOS.dmg
+          draft: false
+          prerelease: false
+
+      - name: Mirror to desktop-latest
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.GH_PAT }}
+          tag_name: desktop-latest
+          files: installer/LexioStudyPlayer-macOS.dmg
+          draft: false
+          prerelease: false
+
+  # ──────────────────────────── Linux (AppImage) ──────────────────────────────
+  linux:
+    runs-on: ubuntu-latest
+    needs: windows
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller PyQt5 PyQtWebEngine python-vlc edge-tts
+
+      - name: Install VLC + Qt runtime libs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y vlc libvlc-dev \
+            libxcb-xinerama0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
+            libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxkbcommon-x11-0 \
+            libnss3 libxcomposite1 libxdamage1 libasound2t64 fuse libfuse2 || \
+          sudo apt-get install -y vlc libvlc-dev \
+            libxcb-xinerama0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
+            libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxkbcommon-x11-0 \
+            libnss3 libxcomposite1 libxdamage1 libasound2 fuse libfuse2
+
+      - name: Build one-dir with PyInstaller
+        run: |
+          pyinstaller LexioStudyPlayer.spec --noconfirm
+
+      - name: Package AppImage
+        run: |
+          set -e
+          mkdir -p installer AppDir
+          cp -r dist/LexioStudyPlayer/* AppDir/
+          cat > AppDir/AppRun <<'EOF'
+          #!/bin/bash
+          HERE="$(dirname "$(readlink -f "$0")")"
+          export VLC_PLUGIN_PATH="$HERE/plugins"
+          export LD_LIBRARY_PATH="$HERE:$LD_LIBRARY_PATH"
+          exec "$HERE/LexioStudyPlayer" "$@"
+          EOF
+          chmod +x AppDir/AppRun
+          cp icon.png AppDir/lexio.png
+          cat > AppDir/lexio.desktop <<'EOF'
+          [Desktop Entry]
+          Name=Lexio Study Player
+          Exec=LexioStudyPlayer
+          Icon=lexio
+          Type=Application
+          Categories=Education;AudioVideo;
+          EOF
+          wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool-x86_64.AppImage
+          APPIMAGE_EXTRACT_AND_RUN=1 ARCH=x86_64 ./appimagetool-x86_64.AppImage AppDir installer/LexioStudyPlayer-Linux.AppImage
+
+      - name: Upload to versioned + desktop-latest releases
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.GH_PAT }}
+          tag_name: v${{ needs.windows.outputs.version }}
+          files: installer/LexioStudyPlayer-Linux.AppImage
+          draft: false
+          prerelease: false
+
+      - name: Mirror to desktop-latest
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.GH_PAT }}
+          tag_name: desktop-latest
+          files: installer/LexioStudyPlayer-Linux.AppImage
+          draft: false
+          prerelease: false

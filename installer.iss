@@ -1,8 +1,17 @@
-; Lexio Study Player v3.9.5 — Inno Setup Script
-; Gera: installer/LexioStudyPlayer-3.9.5-Setup.exe
+; Lexio Study Player — Inno Setup Script
+; Gera: installer/LexioStudyPlayer-<versao>-Setup.exe
+;
+; A versão é LIDA de version.txt (fonte de verdade = APP_VERSION, que o build.sh
+; sincroniza para version.txt). NUNCA hardcodar a versão aqui — já aconteceu o
+; instalador sair com um número stale (3.9.6) enquanto o código era mais recente.
 
 #define MyAppName "Lexio Study Player"
-#define MyAppVersion "3.9.5"
+#define VerHandle = FileOpen("version.txt")
+#define MyAppVersion = Trim(FileRead(VerHandle))
+#expr FileClose(VerHandle)
+#if MyAppVersion == ""
+  #error version.txt vazio — nao consegui ler a versao
+#endif
 #define MyAppPublisher "Lexio"
 #define MyAppURL "https://lexio.app"
 #define MyAppExeName "LexioStudyPlayer.exe"
@@ -20,11 +29,12 @@ DisableDirPage=yes
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 OutputDir=installer
-OutputBaseFilename=LexioStudyPlayer-3.9.5-Setup
+OutputBaseFilename=LexioStudyPlayer-{#MyAppVersion}-Setup
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
 PrivilegesRequired=admin
+ArchitecturesInstallIn64BitMode=x64compatible
 CloseApplications=yes
 SetupIconFile=icon.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
