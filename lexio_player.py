@@ -118,7 +118,7 @@ ACC_HOVER = "#cfcfcf"  # dimmer white on hover
 ON_ACC = "#000000"   # text/icon ON white accent
 
 APP_NAME = "Lexio Study Player"
-APP_VERSION = "3.16.0"
+APP_VERSION = "3.17.0"
 log(f"=== LEXIO PLAYER v{APP_VERSION} ===")  # versão REAL (o banner de cima já não tem versão hardcoded)
 DATA_DIR = Path.home() / '.lexio-player'; DATA_DIR.mkdir(exist_ok=True)
 RECENT_FILE = DATA_DIR / 'recent.json'
@@ -710,6 +710,16 @@ class SeekSlider(QSlider):
         super().__init__(*a, **k)
         self._marks = {}   # label -> value (in slider units, i.e. seconds)
         self._track_segs = []  # [(start_frac, end_frac, done_bool)] — aulas/tracks
+        # Preview da legenda ao passar o rato sobre o groove (só o seek bar; o
+        # slider de volume NUNCA recebe isto, por isso a sua aparência fica intacta —
+        # resolve o conflito #5 "nome da legenda no groove vs css do volume").
+        self._preview = None
+        self.setMouseTracking(True)
+
+    def set_preview(self, fn):
+        """fn(value)->str: texto a mostrar num tooltip flutuante para a posição
+        apontada (ex.: a legenda nesse instante). Só faz sentido no seek bar."""
+        self._preview = fn
 
     def set_track_segs(self, segs):
         """Marca as fronteiras dos tracks (aulas) no groove; segmentos concluídos
@@ -807,6 +817,21 @@ class SeekSlider(QSlider):
                 self.setValue(self._value_at(e.pos()))
                 self.sliderMoved.emit(self.value())
         super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        super().mouseMoveEvent(e)
+        # Tooltip flutuante com a legenda na posição apontada (preview de scrub).
+        if self._preview is not None and self.maximum() > self.minimum():
+            try:
+                from PyQt5.QtWidgets import QToolTip
+                v = self._value_at(e.pos())
+                txt = self._preview(v)
+                if txt:
+                    QToolTip.showText(e.globalPos(), txt, self)
+                else:
+                    QToolTip.hideText()
+            except Exception:
+                pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -926,7 +951,8 @@ class PlayerEngine(QWidget):
     playing_changed = pyqtSignal(bool)
     media_ended = pyqtSignal()
     vocab_triggered = pyqtSignal(str)
-    subtitle_changed = pyqtSignal(str)  # current subtitle text
+    subtitle_changed = pyqtSignal(str)  # current subtitle text (original)
+    subtitles_changed = pyqtSignal(str, str, str)  # original, 2ª linha, 3ª linha
     subtitle_exited = pyqtSignal(int)   # index of subtitle that just finished
     subtitle_entered = pyqtSignal(int)  # index of subtitle we JUST entered (lesson narration)
     ai_loop_changed = pyqtSignal(int)   # remaining loops for current sub, 0 = off
@@ -946,6 +972,14 @@ class PlayerEngine(QWidget):
         self._path = None; self._duration = 0
         self._subs = []        # SubEntry list
         self._played_ids = set()  # track which subs already shown
+        # ── Legendas duplas/triplas ──
+        self._subs2 = []        # 2ª legenda (outra língua / tradução manual)
+        self._subs3 = []        # 3ª legenda (opcional)
+        self._auto_tr = False   # auto-traduzir a 2ª linha via IA quando não há _subs2
+        self._tr_lang = ""      # nome em inglês do idioma alvo (p/ o prompt da IA)
+        self._tr_lang_code = "" # código do idioma alvo
+        self._tr_cache = {}     # texto original -> tradução (preenchido em background)
+        self._tr_inflight = set()  # textos já enviados p/ traduzir (não repetir)
         # ── Language-learning practice state ──
         self._loop = None       # (start, end) seconds, or None — A-B loop
         self._loop_a = None     # manual A point (seconds) waiting for B
@@ -1043,6 +1077,10 @@ class PlayerEngine(QWidget):
             elif not is_playing and self._last_sub:
                 current_sub = self._last_sub
             self.subtitle_changed.emit(current_sub)
+            # 2ª/3ª linha (legendas duplas/triplas): alinhadas pelo TEMPO (robusto a
+            # ficheiros .srt com fronteiras diferentes), com fallback à auto-tradução IA.
+            l2, l3 = self._secondary_lines(p, current_idx, current_sub)
+            self.subtitles_changed.emit(current_sub, l2, l3)
             # Entrámos numa NOVA legenda? (usado pela narração ao vivo das aulas)
             if is_playing and current_idx >= 0 and current_idx != self._last_entered_idx:
                 self._last_entered_idx = current_idx
@@ -1124,6 +1162,9 @@ class PlayerEngine(QWidget):
         self.stop()
         self._path = path
         self._subs = []; self._played_ids = set(); self._last_sub = ""
+        # Legendas secundárias e cache de tradução são do filme anterior — limpar.
+        self._subs2 = []; self._subs3 = []
+        self._tr_cache = {}; self._tr_inflight = set()
         if not Path(path).exists(): return
         # Load subtitles - auto detect .srt file
         sub_path = find_subtitle(path)
@@ -1182,6 +1223,102 @@ class PlayerEngine(QWidget):
         except Exception as e:
             log(f"load_srt fail: {e}")
             return False
+
+    # ── Legendas duplas/triplas ───────────────────────────────────────────────
+    @staticmethod
+    def _text_at(subs, p):
+        """Texto da legenda (numa lista) que cobre o instante p, ou "". Alinhamento
+        por tempo: funciona mesmo quando os ficheiros .srt têm fronteiras diferentes."""
+        for s in subs:
+            if s.start <= p <= s.end:
+                return s.text
+        return ""
+
+    def _secondary_lines(self, p, idx, orig):
+        """Devolve (2ª linha, 3ª linha) para o instante p. A 2ª vem da 2ª legenda
+        carregada; se não houver e a auto-tradução estiver ON, vem da cache de IA."""
+        l2 = self._text_at(self._subs2, p)
+        l3 = self._text_at(self._subs3, p)
+        if not l2 and self._auto_tr and orig:
+            key = orig.strip()
+            l2 = self._tr_cache.get(key, "")
+            if idx >= 0:
+                self._prefetch_tr(idx)   # adianta a tradução das próximas falas
+        return l2, l3
+
+    def _prefetch_tr(self, idx):
+        """Traduz em background a fala atual + as próximas (lote pequeno), guardando
+        em _tr_cache. Evita repetir o que já está em cache/voo."""
+        if not self._tr_lang:
+            return
+        batch = []
+        for j in range(idx, min(idx + 6, len(self._subs))):
+            t = (self._subs[j].text or "").strip()
+            if t and t not in self._tr_cache and t not in self._tr_inflight:
+                self._tr_inflight.add(t); batch.append(t)
+        if batch:
+            threading.Thread(target=self._tr_worker, args=(batch, self._tr_lang),
+                             daemon=True).start()
+
+    def _tr_worker(self, batch, lang):
+        try:
+            sys_p = ("You are a subtitle translator. Translate each line into "
+                     f"{lang}. Keep it natural and concise (it must fit one subtitle "
+                     "line). Reply with ONLY a JSON array of the translations, in the "
+                     "same order and same length — no prose, no markdown.")
+            body = json.dumps({"model": "deepseek-chat", "max_tokens": 1200,
+                "temperature": 0.2,
+                "messages": [{"role": "system", "content": sys_p},
+                             {"role": "user", "content": json.dumps(batch, ensure_ascii=False)}]}).encode()
+            r = urlopen(Request(f"{LEXIO_API}/api/deepseek-chat", data=body,
+                                headers={"Content-Type": "application/json"}), timeout=60)
+            d = json.loads(r.read().decode())
+            raw = (d.get("text") or "").strip()
+            if not raw and d.get("choices"):
+                raw = d["choices"][0].get("message", {}).get("content", "")
+            raw = raw.strip().strip("`")
+            arr = json.loads(raw[raw.find("["): raw.rfind("]") + 1])
+            for src, tr in zip(batch, arr):
+                if tr:
+                    self._tr_cache[src] = str(tr).strip()
+        except Exception as e:
+            log(f"tr worker: {e}")
+        finally:
+            for t in batch:
+                self._tr_inflight.discard(t)
+
+    def load_srt2(self, path):
+        try:
+            self._subs2 = parse_srt(Path(path).read_text(encoding='utf-8', errors='replace'))
+            log(f"2ª legenda: {len(self._subs2)} de {Path(path).name}")
+            return len(self._subs2) > 0
+        except Exception as e:
+            log(f"load_srt2: {e}"); return False
+
+    def load_srt3(self, path):
+        try:
+            self._subs3 = parse_srt(Path(path).read_text(encoding='utf-8', errors='replace'))
+            log(f"3ª legenda: {len(self._subs3)} de {Path(path).name}")
+            return len(self._subs3) > 0
+        except Exception as e:
+            log(f"load_srt3: {e}"); return False
+
+    def set_auto_translate(self, on, lang_en="", lang_code=""):
+        self._auto_tr = bool(on)
+        if lang_en:
+            self._tr_lang = lang_en
+        if lang_code:
+            self._tr_lang_code = lang_code
+
+    def sub_text_at(self, p):
+        """Texto da legenda principal no instante p (para o preview do seek bar)."""
+        return self._text_at(self._subs, p)
+
+    def clear_sub2(self):
+        self._subs2 = []
+
+    def clear_sub3(self):
+        self._subs3 = []
 
     def cycle_sub_track(self):
         """Cycle through VLC subtitle tracks (embedded)"""
@@ -1879,6 +2016,8 @@ class VideoOverlay(QWidget):
         self._cards = []
         self._hover_idx = -1
         self._current_sub = ""
+        self._current_sub2 = ""   # 2ª linha (legenda dupla / tradução)
+        self._current_sub3 = ""   # 3ª linha (legenda tripla)
         self._sub_word_rects = []  # [(x, y, w, h, word)] for bottom subtitle
         self._hide_subs = False   # active-recall: hide subtitle until mouse peeks at bottom
         self._no_sub_hint = False # show a clickable "load a subtitle" banner over the video
@@ -2010,12 +2149,17 @@ class VideoOverlay(QWidget):
         self.update()
 
     def show_subtitle(self, text):
-        # Repintar SEMPRE que o texto muda — em especial quando passa a vazio. Sem
-        # isto, ao trocar de filme a última legenda do filme antigo ficava "colada":
-        # o _tick só repinta enquanto houver legenda ou cartões, por isso ao limpar
-        # (texto = "") nunca chegava a apagar o que estava desenhado.
-        if text != self._current_sub:
-            self._current_sub = text
+        # Compat: legenda simples (sem 2ª/3ª linha). Delega no caminho duplo/triplo
+        # para limpar quaisquer linhas de tradução penduradas.
+        self.show_subtitles(text, "", "")
+
+    def show_subtitles(self, orig, l2="", l3=""):
+        """Legenda principal + 2ª/3ª linhas (legendas duplas/triplas). Repinta só
+        quando algo muda."""
+        if (orig, l2, l3) != (self._current_sub, self._current_sub2, self._current_sub3):
+            self._current_sub = orig
+            self._current_sub2 = l2
+            self._current_sub3 = l3
             self.update()
 
     def reset_for_new_video(self):
@@ -2023,6 +2167,8 @@ class VideoOverlay(QWidget):
         banners. Evita que legendas/cartões do filme anterior fiquem congelados sobre
         o novo vídeo enquanto este ainda não emitiu nada."""
         self._current_sub = ""
+        self._current_sub2 = ""
+        self._current_sub3 = ""
         self._cards = []
         self._hover_idx = -1
         self._flash_msg = ""
@@ -2274,8 +2420,43 @@ class VideoOverlay(QWidget):
                     return (sum(fm.horizontalAdvance(wd) for wd, _ in ln)
                             + space_w * max(0, len(ln) - 1))
 
-                box_h = len(lines) * line_h + 14
-                sw = min(maxw, max((line_width(ln) for ln in lines), default=0) + 2 * pad)
+                # ── 2ª/3ª linha (legendas duplas/triplas): por BAIXO da original,
+                # mais pequenas e a cinzento (tema monocromático — distinguem-se pelo
+                # tamanho/tom, não por cor) e quebradas em no máx. 2 linhas cada. ──
+                tr_fs = max(8, fs - 3)
+                tr_font = QFont("Inter", tr_fs)
+                tr_fm = QFontMetrics(tr_font)
+                tr_line_h = tr_fm.height() + 2
+                tr_sp = tr_fm.horizontalAdvance(" ")
+
+                def _wrap_plain(txt):
+                    out, c, cw = [], [], 0
+                    for wd in [x for x in txt.split(" ") if x]:
+                        ww2 = tr_fm.horizontalAdvance(wd)
+                        add = ww2 + (tr_sp if c else 0)
+                        if c and cw + add > avail:
+                            out.append(" ".join(c)); c, cw = [], 0; add = ww2
+                        c.append(wd); cw += add
+                    if c:
+                        out.append(" ".join(c))
+                    if len(out) > 2:
+                        out = out[:2]; out[1] = out[1] + " …"
+                    return out
+
+                l2_lines = _wrap_plain(self._current_sub2) if self._current_sub2 else []
+                l3_lines = _wrap_plain(self._current_sub3) if self._current_sub3 else []
+
+                gap = 5 if (l2_lines or l3_lines) else 0
+                inner_h = len(lines) * line_h
+                if l2_lines:
+                    inner_h += gap + len(l2_lines) * tr_line_h
+                if l3_lines:
+                    inner_h += (gap if not l2_lines else 3) + len(l3_lines) * tr_line_h
+                box_h = inner_h + 14
+                widths = [line_width(ln) for ln in lines]
+                widths += [tr_fm.horizontalAdvance(s) for s in l2_lines]
+                widths += [tr_fm.horizontalAdvance(s) for s in l3_lines]
+                sw = min(maxw, max(widths, default=0) + 2 * pad)
                 # Sobe a legenda acima do transport flutuante (study mode) para os
                 # controlos NUNCA a taparem.
                 margin_b = max(12, ah // 14) + self._transport_h
@@ -2285,8 +2466,8 @@ class VideoOverlay(QWidget):
                 p.setPen(Qt.NoPen); p.setBrush(QColor(0, 0, 0, 200))
                 p.drawRoundedRect(sx, sy, sw, box_h, 8, 8)
 
-                # Draw each line centred; tint KEY words (colored but NOT underlined).
-                # Only the Twitch vocab cards get underlined words for details clicks.
+                # Original (branco) — palavra a palavra; tinge palavras-chave (sem
+                # sublinhar). Só os cartões Twitch têm palavras clicáveis para detalhes.
                 self._sub_word_rects = []
                 for li, ln in enumerate(lines):
                     lx = acx - line_width(ln) // 2
@@ -2300,6 +2481,26 @@ class VideoOverlay(QWidget):
                             p.setPen(QColor(255, 255, 255)); p.setFont(sub_font)
                         p.drawText(QRect(lx, ly, ww + 4, line_h), Qt.AlignLeft | Qt.AlignVCenter, word)
                         lx += ww + space_w
+
+                # 2ª linha (tradução / legenda dupla) — cinzento claro.
+                ty = sy + 7 + len(lines) * line_h
+                if l2_lines:
+                    ty += gap
+                    p.setFont(tr_font); p.setPen(QColor(200, 200, 200))
+                    for s in l2_lines:
+                        sw2 = tr_fm.horizontalAdvance(s)
+                        p.drawText(QRect(acx - sw2 // 2, ty, sw2 + 4, tr_line_h),
+                                   Qt.AlignLeft | Qt.AlignVCenter, s)
+                        ty += tr_line_h
+                # 3ª linha (legenda tripla) — cinzento mais ténue.
+                if l3_lines:
+                    ty += (gap if not l2_lines else 3)
+                    p.setFont(tr_font); p.setPen(QColor(150, 150, 150))
+                    for s in l3_lines:
+                        sw3 = tr_fm.horizontalAdvance(s)
+                        p.drawText(QRect(acx - sw3 // 2, ty, sw3 + 4, tr_line_h),
+                                   Qt.AlignLeft | Qt.AlignVCenter, s)
+                        ty += tr_line_h
                 p.setFont(sub_font)
             else:
                 # Active-recall: subtitle hidden — discreet placeholder, peek by
@@ -5813,7 +6014,7 @@ class MainWindow(QMainWindow):
         self.engine.playing_changed.connect(self._on_play)
         self.engine.duration_changed.connect(self._on_dur)
         # Wire overlay signals
-        self.engine.subtitle_changed.connect(self.overlay.show_subtitle)
+        self.engine.subtitles_changed.connect(self.overlay.show_subtitles)
         self.engine.subtitle_changed.connect(self._remember_last_sub)
         self.engine.subtitle_exited.connect(self._on_sub_exited)
         self.engine.subtitle_entered.connect(self._lesson_on_sub)
@@ -5911,6 +6112,10 @@ class MainWindow(QMainWindow):
         self.seek.sliderPressed.connect(lambda: setattr(self,'_seeking',True))
         self.seek.sliderReleased.connect(self._seek_to)
         self.seek.sliderMoved.connect(lambda v: self.tlbl.setText(FMT(v)))
+        # Preview da legenda ao passar o rato sobre o seek (mostra o que se diz nesse
+        # instante). Só no seek bar — o volume não tem preview, logo não há conflito (#5).
+        self.seek.set_preview(lambda v: (FMT(v) + "  ·  " + self.engine.sub_text_at(v))
+                              if self.engine.sub_text_at(v) else FMT(v))
         sl.addWidget(self.seek, 1)
         self.dlbl = QLabel("0:00"); self.dlbl.setStyleSheet(f"color:{TMT};font-size:11px;min-width:38px;background:transparent;")
         sl.addWidget(self.dlbl)
@@ -5949,8 +6154,11 @@ class MainWindow(QMainWindow):
         self.sub_btn.clicked.connect(self._load_sub_file)
         self.sub_icon = QPushButton(chr(0xE7F0)); self.sub_icon.setFixedSize(30,24)
         self.sub_icon.setStyleSheet(f"QPushButton{{background:transparent;border:none;color:{TMT};font-family:{ICON_F};font-size:13px;}}QPushButton:hover{{color:{ACC};}}")
-        self.sub_icon.setToolTip(T("sub_toggle_tip"))
+        self.sub_icon.setToolTip(T("sub_toggle_tip") + " · " + T("sub_menu_tip"))
         self.sub_icon.clicked.connect(self._cycle_subs)
+        # Clique-direito no CC → legendas duplas/triplas + auto-tradução.
+        self.sub_icon.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.sub_icon.customContextMenuRequested.connect(self._sub_menu)
 
         self.vol_icon = QLabel(chr(0xE767)); self.vol_icon.setStyleSheet(f"color:{TS2};font-family:{ICON_F};font-size:15px;background:transparent;")
         # SeekSlider (not plain QSlider): clicking anywhere on the bar jumps the
@@ -8205,6 +8413,52 @@ class MainWindow(QMainWindow):
             self.sbl.setText(T("sub_track_on"))
         else:
             self.sbl.setText(T("sub_track_off"))
+
+    def _sub_menu(self, pos):
+        """Menu de legendas duplas/triplas + auto-tradução (clique-direito no CC)."""
+        m = QMenu(self)
+        m.setStyleSheet(f"QMenu{{background:{ELV};color:{TXT};border:1px solid {BRD};padding:4px;}}"
+                        f"QMenu::item{{padding:6px 14px;border-radius:4px;}}QMenu::item:selected{{background:{HVR};}}")
+        a2 = m.addAction(T("sub2_load"))
+        a3 = m.addAction(T("sub3_load"))
+        m.addSeparator()
+        at = m.addAction(T("sub_auto_tr"))
+        at.setCheckable(True); at.setChecked(self.engine._auto_tr)
+        m.addSeparator()
+        c2 = m.addAction(T("sub2_clear"))
+        c3 = m.addAction(T("sub3_clear"))
+        act = m.exec_(self.sub_icon.mapToGlobal(pos))
+        if act is None:
+            return
+        if act == a2:
+            self._load_sub_n(2)
+        elif act == a3:
+            self._load_sub_n(3)
+        elif act == at:
+            self._toggle_auto_tr(at.isChecked())
+        elif act == c2:
+            self.engine.clear_sub2(); self.overlay.flash(T("sub2_off"))
+        elif act == c3:
+            self.engine.clear_sub3(); self.overlay.flash(T("sub3_off"))
+
+    def _load_sub_n(self, n):
+        if not self.engine.path():
+            showToast(T("sub_need_first"), "accent"); return
+        path, _ = QFileDialog.getOpenFileName(self, T("dlg_load_sub"), "",
+            "Legendas (*.srt *.SRT *.vtt *.VTT);;Todos (*)")
+        if not path:
+            return
+        ok = self.engine.load_srt2(path) if n == 2 else self.engine.load_srt3(path)
+        if ok:
+            self.overlay.flash(T(f"sub{n}_loaded", name=Path(path).name))
+        else:
+            self.overlay.flash(T("sub_load_fail"))
+
+    def _toggle_auto_tr(self, on):
+        code = i18n.current_lang()
+        lang_en = i18n.language_en_name(code)
+        self.engine.set_auto_translate(on, lang_en, code)
+        self.overlay.flash(T("sub_auto_tr_on", lang=lang_en) if on else T("sub_auto_tr_off"))
 
     def _update_sub_icon(self):
         """Update the subtitle indicator based on loaded subs, and the big subtitle

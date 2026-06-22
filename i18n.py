@@ -1452,3 +1452,20 @@ STRINGS.update({
         "ru": "Дважды щёлкните результат, чтобы скачать и загрузить.",
         "ar": "انقر نقرًا مزدوجًا على نتيجة لتنزيلها وتحميلها."},
 })
+
+# — Legendas duplas/triplas (en+pt; o topup IA preenche as restantes línguas) —
+STRINGS.update({
+    "sub_menu_tip": {"en": "Right-click: dual/triple subtitles & auto-translate",
+        "pt": "Clique-direito: legendas duplas/triplas e auto-tradução"},
+    "sub2_load": {"en": "Load 2nd subtitle…", "pt": "Carregar 2ª legenda…"},
+    "sub3_load": {"en": "Load 3rd subtitle…", "pt": "Carregar 3ª legenda…"},
+    "sub2_clear": {"en": "Remove 2nd subtitle", "pt": "Remover 2ª legenda"},
+    "sub3_clear": {"en": "Remove 3rd subtitle", "pt": "Remover 3ª legenda"},
+    "sub_auto_tr": {"en": "Auto-translate 2nd line (AI)", "pt": "Auto-traduzir 2ª linha (IA)"},
+    "sub_auto_tr_on": {"en": "Auto-translating to {lang}", "pt": "A traduzir para {lang}"},
+    "sub_auto_tr_off": {"en": "Auto-translate off", "pt": "Auto-tradução desligada"},
+    "sub2_loaded": {"en": "2nd subtitle: {name}", "pt": "2ª legenda: {name}"},
+    "sub3_loaded": {"en": "3rd subtitle: {name}", "pt": "3ª legenda: {name}"},
+    "sub2_off": {"en": "2nd subtitle removed", "pt": "2ª legenda removida"},
+    "sub3_off": {"en": "3rd subtitle removed", "pt": "3ª legenda removida"},
+})
