@@ -118,7 +118,7 @@ ACC_HOVER = "#cfcfcf"  # dimmer white on hover
 ON_ACC = "#000000"   # text/icon ON white accent
 
 APP_NAME = "Lexio Study Player"
-APP_VERSION = "3.17.0"
+APP_VERSION = "3.18.0"
 log(f"=== LEXIO PLAYER v{APP_VERSION} ===")  # versão REAL (o banner de cima já não tem versão hardcoded)
 DATA_DIR = Path.home() / '.lexio-player'; DATA_DIR.mkdir(exist_ok=True)
 RECENT_FILE = DATA_DIR / 'recent.json'
@@ -5941,6 +5941,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self._study_mode = False
+        self._sub_names = ["", "", ""]  # nomes dos ficheiros das 3 legendas (principal/2ª/3ª)
         self._transport_overlay = None     # floating seek+controls window (study mode)
         self._transport_floating = False
         self._transport_opacity = 0.90   # opacidade do transport flutuante (ajustável: clique-direito)
@@ -6150,8 +6151,8 @@ class MainWindow(QMainWindow):
         self.nb = _icn(chr(0xE893), 38, 14, T("next_n")); self.nb.clicked.connect(self._next)
 
         # 0xE7F0 = ClosedCaption (o CC tradicional). 0xE720 era o Microfone — errado.
-        self.sub_btn = _icn(chr(0xE7F0), 36, 16, T("load_sub_tip"))
-        self.sub_btn.clicked.connect(self._load_sub_file)
+        self.sub_btn = _icn(chr(0xE7F0), 36, 16, T("sub_mgr_btn_tip"))
+        self.sub_btn.clicked.connect(self._open_sub_manager)
         self.sub_icon = QPushButton(chr(0xE7F0)); self.sub_icon.setFixedSize(30,24)
         self.sub_icon.setStyleSheet(f"QPushButton{{background:transparent;border:none;color:{TMT};font-family:{ICON_F};font-size:13px;}}QPushButton:hover{{color:{ACC};}}")
         self.sub_icon.setToolTip(T("sub_toggle_tip") + " · " + T("sub_menu_tip"))
@@ -6237,13 +6238,13 @@ class MainWindow(QMainWindow):
         nav_lo.setContentsMargins(12,3,12,3)
         _sp = QSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum); _sp.setHeightForWidth(True)
         self.nav_bar.setSizePolicy(_sp)
-        self.btn_sub = nav_icn(T("sub_add"), T("sub_add_tip"), True)
+        self.btn_sub = nav_icn(T("sub_mgr_btn"), T("sub_mgr_btn_tip"), True)
         self.btn_sub.setStyleSheet(
             f"QPushButton{{background:transparent;color:{TS2};border:1px solid {ACC};"
             f"border-radius:13px;font-size:11px;padding:4px 13px;font-family:'Inter','Segoe UI',sans-serif;font-weight:600;}}"
             f"QPushButton:hover{{background:{HVR};color:{TXT};border-color:{ACC};}}"
             f"QPushButton:checked{{background:rgba(60,180,90,0.18);color:#9EE6A0;border-color:#3CB45A;}}")
-        self.btn_sub.clicked.connect(self._load_sub_file)
+        self.btn_sub.clicked.connect(self._open_sub_manager)
         nav_lo.addWidget(self.btn_sub)
         self.btn_sub_online = nav_icn(T("sub_online"), T("sub_online_tip"))
         self.btn_sub_online.clicked.connect(self._search_subs_online)
@@ -8290,6 +8291,7 @@ class MainWindow(QMainWindow):
         # para não ficarem "colados" sobre o novo (bug das legendas congeladas).
         self.overlay.reset_for_new_video()
         self.engine.show_subtitle_reset()
+        self._sub_names = ["", "", ""]        # filme novo → esquece nomes das legendas
         self._roll_session(Path(path).name)   # envia a sessão anterior, começa nova
         self.seek.clear_marks()
         # Filme novo → esquece tracks/aulas e limpa as marcas do groove.
@@ -8312,6 +8314,7 @@ class MainWindow(QMainWindow):
             srt = self._recall_sub(path)
             if srt and self.engine.load_srt(srt):
                 self._update_sub_icon()
+                self._sub_names[0] = Path(srt).name
                 self.sbl.setText(T("sub_from_memory", name=Path(srt).name))
                 return
         self.sbl.setText(Path(path).name)
@@ -8342,11 +8345,116 @@ class MainWindow(QMainWindow):
                 self._remember_sub(self.engine.path(), subs[0])
                 self._update_sub_icon()
                 name = Path(subs[0]).name
+                self._sub_names[0] = name
                 self.sbl.setText(f"CC {name}")
                 self.overlay.flash(T("sub_dropped", name=name))
             else:
                 showToast(T("sub_load_fail"), "accent")
         e.acceptProposedAction()
+
+    def _open_sub_manager(self):
+        """Gestor de legendas VISÍVEL: 3 slots (principal/2ª/3ª) + auto-tradução, para
+        ser óbvio que se pode mostrar mais do que uma legenda ao mesmo tempo."""
+        # O botão é checkable (indicador verde): repõe o estado correto ao fechar.
+        if not self.engine.path():
+            showToast(T("sub_need_first"), "accent")
+            self._update_sub_icon(); return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(T("sub_mgr_title"))
+        dlg.setMinimumWidth(460)
+        dlg.setStyleSheet(f"QDialog{{background:{ELV};}}QLabel{{color:{TXT};background:transparent;}}")
+        lo = QVBoxLayout(dlg); lo.setContentsMargins(18, 16, 18, 16); lo.setSpacing(10)
+
+        title = QLabel(T("sub_mgr_title"))
+        title.setStyleSheet(f"color:{TXT};font-size:16px;font-weight:700;background:transparent;")
+        lo.addWidget(title)
+        intro = QLabel(T("sub_mgr_intro")); intro.setWordWrap(True)
+        intro.setStyleSheet(f"color:{TMT};font-size:11px;background:transparent;")
+        lo.addWidget(intro)
+
+        def _btn(label, accent=False):
+            b = QPushButton(label); b.setCursor(Qt.PointingHandCursor)
+            brd = ACC if accent else BRD
+            b.setStyleSheet(
+                f"QPushButton{{background:transparent;color:{TS2};border:1px solid {brd};"
+                f"border-radius:13px;font-size:11px;padding:5px 13px;}}"
+                f"QPushButton:hover{{background:{HVR};color:{TXT};border-color:{ACC};}}")
+            return b
+
+        rows = {}   # slot -> name QLabel (para refrescar)
+
+        def _make_row(slot, title_txt, can_online):
+            row = QWidget(); row.setStyleSheet(f"background:{SRF};border-radius:10px;")
+            rl = QVBoxLayout(row); rl.setContentsMargins(12, 10, 12, 10); rl.setSpacing(6)
+            cap = QLabel(title_txt)
+            cap.setStyleSheet(f"color:{TXT};font-size:12px;font-weight:600;background:transparent;")
+            rl.addWidget(cap)
+            line = QHBoxLayout(); line.setSpacing(8)
+            name_lbl = QLabel(""); name_lbl.setStyleSheet(f"color:{TMT};font-size:11px;background:transparent;")
+            name_lbl.setWordWrap(True)
+            line.addWidget(name_lbl, 1)
+            rows[slot] = name_lbl
+            if slot == 0:
+                b_load = _btn(T("sub_mgr_change"), accent=True)
+                b_load.clicked.connect(lambda: (self._load_sub_file(), _refresh()))
+                line.addWidget(b_load)
+                if can_online:
+                    b_on = _btn(T("sub_mgr_online"))
+                    b_on.clicked.connect(lambda: (self._search_subs_online(), _refresh()))
+                    line.addWidget(b_on)
+            else:
+                b_add = _btn(T("sub_mgr_add"), accent=True)
+                b_add.clicked.connect(lambda _=0, s=slot: (self._load_sub_n(s + 1), _refresh()))
+                line.addWidget(b_add)
+                b_rm = _btn(T("sub_mgr_remove"))
+                def _rm(_=0, s=slot):
+                    (self.engine.clear_sub2() if s == 1 else self.engine.clear_sub3())
+                    self._sub_names[s] = ""
+                    self.overlay.flash(T("sub2_off") if s == 1 else T("sub3_off"))
+                    _refresh()
+                b_rm.clicked.connect(_rm)
+                line.addWidget(b_rm)
+            rl.addLayout(line)
+            return row
+
+        r0 = _make_row(0, T("sub_mgr_main"), True)
+        r1 = _make_row(1, T("sub_mgr_2nd"), False)
+        r2 = _make_row(2, T("sub_mgr_3rd"), False)
+        for r in (r0, r1, r2):
+            lo.addWidget(r)
+
+        # Auto-tradução da 2ª linha (alternativa a carregar ficheiro na 2ª).
+        lang_en = i18n.language_en_name(i18n.current_lang())
+        chk = QCheckBox(T("sub_mgr_autotr", lang=lang_en))
+        chk.setChecked(bool(self.engine._auto_tr))
+        chk.setStyleSheet(f"QCheckBox{{color:{TXT};font-size:11px;background:transparent;}}")
+        chk.toggled.connect(lambda on: (self._toggle_auto_tr(on), _refresh()))
+        lo.addWidget(chk)
+
+        note = QLabel(T("sub_mgr_note")); note.setWordWrap(True)
+        note.setStyleSheet(f"color:{TMT};font-size:10px;background:transparent;")
+        lo.addWidget(note)
+
+        btn_row = QHBoxLayout(); btn_row.addStretch(1)
+        b_close = _btn(T("sub_mgr_close"), accent=True)
+        b_close.clicked.connect(dlg.accept)
+        btn_row.addWidget(b_close)
+        lo.addLayout(btn_row)
+
+        def _refresh():
+            # Slot 0: nome guardado, ou "carregada" se houver subs sem nome (auto-detetada).
+            n0 = self._sub_names[0] or (("✓ " + T("sub_loaded")) if self.engine.sub_count() > 0 else T("sub_mgr_none"))
+            rows[0].setText(n0)
+            n1 = self._sub_names[1] or (("✓ " + T("sub_loaded")) if len(self.engine._subs2) > 0
+                 else (("IA → " + lang_en) if self.engine._auto_tr else T("sub_mgr_none")))
+            rows[1].setText(n1)
+            n2 = self._sub_names[2] or (("✓ " + T("sub_loaded")) if len(self.engine._subs3) > 0 else T("sub_mgr_none"))
+            rows[2].setText(n2)
+
+        _refresh()
+        dlg.exec_()
+        self._update_sub_icon()   # repõe o estado verde do botão
 
     def _load_sub_file(self):
         """Open file dialog to load .srt subtitle manually"""
@@ -8359,6 +8467,7 @@ class MainWindow(QMainWindow):
             self._remember_sub(self.engine.path(), path)   # remember for next time
             self._update_sub_icon()
             name = Path(path).name
+            self._sub_names[0] = name
             self.sbl.setText(f"CC {name}")
             self.overlay.flash(T("sub_dropped", name=name))
         elif path:
@@ -8437,9 +8546,9 @@ class MainWindow(QMainWindow):
         elif act == at:
             self._toggle_auto_tr(at.isChecked())
         elif act == c2:
-            self.engine.clear_sub2(); self.overlay.flash(T("sub2_off"))
+            self.engine.clear_sub2(); self._sub_names[1] = ""; self.overlay.flash(T("sub2_off"))
         elif act == c3:
-            self.engine.clear_sub3(); self.overlay.flash(T("sub3_off"))
+            self.engine.clear_sub3(); self._sub_names[2] = ""; self.overlay.flash(T("sub3_off"))
 
     def _load_sub_n(self, n):
         if not self.engine.path():
@@ -8450,9 +8559,11 @@ class MainWindow(QMainWindow):
             return
         ok = self.engine.load_srt2(path) if n == 2 else self.engine.load_srt3(path)
         if ok:
+            self._sub_names[n - 1] = Path(path).name
             self.overlay.flash(T(f"sub{n}_loaded", name=Path(path).name))
         else:
             self.overlay.flash(T("sub_load_fail"))
+        return ok
 
     def _toggle_auto_tr(self, on):
         code = i18n.current_lang()
