@@ -118,7 +118,7 @@ ACC_HOVER = "#cfcfcf"  # dimmer white on hover
 ON_ACC = "#000000"   # text/icon ON white accent
 
 APP_NAME = "Lexio Study Player"
-APP_VERSION = "3.18.0"
+APP_VERSION = "3.19.0"
 log(f"=== LEXIO PLAYER v{APP_VERSION} ===")  # versão REAL (o banner de cima já não tem versão hardcoded)
 DATA_DIR = Path.home() / '.lexio-player'; DATA_DIR.mkdir(exist_ok=True)
 RECENT_FILE = DATA_DIR / 'recent.json'
@@ -1313,6 +1313,20 @@ class PlayerEngine(QWidget):
     def sub_text_at(self, p):
         """Texto da legenda principal no instante p (para o preview do seek bar)."""
         return self._text_at(self._subs, p)
+
+    def secondary_for_index(self, idx):
+        """(2ª, 3ª) linha para a fala de índice idx (para o feed da aba Legendas).
+        Usa o ponto médio da fala para alinhar por tempo; recorre à cache de
+        auto-tradução quando não há 2ª legenda em ficheiro."""
+        if not (0 <= idx < len(self._subs)):
+            return "", ""
+        s = self._subs[idx]
+        mid = (s.start + s.end) / 2.0
+        l2 = self._text_at(self._subs2, mid)
+        l3 = self._text_at(self._subs3, mid)
+        if not l2 and self._auto_tr:
+            l2 = self._tr_cache.get((s.text or "").strip(), "")
+        return l2, l3
 
     def clear_sub2(self):
         self._subs2 = []
@@ -6030,6 +6044,7 @@ class MainWindow(QMainWindow):
         # subtitle_entered dispara em CADA entrada de fala, em paridade exata com a
         # legenda de baixo, por isso o feed nunca mais perde linhas.
         self.engine.subtitle_entered.connect(self._card_on_sub)
+        self.engine.subtitle_entered.connect(self._subs_feed_on_sub)   # destaca/scroll no feed
         # Sublinhador inteligente: lê o guião em contexto e deteta GRUPOS de palavras.
         self._expr_miner = ExpressionMiner(LEXIO_API)
         self._expr_miner.updated.connect(self.overlay.update)   # repinta com novos grupos
@@ -6450,6 +6465,31 @@ class MainWindow(QMainWindow):
         twl2.addWidget(self.tw_empty)
         twl2.addStretch()
         tabs.addTab(twt, T("tab_tracks"))
+
+        # ── Legendas: FEED das falas (original + 2ª/3ª linha), com palavras-chave
+        # SUBLINHADAS e clicáveis (abre Detalhes) — o estudo das legendas secundárias
+        # vive aqui, onde há espaço, em vez de no overlay apertado do vídeo. Acompanha
+        # o vídeo (a fala atual fica destacada e faz auto-scroll). ──
+        sft = QWidget(); sfl = QVBoxLayout(sft); sfl.setContentsMargins(6, 6, 6, 6); sfl.setSpacing(4)
+        sf_hint = QLabel(T("subs_feed_hint")); sf_hint.setWordWrap(True)
+        sf_hint.setStyleSheet(f"color:{TMT};font-size:10px;background:transparent;")
+        sfl.addWidget(sf_hint)
+        self.sf_scroll = QScrollArea(); self.sf_scroll.setWidgetResizable(True)
+        self.sf_scroll.setStyleSheet(
+            f"QScrollArea{{background:transparent;border:none;}}"
+            f"QScrollBar:vertical{{background:transparent;width:8px;}}"
+            f"QScrollBar::handle:vertical{{background:{BRD};border-radius:4px;min-height:24px;}}")
+        self.sf_inner = QWidget(); self.sf_inner.setStyleSheet("background:transparent;")
+        self.sf_lo = QVBoxLayout(self.sf_inner); self.sf_lo.setContentsMargins(0, 0, 0, 0); self.sf_lo.setSpacing(4)
+        self.sf_empty = QLabel(T("subs_feed_empty")); self.sf_empty.setWordWrap(True)
+        self.sf_empty.setAlignment(Qt.AlignTop)
+        self.sf_empty.setStyleSheet(f"color:{TMT};font-size:11px;background:transparent;padding:14px 6px;")
+        self.sf_lo.addWidget(self.sf_empty)
+        self.sf_lo.addStretch(1)
+        self.sf_scroll.setWidget(self.sf_inner)
+        sfl.addWidget(self.sf_scroll, 1)
+        self._sf_rows = {}   # idx -> QLabel da fala (para destacar/atualizar)
+        tabs.addTab(sft, T("tab_subs"))
 
         # (Aba "Notas" removida — bloco de notas manual fora do espírito "a IA trata".)
 
@@ -7547,6 +7587,101 @@ class MainWindow(QMainWindow):
         except Exception as e:
             log(f"card on sub: {e}")
 
+    # ── Feed da aba "Legendas" (original + 2ª/3ª linha, sublinhadas e clicáveis) ──
+    def _sf_entry_html(self, idx):
+        """HTML de uma fala para o feed: tempo (salto) + original + traduções, com as
+        palavras-chave sublinhadas/clicáveis (mark_html). A 2ª/3ª linha a cinzento."""
+        subs = self.engine._subs
+        if not (0 <= idx < len(subs)):
+            return ""
+        s = subs[idx]
+        ts = FMT(int(s.start))
+        l2, l3 = self.engine.secondary_for_index(idx)
+        html = (f'<a href="lexioseek:{s.start:.2f}" style="color:{TMT};'
+                f'text-decoration:none;font-size:10px;">[{ts}]</a> ')
+        html += f'<span style="color:{TS2};font-size:12px;">{mark_html(s.text, subtle=True)}</span>'
+        if l2:
+            html += (f'<div style="color:#c8c8c8;font-size:11px;margin-top:2px;">'
+                     f'{mark_html(l2, subtle=True)}</div>')
+        if l3:
+            html += (f'<div style="color:#9a9a9a;font-size:11px;">'
+                     f'{mark_html(l3, subtle=True)}</div>')
+        return html
+
+    def _rebuild_subs_feed(self):
+        """Reconstrói o feed da aba Legendas a partir das falas carregadas."""
+        if not hasattr(self, 'sf_lo'):
+            return
+        # Evita reconstruir quando nada mudou (o _update_sub_icon é chamado várias
+        # vezes): assinatura = tamanhos das 3 listas + estado da auto-tradução.
+        sig = (len(self.engine._subs), len(self.engine._subs2),
+               len(self.engine._subs3), bool(self.engine._auto_tr),
+               tuple(self._sub_names))
+        if sig == getattr(self, '_sf_sig', None):
+            return
+        self._sf_sig = sig
+        # Limpa as linhas anteriores (mantém o stretch final).
+        for lbl in self._sf_rows.values():
+            lbl.setParent(None); lbl.deleteLater()
+        self._sf_rows = {}
+        subs = self.engine._subs
+        has = len(subs) > 0
+        self.sf_empty.setVisible(not has)
+        if not has:
+            return
+        for idx in range(len(subs)):
+            lbl = QLabel(self._sf_entry_html(idx))
+            lbl.setTextFormat(Qt.RichText)
+            lbl.setWordWrap(True)
+            lbl.setOpenExternalLinks(False)
+            lbl.setTextInteractionFlags(Qt.TextBrowserInteraction)
+            lbl.linkActivated.connect(self._subs_feed_link)
+            lbl.setStyleSheet(
+                f"QLabel{{background:{SRF};border:1px solid transparent;border-radius:8px;"
+                f"padding:6px 8px;}}QLabel:hover{{background:{HVR};}}")
+            # Inserir antes do stretch (último item do layout).
+            self.sf_lo.insertWidget(self.sf_lo.count() - 1, lbl)
+            self._sf_rows[idx] = lbl
+
+    def _subs_feed_on_sub(self, idx):
+        """Destaca a fala atual no feed e faz auto-scroll até ela. Atualiza a tradução
+        da linha (caso a auto-tradução IA já tenha chegado entretanto)."""
+        try:
+            lbl = self._sf_rows.get(idx)
+            if lbl is None:
+                # Feed ainda não construído para estas legendas → constrói agora.
+                if self.engine.sub_count() > 0 and not self._sf_rows:
+                    self._rebuild_subs_feed()
+                    lbl = self._sf_rows.get(idx)
+                if lbl is None:
+                    return
+            # Refresca o HTML (preenche tradução que possa ter chegado da IA).
+            lbl.setText(self._sf_entry_html(idx))
+            # Realça a fala atual; tira o realce das outras.
+            for i, w in self._sf_rows.items():
+                cur = (i == idx)
+                w.setStyleSheet(
+                    f"QLabel{{background:{HVR if cur else SRF};"
+                    f"border:1px solid {ACC if cur else 'transparent'};border-radius:8px;"
+                    f"padding:6px 8px;}}QLabel:hover{{background:{HVR};}}")
+            # Auto-scroll suave até à fala atual.
+            self.sf_scroll.ensureWidgetVisible(lbl, 0, 40)
+        except Exception as e:
+            log(f"subs feed: {e}")
+
+    def _subs_feed_link(self, href):
+        """Clique no feed: tempo → salta o vídeo; palavra → abre Detalhes."""
+        try:
+            if href.startswith("lexioseek:"):
+                self.engine.seek(float(href.split(":", 1)[1])); self.engine.play()
+            elif href.startswith("lexioword:"):
+                from urllib.parse import unquote
+                self.word_details.show_for(unquote(href.split(":", 1)[1]))
+                if hasattr(self, "_balance_left_dock"):
+                    self._balance_left_dock()
+        except Exception as e:
+            log(f"subs feed link: {e}")
+
     def _auto_ex_on_sub(self, idx):
         """A cada fala ouvida (com auto-exercícios ligado), conta; ao fim de N abre o
         próximo exercício — mas nunca empilha sobre um exercício/aula/missão já aberto."""
@@ -8292,6 +8427,7 @@ class MainWindow(QMainWindow):
         self.overlay.reset_for_new_video()
         self.engine.show_subtitle_reset()
         self._sub_names = ["", "", ""]        # filme novo → esquece nomes das legendas
+        self._sf_sig = None                   # força rebuild do feed da aba Legendas
         self._roll_session(Path(path).name)   # envia a sessão anterior, começa nova
         self.seek.clear_marks()
         # Filme novo → esquece tracks/aulas e limpa as marcas do groove.
@@ -8411,6 +8547,7 @@ class MainWindow(QMainWindow):
                 def _rm(_=0, s=slot):
                     (self.engine.clear_sub2() if s == 1 else self.engine.clear_sub3())
                     self._sub_names[s] = ""
+                    self._rebuild_subs_feed()
                     self.overlay.flash(T("sub2_off") if s == 1 else T("sub3_off"))
                     _refresh()
                 b_rm.clicked.connect(_rm)
@@ -8546,9 +8683,9 @@ class MainWindow(QMainWindow):
         elif act == at:
             self._toggle_auto_tr(at.isChecked())
         elif act == c2:
-            self.engine.clear_sub2(); self._sub_names[1] = ""; self.overlay.flash(T("sub2_off"))
+            self.engine.clear_sub2(); self._sub_names[1] = ""; self._rebuild_subs_feed(); self.overlay.flash(T("sub2_off"))
         elif act == c3:
-            self.engine.clear_sub3(); self._sub_names[2] = ""; self.overlay.flash(T("sub3_off"))
+            self.engine.clear_sub3(); self._sub_names[2] = ""; self._rebuild_subs_feed(); self.overlay.flash(T("sub3_off"))
 
     def _load_sub_n(self, n):
         if not self.engine.path():
@@ -8560,6 +8697,7 @@ class MainWindow(QMainWindow):
         ok = self.engine.load_srt2(path) if n == 2 else self.engine.load_srt3(path)
         if ok:
             self._sub_names[n - 1] = Path(path).name
+            self._rebuild_subs_feed()
             self.overlay.flash(T(f"sub{n}_loaded", name=Path(path).name))
         else:
             self.overlay.flash(T("sub_load_fail"))
@@ -8569,6 +8707,7 @@ class MainWindow(QMainWindow):
         code = i18n.current_lang()
         lang_en = i18n.language_en_name(code)
         self.engine.set_auto_translate(on, lang_en, code)
+        self._rebuild_subs_feed()
         self.overlay.flash(T("sub_auto_tr_on", lang=lang_en) if on else T("sub_auto_tr_off"))
 
     def _update_sub_icon(self):
@@ -8586,13 +8725,15 @@ class MainWindow(QMainWindow):
         else:
             self.sub_icon.setText("")
             self.sub_icon.setToolTip(T("subs_none"))
-        # Big practice-bar button: green check when a subtitle is loaded.
+        # Botão "Legendas" (abre o gestor): mantém o rótulo e fica verde quando há sub.
         if hasattr(self, 'btn_sub'):
-            self.btn_sub.setText(T("sub_loaded") if has_subs else T("sub_add"))
+            self.btn_sub.setText(T("sub_mgr_btn"))
             self.btn_sub.setChecked(has_subs)
         # On-video banner: only when a video is open and there's still no subtitle.
         if hasattr(self, 'overlay'):
             self.overlay.set_no_sub_hint(bool(self.video_path) and not has_subs)
+        # Reconstrói o feed da aba Legendas (falas + traduções) sempre que as legendas mudam.
+        self._rebuild_subs_feed()
 
     def _cycle_spd(self):
         spds = [0.5,0.75,1.0,1.25,1.5,2.0]

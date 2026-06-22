@@ -1489,4 +1489,10 @@ STRINGS.update({
     "sub_mgr_note": {"en": "The 2nd/3rd lines are reading support only — they never change the vocab cards (those stay in the original language).",
         "pt": "A 2ª/3ª linha são só apoio de leitura — nunca mudam os cartões de vocabulário (esses ficam na língua original)."},
     "sub_mgr_close": {"en": "Close", "pt": "Fechar"},
+    # — Aba "Legendas": feed das falas com original + traduções, sublinhadas e clicáveis —
+    "tab_subs": {"en": "Subtitles", "pt": "Legendas"},
+    "subs_feed_empty": {"en": "Load a subtitle to see the lines here — with key words underlined and clickable.",
+        "pt": "Carrega uma legenda para veres as falas aqui — com palavras-chave sublinhadas e clicáveis."},
+    "subs_feed_hint": {"en": "Follows the video. Click a word for details; click the time to jump there.",
+        "pt": "Acompanha o vídeo. Clica numa palavra para detalhes; clica no tempo para saltar."},
 })
