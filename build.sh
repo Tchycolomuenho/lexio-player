@@ -22,7 +22,7 @@ echo "=== Lexio Study Player — build canónica ==="
 
 # [1/5] Sanidade: o código tem de compilar ANTES de empacotar (falha cedo).
 echo "[1/5] py_compile (lexio_player.py, scene_agent.py, i18n.py)..."
-python -m py_compile lexio_player.py scene_agent.py i18n.py
+/c/Python314/python.exe -m py_compile lexio_player.py scene_agent.py i18n.py
 
 # [2/5] Sincronizar version.txt com APP_VERSION (o instalador lê o version.txt; já
 #       houve dessincronização 3.7.0 vs 3.8.0). Fonte de verdade = APP_VERSION.
@@ -33,7 +33,7 @@ echo "[2/5] versão = $VER (version.txt sincronizado)"
 
 # [3/5] PyInstaller (one-dir, VLC embutido) — usa SEMPRE o spec, nunca flags soltas.
 echo "[3/5] PyInstaller (pode demorar alguns minutos)..."
-python -m PyInstaller --noconfirm --clean LexioStudyPlayer.spec
+/c/Python314/python.exe -m PyInstaller --noconfirm --clean LexioStudyPlayer.spec
 test -f "dist/LexioStudyPlayer/LexioStudyPlayer.exe" || { echo "ERRO: exe não gerado"; exit 1; }
 
 # [4/5] Instalador Inno Setup.

@@ -118,7 +118,7 @@ ACC_HOVER = "#cfcfcf"  # dimmer white on hover
 ON_ACC = "#000000"   # text/icon ON white accent
 
 APP_NAME = "Lexio Study Player"
-APP_VERSION = "3.19.0"
+APP_VERSION = "3.21.0"
 log(f"=== LEXIO PLAYER v{APP_VERSION} ===")  # versão REAL (o banner de cima já não tem versão hardcoded)
 DATA_DIR = Path.home() / '.lexio-player'; DATA_DIR.mkdir(exist_ok=True)
 RECENT_FILE = DATA_DIR / 'recent.json'
@@ -130,8 +130,48 @@ SUPPORTED_VID = {'.mp4','.avi','.mkv','.mov','.wmv','.flv','.webm','.m4v','.mpg'
 SUPPORTED_AUD = {'.mp3','.wav','.flac','.ogg','.m4a','.aac','.wma'}
 SUPPORTED = SUPPORTED_VID | SUPPORTED_AUD
 
-LEXIO_API = "https://lexio-app-five.vercel.app"
+# Backend principal (Vercel) e RÉPLICA CHINA (Cloudflare Pages). A Vercel é
+# frequentemente lenta ou inacessível atrás do Great Firewall, o que mata TODAS as
+# chamadas de IA (chat/tts/visão/exercícios). A réplica Cloudflare é um espelho
+# completo do mesmo /api e é alcançável na China. No arranque sondamos o primário e,
+# se não responder, comutamos LEXIO_API para a réplica — como quase todas as chamadas
+# usam o global em f-strings (avaliado no momento) e o ExpressionMiner só é construído
+# depois, basta trocar este global cedo em main().
+LEXIO_API_PRIMARY = "https://lexio-app-five.vercel.app"
+LEXIO_API_CHINA = "https://lexio-app-46s.pages.dev"
+LEXIO_API = LEXIO_API_PRIMARY
 SUPABASE_URL = "https://lobwdstwpcbuljferyyo.supabase.co"
+
+
+def _host_reachable(base, timeout=3.0):
+    """True se o host devolve QUALQUER resposta HTTP (DNS/TCP/TLS OK), mesmo 4xx/5xx.
+    Só timeout/erro de ligação (típico do Great Firewall) conta como inacessível."""
+    try:
+        urlopen(Request(f"{base}/api/auth", headers={"User-Agent": APP_NAME}), timeout=timeout)
+        return True
+    except HTTPError:
+        return True   # respondeu (ex.: 405/500) → host alcançável
+    except Exception:
+        return False  # timeout / connection refused / DNS → bloqueado/offline
+
+
+def _select_backend():
+    """Escolhe o backend acessível. Mantém o primário (Vercel) se responder; caso
+    contrário, e se a réplica China (Cloudflare) responder, comuta para ela. Tem de
+    correr ANTES de construir a MainWindow (o ExpressionMiner fixa o valor)."""
+    global LEXIO_API
+    try:
+        if _host_reachable(LEXIO_API_PRIMARY, timeout=3.0):
+            LEXIO_API = LEXIO_API_PRIMARY
+            log(f"backend: primário OK ({LEXIO_API_PRIMARY})")
+            return
+        if _host_reachable(LEXIO_API_CHINA, timeout=4.0):
+            LEXIO_API = LEXIO_API_CHINA
+            log(f"backend: primário inacessível -> réplica China ({LEXIO_API_CHINA})")
+            return
+        log("backend: nenhum acessível; mantém primário")
+    except Exception as e:
+        log(f"_select_backend falhou ({e}); mantém primário")
 
 # Vozes neurais Microsoft (as MESMAS da web, api/tts.js) — naturais, multilíngue.
 # Geradas localmente via `edge-tts` (Python), que calcula o token Sec-MS-GEC que o
@@ -307,6 +347,9 @@ _PLAYER_EXERCISE_KINDS = frozenset((
 ))
 
 i18n.set_cache_dir(str(DATA_DIR / 'i18n-cache'))   # traduções IA on-demand ficam aqui
+# Traduções pré-geradas que vêm NO instalador (read-only) — fazem TODAS as línguas
+# oferecidas funcionar offline, sem depender da IA em runtime. Mesma base das fontes.
+i18n.set_bundled_dir(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'i18n-bundled'))
 _UI_LANG_FILE = DATA_DIR / 'ui-lang.txt'
 
 def load_ui_lang():
@@ -332,6 +375,30 @@ def save_ui_lang(code):
         _UI_LANG_FILE.write_text(str(code), encoding='utf-8')
     except Exception as e:
         log(f"save ui lang: {e}")
+
+# ── Línguas DA CONTA (web) — nativa + foco. NÃO se escolhem no desktop: vêm do
+# perfil da app web (Supabase) e mandam no CONTEÚDO (explicações/exercícios na
+# nativa, legendas/alvo no foco). A escolha do desktop é só a APRESENTAÇÃO (ui-lang).
+# Guardamos a última conhecida para funcionar offline/antes do login.
+_ACCOUNT_LANGS_FILE = DATA_DIR / 'account-langs.json'
+
+def load_account_langs():
+    """{'native': 'pt', 'target': 'en'} vindas do perfil web, em cache local."""
+    try:
+        return json.loads(_ACCOUNT_LANGS_FILE.read_text(encoding='utf-8'))
+    except Exception:
+        return {}
+
+def save_account_langs(native=None, target=None):
+    d = load_account_langs()
+    if native:
+        d['native'] = i18n._norm(native)
+    if target:
+        d['target'] = i18n._norm(target)
+    try:
+        _ACCOUNT_LANGS_FILE.write_text(json.dumps(d), encoding='utf-8')
+    except Exception as e:
+        log(f"save account langs: {e}")
 
 def translate_ui_via_ai(code):
     """Traduz TODAS as strings da UI para `code` via IA (deepseek) e guarda em
@@ -528,8 +595,11 @@ def call_vision(prompt, system="", images=None, model=None,
                 errors.append(f"{m}: {e}"); log(f"vision {m} falhou: {e}")
     raise RuntimeError("vision failed — " + "; ".join(errors[:4]))
 
-set_lang(load_ui_lang())   # aplica antes de construir a UI
-set_native(load_ui_lang())  # conteúdo (dicionário/chat) na língua escolhida; conta pode sobrepor no login
+set_lang(load_ui_lang())   # APRESENTAÇÃO da UI (escolha do desktop) — antes de construir a UI
+# CONTEÚDO (explicações/exercícios) = língua NATIVA da conta web, NÃO a apresentação.
+# Usa a última nativa conhecida (cache do perfil); só na 1ª vez, sem nada em cache,
+# cai para a apresentação como palpite. O login sobrepõe com o valor real do perfil.
+set_native(load_account_langs().get('native') or load_ui_lang())
 
 def FMT(sec):
     s = max(0, int(sec)); h,s = divmod(s,3600); m,s = divmod(s,60)
@@ -3275,7 +3345,7 @@ class ChatPanel(QWidget):
         self._messages = []
         self._token = self._load_token()
         self._user_name = ""           # nome do utilizador (perfil da web)
-        self._user_target = ""         # língua-alvo da conta
+        self._user_target = load_account_langs().get("target", "") or ""  # foco (perfil web), em cache p/ offline
         self._activity_summary = ""    # resumo da atividade (player+web) p/ a IA "conhecer" o user
         self._setup_ui()
         self._ai_thread = None
@@ -3534,13 +3604,14 @@ class ChatPanel(QWidget):
             if not uid:
                 return
             ih = {"apikey": SUPABASE_ANON, "Authorization": header}
-            info = {"name": "", "target": "", "videos": []}
+            info = {"name": "", "target": "", "native": "", "videos": []}
             try:
-                u = f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{uid}&select=display_name,target_lang"
+                u = f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{uid}&select=display_name,target_lang,native_lang"
                 d = json.loads(urlopen(Request(u, headers=ih), timeout=15).read().decode())
                 if d:
                     info["name"] = d[0].get("display_name") or ""
                     info["target"] = d[0].get("target_lang") or ""
+                    info["native"] = d[0].get("native_lang") or ""
             except Exception as e:
                 log(f"profile fetch: {e}")
             try:
@@ -3561,6 +3632,12 @@ class ChatPanel(QWidget):
     def _on_user_ctx(self, info):
         self._user_name = info.get("name", "") or ""
         self._user_target = info.get("target", "") or ""
+        # Língua NATIVA e de FOCO vêm do perfil web (não do desktop). A nativa manda no
+        # conteúdo (explicações/exercícios); guardamos ambas para o próximo arranque.
+        native = (info.get("native", "") or "").strip()
+        if native:
+            set_native(native)        # conteúdo passa a sair na nativa real da conta
+        save_account_langs(native=native or None, target=self._user_target or None)
         vids = (info.get("videos") or [])[:6]
         parts = []
         if self._user_target:
@@ -5979,6 +6056,9 @@ class MainWindow(QMainWindow):
             self)
         self.reminder.show_note.connect(self._show_reminder_note)
         self._autopause_on = False
+        # ── Coach AI (responsibility calls) ──
+        self.coach_mgr = CoachManager(self)
+        self.coach_mgr.coach_call.connect(self._on_coach_call)
         # ── Tipo de estudo: desligado | leve | focado. A IA (Scene Agent) está SEMPRE
         # em modo "Deus" (máxima qualidade); o que muda é QUANTO intervém:
         #   desligado = sem agente, só ver; leve = poucas missões; focado = muitas + autopause/loop.
@@ -8856,17 +8936,54 @@ class MainWindow(QMainWindow):
         tray.showMessage(title or T("reminder_title"), body or "",
                          QSystemTrayIcon.Information, 12000)
 
+    # ── Coach AI call handler ──
+    def _on_coach_call(self, level, word):
+        """Called when the CoachManager detects it's time for a responsibility call."""
+        # Speak the opening line using edge-tts
+        lines = {
+            "calm": "Ola. Vamos fazer uma revisao curta e honesta.",
+            "firm": "Lexio na linha. Chega de adiar. Tens uma missao curta agora.",
+            "maximum": "Lexio na linha. Levanta-te. A tua sessao comeca agora.",
+        }
+        opening = lines.get(level, "Lexio na linha.")
+        try:
+            speak_edge_tts(opening, i18n.current_lang() or "pt", -20)
+        except:
+            speak_local_sapi(opening, "pt")
+
+        # Show tray notification
+        tray = self._ensure_tray()
+        if tray:
+            title = "Pressao maxima!" if level == "maximum" else "Lexio Coach"
+            body = "A tua divida de estudo esta critica." if level == "maximum" else "Coach de responsabilidade — hora de provar o que aprendeste."
+            tray.showMessage(title, body, QSystemTrayIcon.Information, 15000)
+
+        # Only show dialog if window is visible (otherwise tray notification is enough)
+        if self.isVisible():
+            dialog = CoachDialog(level, word, self)
+            result = dialog.result() if dialog.exec_() == QDialog.Accepted else "cancelled"
+
+            # Update debt
+            state = _load_coach_state()
+            if result == "passed":
+                state["debt"] = max(0, state["debt"] - 1)
+            elif result in ("failed", "skipped"):
+                state["debt"] = state["debt"] + 1
+            elif result == "cancelled":
+                state["debt"] = state["debt"] + (2 if level == "maximum" else 1)
+            _save_coach_state(state)
+
     def _export(self):
         if not self.video_path: return
         p, _ = QFileDialog.getSaveFileName(self, T("dlg_export"), f"{Path(self.video_path).stem}_estudo.json", "JSON (*.json)")
         if p: Path(p).write_text(self.mgr.export(self.video_path), encoding='utf-8')
     def _check_upd(self):
         try:
-            r = urlopen(Request("https://github.com/amandioestevao/lexio-player/releases/latest/download/version.txt", headers={'User-Agent':APP_NAME}), timeout=5)
+            r = urlopen(Request("https://github.com/Tchycolomuenho/lexio-player/releases/latest/download/version.txt", headers={'User-Agent':APP_NAME}), timeout=5)
             v = r.read().decode().strip()
             if v and v != APP_VERSION:
                 if QMessageBox.question(self, T("dlg_update"), f"Nova: {v}\nDescarregar?", QMessageBox.Yes|QMessageBox.No) == QMessageBox.Yes:
-                    webbrowser.open("https://github.com/amandioestevao/lexio-player/releases/latest")
+                    webbrowser.open("https://github.com/Tchycolomuenho/lexio-player/releases/latest")
         except: pass
     def _about(self):
         QMessageBox.about(self, APP_NAME, f"<div style='text-align:center;'><h2 style='color:{ACC};'>{APP_NAME}</h2><p style='color:{TS2};'>v{APP_VERSION}</p><p style='color:{TMT};'>VLC + Chat IA</p></div>")
@@ -9024,6 +9141,224 @@ class MainWindow(QMainWindow):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# COACH AI — Background responsibility coach for desktop
+# ═══════════════════════════════════════════════════════════════════════════
+
+COACH_STATE_FILE = DATA_DIR / "coach-state.json"
+COACH_DEFAULT_INTERVAL = 180  # minutes
+
+def _coach_defaults():
+    return {
+        "enabled": False,
+        "level": "firm",
+        "intervalMinutes": COACH_DEFAULT_INTERVAL,
+        "questionsPerCall": 3,
+        "quietStart": "22:00",
+        "quietEnd": "08:00",
+        "nextCallAt": None,  # epoch ms
+        "debt": 0,
+    }
+
+def _load_coach_state():
+    try:
+        if COACH_STATE_FILE.exists():
+            data = json.loads(COACH_STATE_FILE.read_text(encoding="utf-8"))
+            return {**_coach_defaults(), **data}
+    except Exception as e:
+        log(f"coach load: {e}")
+    return _coach_defaults()
+
+def _save_coach_state(state):
+    try:
+        COACH_STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    except Exception as e:
+        log(f"coach save: {e}")
+
+def _is_coach_quiet_hours(state, now=None):
+    if now is None:
+        now = datetime.now()
+    current = now.hour * 60 + now.minute
+    sh, sm = map(int, state["quietStart"].split(":"))
+    eh, em = map(int, state["quietEnd"].split(":"))
+    start = sh * 60 + sm
+    end = eh * 60 + em
+    if start == end:
+        return False
+    return current >= start and current < end if start < end else current >= start or current < end
+
+
+class CoachDialog(QDialog):
+    """Full-screen challenge dialog for the desktop player coach."""
+
+    def __init__(self, level, word, parent=None):
+        super().__init__(parent)
+        self.level = level
+        self.word = word
+        self._result = "skipped"
+        self._timer_secs = 75 if level == "calm" else (30 if level == "maximum" else 50)
+        self._timer_running = False
+        self._setup_ui()
+
+    def _setup_ui(self):
+        self.setWindowTitle("Lexio Coach")
+        self.setStyleSheet(f"""
+            QDialog {{
+                background-color: {BG};
+                color: {TXT};
+                font-family: 'Inter', 'Segoe UI', sans-serif;
+            }}
+            QLabel {{ color: {TXT}; font-size: 14px; }}
+            QPushButton {{
+                background-color: {ELV};
+                color: {TXT};
+                border: 1px solid {BRD};
+                border-radius: 10px;
+                padding: 14px 28px;
+                font-size: 14px;
+                font-weight: 600;
+                min-width: 120px;
+            }}
+            QPushButton:hover {{ background-color: {HVR}; border-color: {ACC}; }}
+            QPushButton#passBtn {{ background-color: #1a6b3c; border-color: #22c55e; color: #fff; }}
+            QPushButton#passBtn:hover {{ background-color: #228b4a; }}
+            QPushButton#failBtn {{ background-color: #6b1a1a; border-color: #ef4444; color: #fff; }}
+            QPushButton#failBtn:hover {{ background-color: #8b2222; }}
+        """)
+        self.setMinimumSize(500, 300)
+        layout = QVBoxLayout()
+        layout.setSpacing(20)
+        layout.setContentsMargins(40, 40, 40, 40)
+
+        title_text = {
+            "calm": "Revisão curta e honesta",
+            "firm": "Lexio na linha — chega de adiar",
+            "maximum": "PRESSÃO MÁXIMA — foco total!",
+        }.get(self.level, "Lexio Coach")
+
+        title = QLabel(f"<h2 style='color:{ACC};margin:0'>{title_text}</h2>")
+        title.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title)
+
+        timer_color = "#ef4444" if self.level == "maximum" else ACC
+        self.timer_label = QLabel(f"<span style='font-size:32px;font-weight:700;color:{timer_color}'>{self._timer_secs}s</span>")
+        self.timer_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.timer_label)
+
+        prompt = QLabel(f"<p style='font-size:16px;color:{TMT};text-align:center;margin:0'>Traduz ou usa a palavra:</p>")
+        prompt.setAlignment(Qt.AlignCenter)
+        prompt.setWordWrap(True)
+        layout.addWidget(prompt)
+
+        word_label = QLabel(f"<p style='font-size:22px;font-weight:700;color:{TXT};text-align:center;margin:0'>{self.word}</p>")
+        word_label.setAlignment(Qt.AlignCenter)
+        word_label.setWordWrap(True)
+        layout.addWidget(word_label)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(12)
+
+        pass_btn = QPushButton("✓ Passei")
+        pass_btn.setObjectName("passBtn")
+        pass_btn.clicked.connect(lambda: self._done("passed"))
+        btn_layout.addWidget(pass_btn)
+
+        fail_btn = QPushButton("✗ Falhei")
+        fail_btn.setObjectName("failBtn")
+        fail_btn.clicked.connect(lambda: self._done("failed"))
+        btn_layout.addWidget(fail_btn)
+
+        skip_btn = QPushButton("Saltar")
+        skip_btn.clicked.connect(lambda: self._done("skipped"))
+        btn_layout.addWidget(skip_btn)
+
+        cancel_btn = QPushButton("Cancelar (+ dívida)")
+        cancel_btn.clicked.connect(lambda: self._done("cancelled"))
+        btn_layout.addWidget(cancel_btn)
+
+        layout.addLayout(btn_layout)
+        self.setLayout(layout)
+        self._start_timer()
+
+    def _start_timer(self):
+        self._timer_running = True
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start(1000)
+
+    def _tick(self):
+        self._timer_secs -= 1
+        self.timer_label.setText(
+            f"<span style='font-size:32px;font-weight:700;color:{'#ef4444' if self._timer_secs <= 10 else ACC}'>{self._timer_secs}s</span>"
+        )
+        if self._timer_secs <= 0:
+            self._timer.stop()
+            self._done("failed")
+
+    def _done(self, result):
+        self._timer_running = False
+        if hasattr(self, "_timer"):
+            self._timer.stop()
+        self._result = result
+        self.accept()
+
+    def result(self):
+        return self._result
+
+    def closeEvent(self, event):
+        if self._timer_running:
+            self._timer.stop()
+        super().closeEvent(event)
+
+
+class CoachManager(QObject):
+    """Background thread that checks coach schedule and triggers calls."""
+
+    coach_call = pyqtSignal(str, str)  # level, word
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._state = _load_coach_state()
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._check)
+        self._timer.setInterval(15_000)  # every 15s
+        if self._state["enabled"]:
+            self._timer.start()
+
+    def save(self, state):
+        self._state = state
+        _save_coach_state(state)
+        if state["enabled"] and not self._timer.isActive():
+            self._timer.start()
+        elif not state["enabled"] and self._timer.isActive():
+            self._timer.stop()
+
+    def _check(self):
+        if not self._state["enabled"]:
+            return
+        if self._state.get("nextCallAt") is None:
+            return
+        if _is_coach_quiet_hours(self._state):
+            return
+        if self._state["level"] == "maximum" and not self._state.get("maximumConsent"):
+            return
+
+        now_ms = int(time.time() * 1000)
+        if now_ms >= self._state["nextCallAt"]:
+            # Trigger call
+            words = self._state.get("words", [])
+            word = words[0] if words else "example"
+            self.coach_call.emit(self._state["level"], word)
+
+            # Schedule next
+            jitter = int(self._state["intervalMinutes"] * 60_000 * 0.08 * random.random())
+            self._state["nextCallAt"] = now_ms + self._state["intervalMinutes"] * 60_000 + jitter
+            _save_coach_state(self._state)
+
+    def stop(self):
+        self._timer.stop()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # ENTRY
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -9072,6 +9407,13 @@ def main():
         _ui_font = QFont("Inter", 10)
         _ui_font.setHintingPreference(QFont.PreferFullHinting)
         app.setFont(_ui_font)
+        # Direção do layout segue a língua de APRESENTAÇÃO: árabe/hebraico/farsi/urdu
+        # invertem toda a UI (igual ao dir/data-rtl da app web). Antes de criar widgets.
+        app.setLayoutDirection(Qt.RightToLeft if i18n.is_rtl(i18n.current_lang()) else Qt.LeftToRight)
+        # China-friendly: sonda o backend e comuta p/ réplica Cloudflare se a Vercel
+        # estiver bloqueada (Great Firewall). TEM de ser antes de MainWindow (o
+        # ExpressionMiner fixa LEXIO_API na construção).
+        _select_backend()
         w = MainWindow()
         try:
             _ico2 = os.path.join(_base_dir, "icon.ico")

@@ -16,6 +16,14 @@ chave sem tradução numa língua cai para inglês (nunca fica partida).
 
 SUPPORTED = ["en", "pt", "es", "fr", "de", "it", "nl", "zh", "ja", "ko", "ru", "ar"]
 
+# Línguas escritas da direita para a esquerda — a UI tem de inverter o layout
+# (igual ao data-rtl/dir da app web). Aplica-se à língua de APRESENTAÇÃO.
+RTL = {"ar", "he", "fa", "ur"}
+
+
+def is_rtl(code):
+    return _norm(code) in RTL
+
 # Nome de cada língua para usar nos prompts da IA (dicionário/chat) — "in <X>".
 # A native do utilizador entra aqui para as traduções saírem na língua certa.
 LANG_NAMES = {
@@ -29,7 +37,8 @@ import os, json
 _current = "en"
 _native = "pt"        # língua nativa do utilizador (para o conteúdo da IA)
 _extra = {}           # code -> {key: str}  traduções da IA (línguas não embutidas)
-_cache_dir = None     # onde guardar as traduções da IA
+_cache_dir = None     # onde guardar/ler as traduções da IA (escrita; perfil do user)
+_bundled_dir = None   # traduções pré-geradas que VÊM no instalador (só-leitura)
 
 
 def _norm(code):
@@ -45,22 +54,41 @@ def set_cache_dir(path):
         pass
 
 
+def set_bundled_dir(path):
+    """Pasta read-only com traduções pré-geradas (ui_<code>.json) que vêm no
+    instalador, para QUALQUER língua oferecida funcionar offline, sem chamar a IA."""
+    global _bundled_dir
+    _bundled_dir = path
+
+
 def _cache_file(code):
     return os.path.join(_cache_dir, "ui_%s.json" % code) if _cache_dir else None
 
 
+def _candidate_files(code):
+    """Ficheiros onde a língua pode estar: 1º a cache do user (mais recente), depois
+    a pasta pré-gerada do instalador."""
+    files = []
+    if _cache_dir:
+        files.append(os.path.join(_cache_dir, "ui_%s.json" % code))
+    if _bundled_dir:
+        files.append(os.path.join(_bundled_dir, "ui_%s.json" % code))
+    return files
+
+
 def has_language(code):
-    """True se a língua tem tradução disponível: embutida, em memória, ou em cache."""
+    """True se a língua tem tradução disponível: embutida, em memória, em cache do
+    user, ou pré-gerada no instalador."""
     code = _norm(code)
     if code in SUPPORTED or code in _extra:
         return True
-    f = _cache_file(code)
-    if f and os.path.exists(f):
-        try:
-            _extra[code] = json.load(open(f, encoding="utf-8"))
-            return True
-        except Exception:
-            pass
+    for f in _candidate_files(code):
+        if f and os.path.exists(f):
+            try:
+                _extra[code] = json.load(open(f, encoding="utf-8"))
+                return True
+            except Exception:
+                pass
     return False
 
 

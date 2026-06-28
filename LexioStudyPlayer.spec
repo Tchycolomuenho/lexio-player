@@ -65,6 +65,11 @@ _datas = [
 ] + _tts_datas
 if os.path.exists('icon.ico'):
     _datas.append(('icon.ico', '.'))
+# Traduções de UI pré-geradas (todas as línguas oferecidas) — offline, no instalador.
+if os.path.isdir('i18n-bundled'):
+    import glob as _glob
+    for _f in _glob.glob(os.path.join('i18n-bundled', 'ui_*.json')):
+        _datas.append((_f, 'i18n-bundled'))
 
 a = Analysis(
     ['lexio_player.py'],
